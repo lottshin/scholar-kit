@@ -1,0 +1,35 @@
+# Runtime data (cookies, session, cache)
+.scholar-kit/
+
+# Downloaded papers
+papers/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Runtime temp files
+scripts/_batch_urls.txt
+scripts/_parse_search.py
+
+# Test artifacts
+scripts/test_papers/
+*.tmp
+*.bak
+debug_*.html
+debug_*.json
