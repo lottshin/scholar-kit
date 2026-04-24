@@ -1,6 +1,64 @@
 # Scholar Kit
 
-学术文献检索与科研辅助 AI Skill。支持知网（CNKI）、OpenAlex、Semantic Scholar、arXiv 等多数据源。
+学术文献检索与科研辅助 AI Skill。支持知网（CNKI）、OpenAlex、Semantic Scholar、arXiv、NSSD 五个检索源，通过 Crossref 补全元数据、Unpaywall 解析 OA 下载链接。
+
+## Features
+
+### 文献检索
+
+支持知网、OpenAlex、Semantic Scholar、arXiv、NSSD 五个数据源。知网侧支持核心期刊筛选（北大核心、CSSCI、CSCD 等）、文献类型筛选（硕士/博士/期刊/会议/报纸）、搜索字段指定（主题/篇名/关键词/摘要/全文/作者/来源）、按作者/期刊/年份的高级搜索、多关键词批量搜索。API 数据源基于标准库 urllib 即可运行，不依赖知网环境。
+
+### 论文下载
+
+知网 PDF 批量下载，支持搜索+下载一步完成（`search --download`），自动分批并设置冷却间隔避免触发风控。英文 OA 论文通过 DOI 获取。
+
+### 全文阅读
+
+知网论文全文抓取与本地缓存。期刊论文使用 HTML 阅读提取，硕博论文通过 FlowPDF 三级加速提取（PDF.js API 直取 → 批量滚动 → 逐页补漏）。支持 .docx / .txt / .md 文件解析，自动处理中文编码（UTF-8 / GBK / GB18030）。
+
+### 引用生成与导出
+
+支持 GB/T 7714、BibTeX、RIS、APA、脚注五种引用格式。文献列表可导出为 BibTeX、RIS、Markdown、JSON、Excel。支持导入知网导出的 NoteExpress / Refworks / BibTeX 题录文件。
+
+### 引文网络分析
+
+基于 Semantic Scholar API 的前向/后向引用追踪。输入 DOI、arXiv ID 或论文 URL，获取"谁引用了这篇"和"这篇引用了谁"的双向引用链。不依赖知网，任何环境均可使用。
+
+### 研究趋势分析
+
+对搜索结果进行聚合统计：年份分布、高频关键词 Top 30、高被引论文 Top 10、数据源分布。用于选题分析和研究热点判断。
+
+### Word 文档处理
+
+Markdown 转学术格式 .docx（自动生成脚注和参考文献节）。支持在现有 .docx 上打补丁——插入引用、脚注、参考文献，保留原文档格式。
+
+### Agent 驱动的工作流
+
+以下功能由 Agent 结合脚本完成，不需要单独的命令：
+
+- **文献综述** — 读取用户论文，提取关键词搜索，筛选后基于全文/摘要撰写综述
+- **引用建议** — 识别论文中需要引用的句子，匹配文献并区分"必须引用"和"建议引用"
+- **文献对比矩阵** — 多篇论文按研究问题、方法、发现、局限性等维度结构化对比
+- **阅读笔记** — 按模板提取每篇论文的核心信息，多篇时附综合评述
+- **学术表达优化** — 逐段诊断论文表达质量，改善措辞、重构句式、增强原创论述
+
+## Usage
+
+安装完成后，直接用自然语言指示 Agent：
+
+```
+"帮我搜索关于乡村振兴的核心期刊论文"
+"搜20篇新闻传播的CSSCI论文并下载"
+"搜几篇关于数字经济的硕士论文，抓取全文"
+"读取我的论文，帮我写一段文献综述"
+"把这些引用插入我的 Word 文档"
+"这篇论文被哪些后续研究引用了"
+"分析一下这批搜索结果的研究趋势"
+"帮我对比这5篇论文的研究方法和发现"
+"帮我优化这篇论文的学术表达"
+```
+
+Agent 会自动识别意图并调用 Scholar Kit。
 
 ## Installation
 
@@ -12,7 +70,7 @@
 Fetch and follow instructions from https://raw.githubusercontent.com/lottshin/scholar-kit/main/setup.md
 ```
 
-Agent 会自动识别平台、clone 到正确位置、安装依赖并验证环境，全程无需手动操作。
+Agent 会自动识别平台、clone 到正确位置、安装依赖并验证环境。
 
 适用于 Cursor、Claude Code 及任何支持 fetch 指令的 AI Agent。
 
@@ -58,32 +116,12 @@ Agent 应自动识别 Scholar Kit 并执行。
 | 浏览器 | Edge 或 Chrome（知网功能需要） |
 | 网络 | 知网需校园网或 VPN |
 | Selenium | 4.10+（自动管理 WebDriver，无需手动下载） |
+| httpx | 可选（未安装时 HTTP 请求走标准库 urllib 兜底） |
 
-## Features
+## Configuration
 
-- **文献搜索** — 多数据源检索，支持核心期刊筛选（北大核心、CSSCI、CSCD 等）
-- **论文下载** — 知网 PDF 批量并行下载（搜索+下载一步完成），英文 OA 论文通过 DOI 获取
-- **全文阅读** — HTML 全文抓取与缓存，支持 .docx/.txt/.md 解析
-- **引用生成** — GB/T 7714、BibTeX、RIS、APA、脚注格式
-- **Word 文档** — Markdown 转学术格式 .docx（含脚注），.docx 补丁（插引用/脚注/参考文献）
-- **文献综述** — 基于检索结果和全文，辅助撰写综述与引用建议
-- **学术表达优化** — 逐段提升论文原创表达质量
-
-## Usage
-
-安装完成后，直接用自然语言指示 Agent：
-
-```
-"帮我搜索关于乡村振兴的核心期刊论文"
-"搜20篇新闻传播的CSSCI论文并下载"
-"读取我的论文，帮我写一段文献综述"
-"把这些引用插入我的 Word 文档"
-"帮我优化这篇论文的学术表达"
-```
-
-Agent 会自动识别意图并调用 Scholar Kit。无需记忆任何命令。
-
-## Configuration (Optional)
+<details>
+<summary>可选配置</summary>
 
 在项目目录下创建 `.scholar-kit/config.json`：
 
@@ -99,7 +137,18 @@ Agent 会自动识别意图并调用 Scholar Kit。无需记忆任何命令。
 
 也可通过环境变量覆盖，详见 [SKILL.md](SKILL.md#配置)。
 
+</details>
+
+## Platform Notes
+
+- **知网功能**需要本地桌面浏览器（Edge/Chrome）+ 校园网/VPN，沙箱环境中需具备这两个条件才可用
+- **其他功能**（API 搜索、引用生成、Word 文档处理、引文网络、趋势分析）在所有平台均可用
+- `check` 命令返回 `capabilities` 字段，Agent 据此自动选择可用的数据源
+
 ## File Structure
+
+<details>
+<summary>展开目录结构</summary>
 
 ```
 scholar-kit/
@@ -111,7 +160,8 @@ scholar-kit/
 ├── references/           ← Agent 按需读取的参考文档
 │   ├── core-journals.md
 │   ├── error-codes.md
-│   └── environment.md
+│   ├── environment.md
+│   └── workflows.md
 └── scripts/              ← Python 脚本
     ├── literature.py     ← 统一 CLI 入口
     ├── requirements.txt
@@ -120,6 +170,19 @@ scholar-kit/
     ├── search.py
     └── cnki/             ← 知网模块
 ```
+
+</details>
+
+## Update
+
+在 skill 安装目录执行：
+
+```bash
+git pull
+pip install -r scripts/requirements.txt
+```
+
+`check` 命令会自动检测是否有新版本可用。
 
 ## Disclaimer
 

@@ -105,8 +105,14 @@ def _get_title(driver) -> str:
 
 
 def _click_download_btn(driver, file_format: str = "pdf") -> bool:
-    """点击下载按钮，成功返回 True"""
+    """点击下载按钮，成功返回 True。
+
+    知网不同页面（期刊 vs 学位论文）的按钮 ID/结构不一致，
+    因此先按 ID 找，再按链接文字找，确保都能命中。
+    """
     btn_id = "pdfDown" if file_format == "pdf" else "cajDown"
+    btn_text = "PDF下载" if file_format == "pdf" else "CAJ下载"
+
     btn_selectors = [
         (By.ID, btn_id),
         (By.CSS_SELECTOR, "a#{}".format(btn_id)),
@@ -114,13 +120,38 @@ def _click_download_btn(driver, file_format: str = "pdf") -> bool:
     ]
     for by, selector in btn_selectors:
         try:
-            btn = WebDriverWait(driver, 10).until(
+            btn = WebDriverWait(driver, 5).until(
                 EC.element_to_be_clickable((by, selector))
             )
             btn.click()
             return True
         except (TimeoutException, NoSuchElementException):
             continue
+
+    try:
+        links = driver.find_elements(By.CSS_SELECTOR, "a")
+        for link in links:
+            text = (link.text or "").strip()
+            if text == btn_text:
+                link.click()
+                return True
+            href = link.get_attribute("href") or ""
+            if "download" in href and btn_text[:3] in text:
+                link.click()
+                return True
+    except Exception:
+        pass
+
+    if file_format == "pdf":
+        try:
+            caj_btn = driver.find_element(By.ID, "cajDown")
+            if caj_btn:
+                _log("[cnki-download] PDF 按钮未找到，尝试 CAJ 兜底")
+                caj_btn.click()
+                return True
+        except (NoSuchElementException, Exception):
+            pass
+
     return False
 
 
@@ -252,8 +283,15 @@ def _trigger_batch_window(
         _log(f"[cnki-download] [{idx}/{total}] 并行打开: {url[:80]}...")
         orphan_handle = None
         try:
+            before_open = set(driver.window_handles)
             driver.execute_script("window.open('');")
-            orphan_handle = driver.window_handles[-1]
+            after_open = set(driver.window_handles)
+            new_handles = after_open - before_open
+            if not new_handles:
+                _log(f"[cnki-download] [{idx}/{total}] 未能打开新标签")
+                batch_errors.append({"url": url, "code": "CNKI_DOWNLOAD_FAILED", "error": "无法打开新标签页"})
+                continue
+            orphan_handle = new_handles.pop()
             driver.switch_to.window(orphan_handle)
             driver.get(url)
             tab_handles.append((url, orphan_handle, idx))
@@ -422,7 +460,10 @@ def batch_download_cnki(
     if owns_driver:
         accessible, msg = check_cnki_access()
         if not accessible:
-            return {"status": "error", "code": "CNKI_UNREACHABLE", "message": msg}
+            if msg.startswith("SANDBOX_BLOCKED"):
+                _log("[cnki-download] 沙盒限制导致预检失败，继续尝试...")
+            else:
+                return {"status": "error", "code": "CNKI_UNREACHABLE", "message": msg}
 
     total = len(urls)
     _log(f"[cnki-download] 开始批量下载: {total} 篇论文"

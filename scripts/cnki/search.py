@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -33,6 +34,27 @@ def _year_from_date(date_str: str) -> Optional[int]:
         return None
 
 
+def _filter_by_year(results: list, year_from: Optional[int], year_to: Optional[int]) -> list:
+    """客户端年份过滤，用于 UI 侧边栏筛选失败时的兜底。无日期或解析失败的条目保留。"""
+    if not results or (year_from is None and year_to is None):
+        return results
+    filtered = []
+    for r in results:
+        if not r.get("date"):
+            filtered.append(r)
+            continue
+        y = _year_from_date(r["date"])
+        if y is None:
+            filtered.append(r)
+            continue
+        if year_from is not None and y < year_from:
+            continue
+        if year_to is not None and y > year_to:
+            continue
+        filtered.append(r)
+    return filtered
+
+
 # ── 搜索 ─────────────────────────────────────────────
 
 def search_cnki(
@@ -42,6 +64,8 @@ def search_cnki(
     year_to: int = None,
     author: str = None,
     journal: str = None,
+    doc_type: str = None,
+    field: str = None,
     sort: str = "relevance",
     pages: int = 1,
     _keep_driver: bool = False,
@@ -51,11 +75,13 @@ def search_cnki(
 
     Args:
         keyword:       搜索关键词
-        core:          核心期刊筛选 (北大核心/CSSCI/CSCD/SCI/EI/科技核心)
+        core:          核心期刊筛选 (北大核心/CSSCI/AMI/WJCI/CSCD/EI)
         year_from:     起始年份
         year_to:       截止年份
         author:        作者
         journal:       期刊名
+        doc_type:      文献类型 (master/doctor/thesis/journal/conference/newspaper)
+        field:         搜索字段 (主题/篇名/关键词/摘要/全文/作者/来源)，默认主题
         sort:          排序方式 (relevance/date/citations)
         pages:         抓取页数
         _keep_driver:  内部参数。为 True 时搜索成功后不关闭浏览器，
@@ -66,11 +92,15 @@ def search_cnki(
         _keep_driver=True 且成功:  tuple[list[dict], WebDriver] — (论文列表, 浏览器实例)
         搜索异常时始终返回:        list[dict] — 含 status=error 的单元素列表
     """
-    _log(f"[cnki] 开始搜索: keyword={keyword}, core={core}, year_from={year_from}")
+    _log(f"[cnki] 开始搜索: keyword={keyword}, core={core}, "
+         f"year_from={year_from}, doc_type={doc_type}, field={field}")
     accessible, msg = check_cnki_access()
     _log(f"[cnki] 网络检测: accessible={accessible}, msg={msg}")
     if not accessible:
-        return [{"status": "error", "code": "CNKI_UNREACHABLE", "message": msg}]
+        if msg.startswith("SANDBOX_BLOCKED"):
+            _log("[cnki] 沙盒限制导致预检失败，浏览器可能仍可访问，继续尝试...")
+        else:
+            return [{"status": "error", "code": "CNKI_UNREACHABLE", "message": msg}]
 
     driver = None
     should_quit = True
@@ -83,17 +113,19 @@ def search_cnki(
         time.sleep(1)
         _load_cookies(driver)
 
-        use_advanced = bool(author or journal)
+        use_advanced = bool(author or journal or (field and field != "主题"))
 
         if use_advanced:
-            _log(f"[cnki] 使用高级搜索: keyword={keyword}, author={author}, journal={journal}")
+            _log(f"[cnki] 使用高级搜索: keyword={keyword}, field={field}, "
+                 f"author={author}, journal={journal}")
             driver.get(CNKI_ADV_SEARCH_URL)
             time.sleep(REQUEST_INTERVAL)
             driver = _handle_captcha(driver)
 
+            kw_field = field or "主题"
             conditions = []
             if keyword:
-                conditions.append(("主题", keyword))
+                conditions.append((kw_field, keyword))
             if author:
                 conditions.append(("作者", author))
             if journal:
@@ -128,6 +160,13 @@ def search_cnki(
             _log("[cnki] 搜索结果已加载")
         except TimeoutException:
             _log("[cnki] [!] 等待结果表格超时，尝试继续...")
+
+        if doc_type:
+            doc_type_ok = _switch_to_doc_type(driver, doc_type)
+            if doc_type_ok:
+                driver = _handle_captcha(driver)
+            else:
+                _log(f"[cnki] 文献类型筛选 '{doc_type}' 未生效")
 
         core_filter_ok = False
         if core:
@@ -167,22 +206,7 @@ def search_cnki(
                     r["is_core"] = True
                     r["core_type"] = ",".join(core_labels)
 
-        if (year_from is not None or year_to is not None) and all_results:
-            filtered = []
-            for r in all_results:
-                if not r.get("date"):
-                    filtered.append(r)
-                    continue
-                y = _year_from_date(r["date"])
-                if y is None:
-                    filtered.append(r)
-                    continue
-                if year_from is not None and y < year_from:
-                    continue
-                if year_to is not None and y > year_to:
-                    continue
-                filtered.append(r)
-            all_results = filtered
+        all_results = _filter_by_year(all_results, year_from, year_to)
 
         if _keep_driver:
             should_quit = False
@@ -227,6 +251,8 @@ def batch_search_cnki(
     core: str = None,
     author: str = None,
     journal: str = None,
+    doc_type: str = None,
+    field: str = None,
     year_from: int = None,
     year_to: int = None,
     sort: str = "relevance",
@@ -240,6 +266,8 @@ def batch_search_cnki(
         core:      核心期刊筛选
         author:    作者（对每组关键词生效）
         journal:   期刊名（对每组关键词生效）
+        doc_type:  文献类型筛选
+        field:     搜索字段
         year_from: 起始年份
         year_to:   截止年份
         sort:      排序方式
@@ -254,7 +282,10 @@ def batch_search_cnki(
     _log(f"[cnki-batch] 开始批量搜索: {len(keywords)} 组关键词")
     accessible, msg = check_cnki_access()
     if not accessible:
-        return {"status": "error", "code": "CNKI_UNREACHABLE", "message": msg}
+        if msg.startswith("SANDBOX_BLOCKED"):
+            _log("[cnki-batch] 沙盒限制导致预检失败，浏览器可能仍可访问，继续尝试...")
+        else:
+            return {"status": "error", "code": "CNKI_UNREACHABLE", "message": msg}
 
     driver = None
     all_results = []
@@ -276,7 +307,7 @@ def batch_search_cnki(
         _save_cookies(driver)
         _log("[cnki-batch] 浏览器就绪，开始逐组搜索...")
 
-        use_advanced = bool(author or journal)
+        use_advanced = bool(author or journal or (field and field != "主题"))
 
         for idx, keyword in enumerate(keywords):
             _log(f"\n[cnki-batch] === 搜索 {idx + 1}/{len(keywords)}: {keyword} ===")
@@ -293,9 +324,10 @@ def batch_search_cnki(
                     driver = _handle_captcha(driver)
 
                 if use_advanced:
+                    kw_field = field or "主题"
                     conditions = []
                     if keyword:
-                        conditions.append(("主题", keyword))
+                        conditions.append((kw_field, keyword))
                     if author:
                         conditions.append(("作者", author))
                     if journal:
@@ -318,6 +350,10 @@ def batch_search_cnki(
                     )
                 except TimeoutException:
                     _log(f"[cnki-batch] 等待结果超时: {keyword}")
+
+                if doc_type and idx == 0:
+                    if _switch_to_doc_type(driver, doc_type):
+                        driver = _handle_captcha(driver)
 
                 kw_core_ok = False
                 if core:
@@ -366,9 +402,15 @@ def batch_search_cnki(
                 continue
 
         deduped = _dedupe_results(all_results)
-        _log(f"\n[cnki-batch] 完成: 总计 {len(all_results)} 条, 去重后 {len(deduped)} 条, 错误 {len(errors)} 组")
+        deduped = _filter_by_year(deduped, year_from, year_to)
 
-        result: Dict[str, Any] = {"status": "success", "count": len(deduped), "results": deduped}
+        _log(f"\n[cnki-batch] 完成: 总计 {len(all_results)} 条, 去重/过滤后 {len(deduped)} 条, 错误 {len(errors)} 组")
+
+        result: Dict[str, Any] = {
+            "status": "partial" if errors else "success",
+            "count": len(deduped),
+            "results": deduped,
+        }
         if errors:
             result["errors"] = errors
         if core and core_filter_results:
@@ -397,15 +439,15 @@ def batch_search_cnki(
 def _input_search_keyword(driver, keyword: str):
     """在知网搜索页面输入关键词并提交"""
     selectors = [
-        (By.ID, "txt_SearchText"),
-        (By.CSS_SELECTOR, "input.search-input"),
-        (By.CSS_SELECTOR, "input[name='txt_1_value1']"),
         (By.CSS_SELECTOR, "#txt_search"),
+        (By.CSS_SELECTOR, "input.search-input"),
+        (By.ID, "txt_SearchText"),
+        (By.CSS_SELECTOR, "input[name='txt_1_value1']"),
     ]
     search_input = None
     for by, selector in selectors:
         try:
-            search_input = WebDriverWait(driver, 10).until(
+            search_input = WebDriverWait(driver, 5).until(
                 EC.presence_of_element_located((by, selector))
             )
             break
@@ -420,15 +462,15 @@ def _input_search_keyword(driver, keyword: str):
     time.sleep(0.5)
 
     btn_selectors = [
-        (By.CSS_SELECTOR, ".search-btn"),
-        (By.CSS_SELECTOR, "input.btnSearch"),
-        (By.CSS_SELECTOR, "button.search-btn"),
-        (By.XPATH, "//input[@type='button' and contains(@onclick, 'search')]"),
+        "input.search-btn",
+        ".search-btn",
+        "input.btnSearch",
+        "button.search-btn",
     ]
-    for by, selector in btn_selectors:
+    for sel in btn_selectors:
         try:
-            btn = driver.find_element(by, selector)
-            btn.click()
+            btn = driver.find_element(By.CSS_SELECTOR, sel)
+            driver.execute_script("arguments[0].click();", btn)
             return
         except (NoSuchElementException, ElementClickInterceptedException):
             continue
@@ -679,41 +721,67 @@ def _set_year_filter(driver, year_from: int = None, year_to: int = None):
         _log(f"[cnki] 年份筛选失败: {e}，将依赖客户端过滤")
 
 
-def _switch_to_journal_db(driver) -> bool:
-    """点击「学术期刊」数据库标签，使搜索限定在期刊范围内。"""
+_DOCTYPE_TAB_MAP = {
+    "journal": ("学术期刊", "期刊"),
+    "master": ("硕士",),
+    "doctor": ("博士",),
+    "thesis": ("学位", "学位论文"),
+    "conference": ("会议",),
+    "newspaper": ("报纸",),
+}
+
+
+def _switch_to_doc_type(driver, doc_type: str) -> bool:
+    """点击知网搜索结果顶部的文献类型标签。
+
+    doc_type 可选: journal / master / doctor / thesis / conference / newspaper
+    """
+    keywords = _DOCTYPE_TAB_MAP.get(doc_type)
+    if not keywords:
+        _log(f"[cnki] 未知文献类型: {doc_type}，可选: {list(_DOCTYPE_TAB_MAP.keys())}")
+        return False
+
     switch_js = r"""
-    var tabs = document.querySelectorAll('.doctype-menus a[name="classify"]');
+    var keywords = arguments[0];
+    var tabs = document.querySelectorAll('.doctype-menus a[name="classify"], .doctype-menus a');
+    var available = [];
     for (var i = 0; i < tabs.length; i++) {
         var t = (tabs[i].textContent || '').trim();
-        if (t.indexOf('学术期刊') >= 0 || t.indexOf('期刊') >= 0) {
-            tabs[i].click();
-            return JSON.stringify({status: 'clicked', text: t, classid: tabs[i].getAttribute('classid')});
+        available.push(t);
+        for (var k = 0; k < keywords.length; k++) {
+            if (t.indexOf(keywords[k]) >= 0) {
+                tabs[i].click();
+                return JSON.stringify({status: 'clicked', text: t,
+                    classid: tabs[i].getAttribute('classid')});
+            }
         }
     }
-    return JSON.stringify({status: 'not_found'});
+    return JSON.stringify({status: 'not_found', available: available});
     """
     try:
-        raw = driver.execute_script(switch_js)
+        raw = driver.execute_script(switch_js, list(keywords))
         info = json.loads(raw) if raw else {}
-        _log(f"[cnki] 切换学术期刊数据库: {json.dumps(info, ensure_ascii=False)}")
+        _log(f"[cnki] 切换文献类型 '{doc_type}': {json.dumps(info, ensure_ascii=False)}")
         if info.get("status") == "clicked":
-            try:
-                WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "dl[groupid]"))
-                )
-            except TimeoutException:
-                _log("[cnki] 等待侧边栏 groupid 面板超时，继续...")
             try:
                 WebDriverWait(driver, 15).until(
                     EC.presence_of_element_located(
                         (By.CSS_SELECTOR, "table.result-table-list, .result-table-list"))
                 )
             except TimeoutException:
-                pass
+                _log("[cnki] 切换文献类型后等待结果超时，继续...")
+            time.sleep(1)
             return True
+        else:
+            _log(f"[cnki] 未找到文献类型标签 '{doc_type}'，可用: {info.get('available', [])}")
     except Exception as e:
-        _log(f"[cnki] 切换数据库失败: {e}")
+        _log(f"[cnki] 切换文献类型失败: {e}")
     return False
+
+
+def _switch_to_journal_db(driver) -> bool:
+    """点击「学术期刊」数据库标签（兼容旧调用）。"""
+    return _switch_to_doc_type(driver, "journal")
 
 
 def _parse_core_input(core: str) -> list[str]:

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .constants import (
-    HAS_SELENIUM, CNKI_SEARCH_URL, REQUEST_INTERVAL, _log,
+    HAS_SELENIUM, REQUEST_INTERVAL, _log,
 )
 from .driver import (
     _detect_browser, _create_driver, _load_cookies, _save_cookies,
@@ -84,7 +84,7 @@ def _parse_detail_page(driver) -> Dict[str, Any]:
         detail["keywords"] = [
             kw.text.strip().rstrip(";；") for kw in kw_els if kw.text.strip()
         ]
-    except NoSuchElementException:
+    except Exception:
         detail["keywords"] = []
 
     try:
@@ -98,13 +98,13 @@ def _parse_detail_page(driver) -> Dict[str, Any]:
     try:
         org_els = driver.find_elements(By.CSS_SELECTOR, ".orgn a, .organ a")
         detail["institutions"] = [o.text.strip() for o in org_els if o.text.strip()]
-    except NoSuchElementException:
+    except Exception:
         detail["institutions"] = []
 
     try:
         fund_els = driver.find_elements(By.CSS_SELECTOR, ".fund a, p.fund a")
         detail["funds"] = [f.text.strip() for f in fund_els if f.text.strip()]
-    except NoSuchElementException:
+    except Exception:
         detail["funds"] = []
 
     return detail
@@ -173,7 +173,9 @@ def _save_cached_fulltext(url: str, data: Dict[str, Any]):
 
 
 def _has_fulltext_slider(driver) -> bool:
-    """检测全文阅读页底部的滑块验证（"请向右滑动验证，继续阅读全文"）"""
+    """检测全文阅读页底部的滑块验证（"请向右滑动验证，继续阅读全文"）。
+    临时关闭 implicit_wait 避免宽泛选择器 × 3s 延迟。
+    """
     try:
         has_text = driver.execute_script(
             "return document.body && ("
@@ -182,14 +184,18 @@ def _has_fulltext_slider(driver) -> bool:
         )
         if has_text:
             return True
-        sliders = driver.find_elements(
-            By.CSS_SELECTOR,
-            ".slider-verify, .verify-slide, .slide-verify, "
-            "[class*='slider'], [class*='captcha'], [class*='verify']"
-        )
-        for s in sliders:
-            if s.is_displayed():
-                return True
+        driver.implicitly_wait(0)
+        try:
+            sliders = driver.find_elements(
+                By.CSS_SELECTOR,
+                ".slider-verify, .verify-slide, .slide-verify, "
+                "[class*='slider'], [class*='captcha'], [class*='verify']"
+            )
+            for s in sliders:
+                if s.is_displayed():
+                    return True
+        finally:
+            driver.implicitly_wait(3)
     except Exception:
         pass
     return False
@@ -363,6 +369,227 @@ def _extract_html_fulltext(driver) -> Optional[str]:
     return "\n\n".join(sections) if sections else None
 
 
+# ── FlowPDF / KXReader 全文阅读（硕博论文） ─────────────
+
+def _flowpdf_extract_all_textlayers(driver, total_pages: int) -> dict:
+    """一次 JS 调用提取所有已加载的 textLayer 文本。"""
+    raw = driver.execute_script("""
+        var canvases = document.querySelectorAll('canvas');
+        var results = {};
+        for (var i = 0; i < canvases.length; i++) {
+            var canvas = canvases[i];
+            function search(el, depth) {
+                if (!el || depth > 3) return '';
+                var tl = el.querySelector('[class*="textLayer"]');
+                if (tl) {
+                    var spans = tl.querySelectorAll('span, div');
+                    var arr = [];
+                    spans.forEach(function(s) {
+                        var t = s.textContent.trim();
+                        if (t) arr.push(t);
+                    });
+                    return arr.join('');
+                }
+                return search(el.parentElement, depth + 1);
+            }
+            var text = search(canvas.parentElement, 0);
+            if (text && text.length > 0) results[i + 1] = text;
+        }
+        return results;
+    """)
+    if not raw:
+        return {}
+    return {int(k): v for k, v in raw.items() if v and v.strip()}
+
+
+def _read_fulltext_flowpdf(driver, detail_url: str) -> Optional[str]:
+    """KXReader 全文提取（硕博论文）。三级加速：API直取 → 批量滚动 → 逐页补漏。"""
+    original_window = driver.current_window_handle
+
+    try:
+        href = driver.execute_script("""
+            var links = document.querySelectorAll('a');
+            for (var i = 0; i < links.length; i++) {
+                var txt = links[i].textContent.trim();
+                if (txt.indexOf('原版') >= 0 || txt.indexOf('在线阅读') >= 0) {
+                    return links[i].href;
+                }
+            }
+            var els = document.querySelectorAll('li, button, span');
+            for (var i = 0; i < els.length; i++) {
+                var txt = els[i].textContent.trim();
+                if (txt === '原版阅读') {
+                    var a = els[i].querySelector('a') || els[i].closest('a');
+                    if (a) return a.href;
+                }
+            }
+            return null;
+        """)
+
+        if not href:
+            dbcode = driver.execute_script(
+                "var e = document.getElementById('param-dbcode'); return e ? e.value : '';")
+            dbname = driver.execute_script(
+                "var e = document.getElementById('param-dbname'); return e ? e.value : '';")
+            filename = driver.execute_script(
+                "var e = document.getElementById('param-filename'); return e ? e.value : '';")
+            if dbcode and filename:
+                href = (f"https://kns.cnki.net/KXReader/Detail"
+                        f"?DBCODE={dbcode}&DBNAME={dbname}&FILENAME={filename}")
+                _log(f"[cnki-flowpdf] 构造 KXReader URL: {href[:80]}")
+            else:
+                _log("[cnki-flowpdf] 未找到原版阅读链接，也无法构造 URL")
+                return None
+
+        _log(f"[cnki-flowpdf] 原版阅读链接: {href[:80]}")
+
+        handles_before = set(driver.window_handles)
+        driver.execute_script("window.open(arguments[0], '_blank');", href)
+        time.sleep(3)
+
+        new_handles = set(driver.window_handles) - handles_before
+        if not new_handles:
+            _log("[cnki-flowpdf] 未能打开新标签页")
+            return None
+
+        new_window = new_handles.pop()
+        try:
+            driver.switch_to.window(new_window)
+
+            try:
+                WebDriverWait(driver, 20).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "canvas"))
+                )
+            except TimeoutException:
+                _log("[cnki-flowpdf] 页面加载超时（未发现 canvas）")
+                return None
+
+            driver = _handle_captcha(driver)
+
+            total_pages = driver.execute_script(
+                "return document.querySelectorAll('canvas').length;")
+            if not total_pages:
+                _log("[cnki-flowpdf] 未找到 canvas 元素，无法提取")
+                return None
+
+            _log(f"[cnki-flowpdf] 共 {total_pages} 页")
+
+            # ── 方法 1: PDF.js API 直取（最快，~3s） ──────────────
+            all_pages = {}
+            try:
+                driver.set_script_timeout(30)
+                api_result = driver.execute_async_script("""
+                    var cb = arguments[arguments.length - 1];
+                    try {
+                        var app = window.PDFViewerApplication;
+                        if (!app) {
+                            var iframes = document.querySelectorAll('iframe');
+                            for (var f = 0; f < iframes.length; f++) {
+                                try { if (iframes[f].contentWindow.PDFViewerApplication)
+                                    { app = iframes[f].contentWindow.PDFViewerApplication; break; }
+                                } catch(e) {}
+                            }
+                        }
+                        if (!app || !app.pdfDocument) { cb(null); return; }
+                        var doc = app.pdfDocument;
+                        var n = doc.numPages;
+                        var results = {};
+                        var done = 0;
+                        for (var i = 1; i <= n; i++) {
+                            (function(pn) {
+                                doc.getPage(pn).then(function(page) {
+                                    return page.getTextContent();
+                                }).then(function(content) {
+                                    results[pn] = content.items.map(function(it) {
+                                        return it.str;
+                                    }).join('');
+                                    done++;
+                                    if (done === n) cb(results);
+                                }).catch(function() { done++; if (done === n) cb(results); });
+                            })(i);
+                        }
+                        setTimeout(function() { cb(results); }, 25000);
+                    } catch(e) { cb(null); }
+                """)
+                if api_result:
+                    all_pages = {int(k): v.strip() for k, v in api_result.items()
+                                 if v and v.strip()}
+                    if len(all_pages) >= total_pages * 0.5:
+                        _log(f"[cnki-flowpdf] PDF.js API 直取成功: "
+                             f"{len(all_pages)}/{total_pages} 页")
+            except Exception as e:
+                _log(f"[cnki-flowpdf] PDF.js API 不可用: {e}")
+
+            # ── 方法 2: 批量滚动 + 一次性提取（~30s） ─────────────
+            if len(all_pages) < total_pages * 0.5:
+                _log("[cnki-flowpdf] 使用批量滚动模式...")
+                for batch_end in range(5, total_pages + 5, 5):
+                    target = min(batch_end, total_pages) - 1
+                    driver.execute_script(f"""
+                        var c = document.querySelectorAll('canvas');
+                        if (c.length > {target})
+                            c[{target}].scrollIntoView({{block: 'center'}});
+                    """)
+                    time.sleep(0.5)
+                    if batch_end % 50 == 0:
+                        driver = _handle_captcha(driver)
+
+                time.sleep(3)
+                all_pages = _flowpdf_extract_all_textlayers(driver, total_pages)
+                _log(f"[cnki-flowpdf] 批量提取: {len(all_pages)}/{total_pages} 页")
+
+            # ── 方法 3: 逐页补漏（仅处理缺失页） ─────────────────
+            if 0 < len(all_pages) < total_pages * 0.8:
+                missing = [p for p in range(1, total_pages + 1)
+                           if p not in all_pages]
+                if missing:
+                    _log(f"[cnki-flowpdf] 补漏 {len(missing)} 页...")
+                    for page_num in missing:
+                        driver.execute_script(f"""
+                            var c = document.querySelectorAll('canvas');
+                            if (c.length >= {page_num})
+                                c[{page_num - 1}].scrollIntoView({{block: 'center'}});
+                        """)
+                        time.sleep(0.8)
+                    time.sleep(2)
+                    all_pages = _flowpdf_extract_all_textlayers(driver, total_pages)
+                    _log(f"[cnki-flowpdf] 补漏后: {len(all_pages)}/{total_pages} 页")
+
+            if not all_pages:
+                _log("[cnki-flowpdf] 未能提取到任何文本")
+                return None
+
+            parts = [all_pages[p] for p in sorted(all_pages.keys())]
+            combined = "\n\n".join(parts)
+            lines = combined.split("\n")
+            deduped = []
+            for line in lines:
+                s = line.strip()
+                if s and (not deduped or s != deduped[-1]):
+                    deduped.append(s)
+            result = "\n".join(deduped)
+
+            _log(f"[cnki-flowpdf] 提取完成: {len(all_pages)}/{total_pages} 页, "
+                 f"{len(result)} 字")
+            return result if len(result) > 200 else None
+
+        finally:
+            try:
+                if new_window in driver.window_handles:
+                    driver.switch_to.window(new_window)
+                    driver.close()
+            except Exception:
+                pass
+            try:
+                driver.switch_to.window(original_window)
+            except Exception:
+                pass
+
+    except Exception as e:
+        _log(f"[cnki-flowpdf] 提取失败: {e}")
+        return None
+
+
 # ── 批量详情 ──────────────────────────────────────────
 
 def batch_read_detail(
@@ -398,11 +625,6 @@ def batch_read_detail(
         driver.get("https://kns.cnki.net/")
         time.sleep(1)
         _load_cookies(driver)
-
-        driver.get(CNKI_SEARCH_URL)
-        time.sleep(REQUEST_INTERVAL)
-
-        driver = _handle_captcha(driver)
         _save_cookies(driver)
 
         for idx, paper in enumerate(targets):
@@ -436,6 +658,9 @@ def batch_read_detail(
 
                 if fulltext:
                     ft = _read_fulltext_html(driver, url)
+                    if not ft:
+                        _log("[cnki-detail] HTML阅读不可用，尝试原版阅读(FlowPDF)...")
+                        ft = _read_fulltext_flowpdf(driver, url)
                     if ft:
                         paper["has_fulltext"] = True
                         paper["fulltext"] = ft
@@ -451,7 +676,7 @@ def batch_read_detail(
                             "fulltext_length": len(ft),
                         })
                     else:
-                        _log("[cnki-detail] 全文获取失败，仅保留摘要")
+                        _log("[cnki-detail] HTML阅读和原版阅读均失败，仅保留摘要")
                         paper["has_fulltext"] = False
                 else:
                     _log(f"[cnki-detail] 摘要: {paper.get('abstract', '')[:60]}...")

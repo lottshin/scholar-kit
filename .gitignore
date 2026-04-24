@@ -1,5 +1,5 @@
 # Runtime data (cookies, session, cache)
-.scholar-kit/
+**/.scholar-kit/
 
 # Downloaded papers
 papers/
@@ -28,6 +28,7 @@ scripts/_batch_urls.txt
 scripts/_parse_search.py
 
 # Test artifacts
+_test_*.py
 scripts/test_papers/
 *.tmp
 *.bak

@@ -1,8 +1,8 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.2.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.4.0)
 用法:
-  python literature.py search "关键词" [--source cnki|openalex|semantic|arxiv|nssd|all] [--author] [--journal] [--download] ...
-  python literature.py batch-search "词1" "词2" ... [--query-file kw.txt] [--core CSSCI] [--author] [--journal] [--append]
+  python literature.py search "关键词" [--source cnki|openalex|semantic|arxiv|nssd|all] [--doc-type master] [--field 摘要] [--author] [--journal] [--download] ...
+  python literature.py batch-search "词1" "词2" ... [--query-file kw.txt] [--core CSSCI] [--doc-type master] [--field 摘要] [--author] [--journal] [--append]
   python literature.py read-detail [--top-n 5] [--fulltext]
   python literature.py read-paper <论文.docx> [--output paper.txt]
   python literature.py download <url_or_doi> [--dir ./papers] [--doi DOI]
@@ -10,20 +10,23 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.2.0)
   python literature.py batch-download url1 url2 ... [--dir ./papers]
   python literature.py detail <cnki_url>
   python literature.py export --format bibtex|ris|markdown|json|excel|gbt7714|footnote|apa [--output file]
-  python literature.py cite --style gbt7714|footnote|apa
+  python literature.py cite --style gbt7714|gb|footnote|apa
   python literature.py import <filepath>
   python literature.py write-docx <draft.md> [--output 论文.docx]
   python literature.py patch-docx <原论文.docx> --patch patch.json [--output 修改后.docx]
-  python literature.py check                    # 环境自检
+  python literature.py citations <DOI|URL> [--direction citing|cited|both] [--limit 20]
+  python literature.py trends                  # 研究趋势（基于会话数据）
+  python literature.py check                   # 环境自检
   python literature.py clean-cache [--all] [--dry-run]  # 缓存清理
 """
 
 from __future__ import annotations
 
-__version__ = "1.2.0"
+__version__ = "1.4.0"
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -40,6 +43,7 @@ if _script_dir not in sys.path:
 from search import (  # noqa: E402
     search_openalex, search_semantic_scholar, search_arxiv,
     search_nssd, search_all, resolve_crossref, resolve_unpaywall,
+    get_citations, analyze_trends,
 )
 from cnki import (  # noqa: E402
     search_cnki, batch_search_cnki, batch_read_detail,
@@ -103,6 +107,7 @@ def cmd_search(args):
 
     results = []
     reuse_driver = None
+    cnki_error = None
 
     if source in ("cnki", "all"):
         keep = want_download and source == "cnki"
@@ -113,6 +118,8 @@ def cmd_search(args):
             year_to=args.year_to,
             author=args.author,
             journal=args.journal,
+            doc_type=getattr(args, "doc_type", None),
+            field=getattr(args, "field", None),
             sort=args.sort or "relevance",
             pages=args.pages or 1,
             _keep_driver=keep,
@@ -125,12 +132,14 @@ def cmd_search(args):
         if cnki_results and not (len(cnki_results) == 1 and cnki_results[0].get("status") == "error"):
             results.extend(cnki_results)
         elif cnki_results and cnki_results[0].get("status") == "error":
-            _output(cnki_results[0])
             if source == "cnki":
+                _output(cnki_results[0])
                 if reuse_driver:
                     try: reuse_driver.quit()
                     except Exception: pass
                 return
+            # source == "all" 时知网失败不阻断，记录错误后继续 API 搜索
+            cnki_error = cnki_results[0]
 
     try:
         has_keyword = bool(args.query and args.query.strip())
@@ -144,13 +153,22 @@ def cmd_search(args):
             ))
 
         if has_keyword and source in ("semantic", "all"):
-            results.extend(search_semantic_scholar(args.query, limit=api_limit))
+            results.extend(search_semantic_scholar(
+                args.query, limit=api_limit,
+                year_from=args.year_from, year_to=args.year_to,
+            ))
 
         if has_keyword and source in ("arxiv", "all"):
-            results.extend(search_arxiv(args.query, limit=api_limit, sort_by=args.sort or "relevance"))
+            results.extend(search_arxiv(
+                args.query, limit=api_limit, sort_by=args.sort or "relevance",
+                year_from=args.year_from, year_to=args.year_to,
+            ))
 
         if has_keyword and source in ("nssd", "all"):
-            results.extend(search_nssd(args.query, limit=api_limit))
+            results.extend(search_nssd(
+                args.query, limit=api_limit,
+                year_from=args.year_from, year_to=args.year_to,
+            ))
 
         seen = set()
         deduped = []
@@ -173,13 +191,19 @@ def cmd_search(args):
             effective_limit = 20
         deduped = deduped[:effective_limit]
 
-        _save_session(deduped)
+        _save_session(deduped, append=getattr(args, "append", False))
 
         search_output = {"status": "success", "count": len(deduped), "results": deduped}
+        if cnki_error and source == "all":
+            search_output["cnki_error"] = {"code": cnki_error.get("code"), "message": cnki_error.get("message")}
+            search_output["status"] = "partial"
         if args.export:
             content = export_papers(deduped, args.export, args.output)
-            search_output.update({"format": args.export, "output_file": args.output,
-                                  "content": content})
+            if isinstance(content, dict) and content.get("status") == "error":
+                search_output["export_error"] = content
+            else:
+                search_output.update({"format": args.export, "output_file": args.output,
+                                      "content": content})
 
         if want_download and reuse_driver:
             from config import get as cfg_get
@@ -303,10 +327,13 @@ def cmd_detail(args):
 def cmd_export(args):
     papers = _load_session()
     if not papers:
-        _output({"status": "error", "code": "NO_SESSION_DATA", "message": "没有可导出的数据，请先执行 search 命令"})
+        _output({"status": "error", "code": "NO_SESSION_DATA", "message": "没有可导出的数据，请先执行 search、batch-search 或 import"})
         return
 
     result = export_papers(papers, args.export_format, args.output)
+    if isinstance(result, dict) and result.get("status") == "error":
+        _output(result)
+        return
     if args.raw:
         print(result)
     else:
@@ -319,7 +346,7 @@ def cmd_export(args):
 def cmd_cite(args):
     papers = _load_session()
     if not papers:
-        _output({"status": "error", "code": "NO_SESSION_DATA", "message": "没有可格式化的数据，请先执行 search 命令"})
+        _output({"status": "error", "code": "NO_SESSION_DATA", "message": "没有可格式化的数据，请先执行 search、batch-search 或 import"})
         return
 
     enriched = []
@@ -466,54 +493,119 @@ def cmd_batch_search(args):
         core=args.core,
         author=getattr(args, "author", None),
         journal=getattr(args, "journal", None),
+        doc_type=getattr(args, "doc_type", None),
+        field=getattr(args, "field", None),
         year_from=args.year_from,
         year_to=args.year_to,
         sort=args.sort or "relevance",
         pages=args.pages or 1,
     )
 
-    if result.get("status") == "success":
+    if result.get("status") in ("success", "partial") and result.get("results"):
         _save_session(result.get("results") or [], append=args.append)
 
     if args.export and result.get("results"):
         content = export_papers(result["results"], args.export, args.output)
-        _output({"status": "success", "count": len(result["results"]),
-                 "format": args.export, "output_file": args.output,
-                 "content": content})
+        if isinstance(content, dict) and content.get("status") == "error":
+            _output(content)
+            return
+        export_output = {"status": result.get("status", "success"),
+                         "count": len(result["results"]),
+                         "format": args.export, "output_file": args.output,
+                         "content": content}
+        if result.get("errors"):
+            export_output["errors"] = result["errors"]
+        _output(export_output)
     else:
         _output(result)
 
 
 # ── read-detail 命令 ──────────────────────────────────
 
+def _is_cnki_paper(paper: dict) -> bool:
+    url = paper.get("url", "")
+    source = paper.get("source", "")
+    return "cnki" in url.lower() or source == "CNKI" or source == "CNKI-export"
+
+
+def _parse_indices(raw: str, total: int) -> List[int]:
+    """解析用户传入的序号字符串，返回 0-based 索引列表。
+
+    支持格式: "3" "1,3,9" "2-5" "1,3-5,8" （序号从 1 开始）
+    """
+    indices: List[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            lo_i, hi_i = int(lo.strip()), int(hi.strip())
+            indices.extend(range(lo_i - 1, min(hi_i, total)))
+        else:
+            i = int(part.strip()) - 1
+            if 0 <= i < total:
+                indices.append(i)
+    return sorted(set(indices))
+
+
 def cmd_read_detail(args):
     """对会话中的论文批量获取摘要/全文"""
     papers = _load_session()
     if not papers:
         _output({"status": "error", "code": "NO_SESSION_DATA",
-                 "message": "没有可读取的论文，请先执行 search 或 batch-search"})
+                 "message": "没有可读取的论文，请先执行 search、batch-search 或 import"})
         return
 
-    top_n = args.top_n or 5
     do_fulltext = args.fulltext
+    indices_raw = getattr(args, "indices", None)
 
-    print(f"[read-detail] 从会话中读取 {len(papers)} 篇论文，"
-          f"将获取前 {top_n} 篇的{'全文' if do_fulltext else '摘要'}",
+    if indices_raw:
+        pick_idx = _parse_indices(indices_raw, len(papers))
+        if not pick_idx:
+            _output({"status": "error", "code": "INVALID_INDICES",
+                     "message": f"无效序号 '{indices_raw}'，会话共 {len(papers)} 篇（序号 1-{len(papers)}）"})
+            return
+        selected = [papers[i] for i in pick_idx]
+        label = f"第 {indices_raw} 篇"
+    else:
+        top_n = args.top_n or 5
+        selected = papers[:top_n]
+        label = f"前 {len(selected)} 篇"
+
+    print(f"[read-detail] 会话共 {len(papers)} 篇，将获取{label}的{'全文' if do_fulltext else '摘要'}",
           file=sys.stderr)
 
+    cnki_selected = [p for p in selected if _is_cnki_paper(p)]
+    non_cnki_selected = [p for p in selected if not _is_cnki_paper(p)]
+    if not cnki_selected:
+        _output({"status": "warning", "code": "NO_SESSION_DATA",
+                 "message": "所选论文中无知网论文，read-detail 仅支持知网论文。API 源论文请直接使用搜索时返回的摘要",
+                 "count": len(non_cnki_selected), "results": non_cnki_selected})
+        return
     enriched = batch_read_detail(
-        papers=papers,
-        top_n=top_n,
+        papers=cnki_selected,
+        top_n=len(cnki_selected),
         fulltext=do_fulltext,
     )
+    enriched.extend(non_cnki_selected)
 
-    session_papers = []
-    for p in enriched:
-        sp = {k: v for k, v in p.items() if k != "fulltext"}
-        session_papers.append(sp)
+    if indices_raw:
+        updated = list(papers)
+        enriched_map = {p.get("url", ""): p for p in enriched if p.get("url")}
+        for i in pick_idx:
+            url = updated[i].get("url", "")
+            if url in enriched_map:
+                merged = {k: v for k, v in enriched_map[url].items() if k != "fulltext"}
+                merged.update({k: updated[i][k] for k in updated[i] if k not in merged})
+                updated[i] = merged
+        session_papers = updated
+    else:
+        session_papers = []
+        for p in enriched:
+            sp = {k: v for k, v in p.items() if k != "fulltext"}
+            session_papers.append(sp)
     _save_session(session_papers)
 
-    output_papers = enriched[:top_n]
+    output_papers = enriched
     results = []
     for p in output_papers:
         entry: Dict[str, Any] = {
@@ -533,10 +625,17 @@ def cmd_read_detail(args):
             entry["fulltext"] = p["fulltext"]
         elif do_fulltext and p.get("fulltext_cache"):
             try:
-                cache_data = json.loads(
-                    Path(p["fulltext_cache"]).read_text(encoding="utf-8")
-                )
-                entry["fulltext"] = cache_data.get("fulltext", "")
+                cache_path = Path(p["fulltext_cache"]).resolve()
+                allowed_dir = (Path.cwd() / ".scholar-kit" / "fulltext").resolve()
+                try:
+                    cache_path.relative_to(allowed_dir)
+                except ValueError:
+                    entry["fulltext"] = ""
+                else:
+                    cache_data = json.loads(
+                        cache_path.read_text(encoding="utf-8")
+                    )
+                    entry["fulltext"] = cache_data.get("fulltext", "")
             except Exception:
                 entry["fulltext"] = ""
 
@@ -749,11 +848,16 @@ def cmd_write_docx(args):
                  "message": f"文件不存在: {args.filepath}"})
         return
 
-    try:
-        md_text = md_path.read_text(encoding="utf-8")
-    except Exception as e:
+    md_text = None
+    for enc in ("utf-8", "utf-8-sig", "gbk", "gb2312", "gb18030"):
+        try:
+            md_text = md_path.read_text(encoding=enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if md_text is None:
         _output({"status": "error", "code": "ENCODING_ERROR",
-                 "message": f"文件读取失败: {e}"})
+                 "message": "文件编码无法识别"})
         return
 
     output_path = Path(args.output) if args.output else md_path.with_suffix(".docx")
@@ -978,7 +1082,7 @@ def cmd_patch_docx(args):
                 _add_footnote_to_element(ftn_element, fn_counter, run_el, fn_text)
                 stats["footnotes_added"] += 1
                 found = True
-            break
+                break
         if not found:
             warnings.append(f"脚注定位失败: \"{after_text[:30]}\"" if len(after_text) > 30 else f"脚注定位失败: \"{after_text}\"")
 
@@ -1024,7 +1128,6 @@ def cmd_patch_docx(args):
 
 def cmd_clean_cache(args):
     """清理 .scholar-kit/ 缓存目录"""
-    import os
     from datetime import datetime, timedelta
     from config import get as cfg_get
 
@@ -1043,8 +1146,9 @@ def cmd_clean_cache(args):
             stats["total"] += 1
             fsize = fpath.stat().st_size
 
-            should_delete = args.clean_all
-            if not should_delete and fname.endswith(".json") and ttl_days > 0:
+            _protected = {"session.json", "config.json", "cookies.json"}
+            should_delete = args.clean_all and fname not in _protected
+            if not should_delete and fname.endswith(".json") and ttl_days > 0 and fname not in _protected:
                 try:
                     data = json.loads(fpath.read_text(encoding="utf-8"))
                     ts = data.get("_cached_at", "")
@@ -1075,14 +1179,215 @@ def cmd_clean_cache(args):
     _output({"status": "success", "mode": mode, **stats})
 
 
+# ── citations 命令 ────────────────────────────────────
+
+def cmd_citations(args):
+    """引文网络分析：获取论文的前向/后向引用"""
+    paper_id = args.paper_id
+    if not paper_id:
+        _output({"status": "error", "code": "NO_PAPER_ID",
+                 "message": "请提供论文标识（DOI、URL 或 arXiv ID）"})
+        return
+
+    direction = args.direction or "both"
+    limit = args.limit or 20
+
+    print(f"[citations] 查询 {paper_id} 的引文网络（方向: {direction}）...",
+          file=sys.stderr)
+
+    result = get_citations(paper_id, direction=direction, limit=limit)
+
+    if "error" in result:
+        _output({"status": "error", "code": "RESOLVE_FAILED",
+                 "message": result["error"]})
+        return
+
+    paper = result.get("paper", {})
+    citing = result.get("citing", [])
+    references = result.get("references", [])
+    status = "success" if paper else "partial"
+
+    _output({
+        "status": status,
+        "paper": paper,
+        "citing_count": len(citing),
+        "references_count": len(references),
+        "citing": citing,
+        "references": references,
+    })
+
+
+# ── trends 命令 ───────────────────────────────────────
+
+def cmd_trends(args):
+    """研究趋势分析：基于当前会话数据进行聚合统计"""
+    papers = _load_session()
+    if not papers:
+        _output({"status": "error", "code": "NO_SESSION_DATA",
+                 "message": "没有可分析的论文，请先执行 search、batch-search 或 import"})
+        return
+
+    print(f"[trends] 分析 {len(papers)} 篇论文的研究趋势...", file=sys.stderr)
+
+    result = analyze_trends(papers)
+    _output({"status": "success", **result})
+
+
 # ── check 命令 ────────────────────────────────────────
 
-def cmd_check(_args):
-    """环境自检：逐项检查运行条件"""
-    import os
+def _check_browser(subprocess_mod) -> tuple:
+    """检测可用浏览器，返回 (ok: bool, detail: str)"""
+    import shutil as _shutil
+    if sys.platform == "win32":
+        import os as _os
+        for p in [
+            _os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+            _os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+            _os.path.expandvars(r"%LocalAppData%\Microsoft\Edge\Application\msedge.exe"),
+        ]:
+            if _os.path.exists(p):
+                try:
+                    r = subprocess_mod.run([p, "--version"], capture_output=True, text=True, timeout=5)
+                    return True, r.stdout.strip() if r.returncode == 0 else f"Edge ({p})"
+                except Exception:
+                    return True, f"Edge ({p})"
+        _chrome = _shutil.which("chrome") or _shutil.which("google-chrome")
+        if _chrome:
+            return True, f"Chrome ({_chrome})"
+    else:
+        for cmd in ["microsoft-edge", "microsoft-edge-stable", "google-chrome", "chromium", "chromium-browser"]:
+            found = _shutil.which(cmd)
+            if found:
+                try:
+                    r = subprocess_mod.run([found, "--version"], capture_output=True, text=True, timeout=5)
+                    return True, r.stdout.strip() if r.returncode == 0 else cmd
+                except Exception:
+                    return True, cmd
+    return False, "未检测到 Edge/Chrome"
+
+
+def _check_driver() -> tuple:
+    """检测浏览器驱动是否可用，返回 (ok: bool, detail: str)。"""
+    try:
+        from cnki.driver import _detect_browser, _find_local_driver
+        browser = _detect_browser()
+    except Exception as e:
+        return False, f"无法检测浏览器类型: {e}"
+
+    try:
+        from selenium.webdriver.common.selenium_manager import SeleniumManager
+        sm_bin = SeleniumManager._get_binary()
+        if sm_bin and os.path.isfile(str(sm_bin)):
+            import subprocess as _sp
+            browser_arg = "MicrosoftEdge" if browser == "edge" else "chrome"
+            result = _sp.run(
+                [str(sm_bin), "--browser", browser_arg, "--offline", "--output", "json"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0:
+                try:
+                    info = json.loads(result.stdout)
+                    driver_path = info.get("result", {}).get("driver_path", "")
+                    if driver_path and os.path.isfile(driver_path):
+                        return True, f"selenium-manager 找到: {driver_path}"
+                except (ValueError, KeyError):
+                    pass
+    except Exception:
+        pass
+
+    local = _find_local_driver(browser)
+    if local:
+        return True, f"本地驱动: {local}"
+
+    driver_name = "msedgedriver" if browser == "edge" else "chromedriver"
+    return False, (
+        f"未找到 {driver_name}（Selenium Manager 需联网下载）。"
+        f"解决：1) 提权获取网络权限 2) 设置 SCHOLAR_DRIVER_PATH 环境变量"
+    )
+
+
+def _check_cnki() -> tuple:
+    """检测知网连通性，返回 (ok: bool, detail: str)。
+    SANDBOX_BLOCKED 单独标记，让 check 输出能指导 Agent 提权重试。
+    """
+    try:
+        accessible, msg = check_cnki_access()
+        if accessible:
+            return True, "可访问"
+        if msg.startswith("SANDBOX_BLOCKED"):
+            return False, f"沙盒权限阻止（WinError 10013 等），提权后可能正常"
+        return False, msg
+    except Exception as e:
+        return False, str(e)
+
+
+def _fix_sandbox_network() -> List[str]:
+    """检测沙箱环境并写入网络配置。返回已修复项列表。
+
+    注意：Codex 的网络权限在任务创建时锁定，运行中写入 config.toml
+    只对下次任务生效，当前任务仍然无网络。
+    """
+    fixes = []
+
+    codex_dir = Path.cwd() / ".codex"
+    codex_home = Path.home() / ".codex"
+    is_codex_env = (codex_dir.exists() or codex_home.exists()
+                    or os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED"))
+    if is_codex_env:
+        config_targets = []
+        if codex_dir.exists():
+            config_targets.append(codex_dir / "config.toml")
+        if codex_home.exists() and codex_home != codex_dir:
+            config_targets.append(codex_home / "config.toml")
+        if not config_targets:
+            codex_dir.mkdir(parents=True, exist_ok=True)
+            config_targets.append(codex_dir / "config.toml")
+
+        codex_net_config = (
+            '\n# Scholar Kit - 知网检索需要网络权限\n'
+            'approval_policy = "on-request"\n'
+            'sandbox_mode = "workspace-write"\n\n'
+            '[sandbox_workspace_write]\n'
+            'network_access = true\n'
+        )
+        for config_path in config_targets:
+            try:
+                existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+                if "network_access" in existing:
+                    continue
+                with open(config_path, "a", encoding="utf-8") as f:
+                    if existing and not existing.endswith("\n"):
+                        f.write("\n")
+                    f.write(codex_net_config)
+                fixes.append(f"codex: 已写入 {config_path}（network_access = true）")
+            except (PermissionError, OSError):
+                continue
+
+    claude_dir = Path.cwd() / ".claude"
+    if claude_dir.exists():
+        settings_path = claude_dir / "settings.json"
+        try:
+            settings = {}
+            if settings_path.exists():
+                settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            domains = settings.setdefault("sandbox", {}).setdefault("network", {}).setdefault("allowedDomains", [])
+            if "*.cnki.net" not in domains:
+                domains.append("*.cnki.net")
+                settings_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+                fixes.append("claude-code: 已在 .claude/settings.json 添加 *.cnki.net")
+        except Exception:
+            pass
+
+    return fixes
+
+
+def cmd_check(args):
+    """环境自检：逐项检查运行条件，输出能力位供 Agent 决策。--fix 时自动修复可修复项。"""
     import subprocess
+    fix_mode = getattr(args, "fix", False)
 
     checks = []
+    fixes_applied = []
 
     v = sys.version_info
     checks.append({
@@ -1099,9 +1404,34 @@ def cmd_check(_args):
         try:
             mod = __import__(import_name)
             ver = getattr(mod, "__version__", "?")
-            checks.append({"item": pkg, "status": "ok", "detail": ver})
+            status = "ok"
+            detail = ver
+            if pkg == "selenium" and ver != "?":
+                try:
+                    parts = [int(x) for x in ver.split(".")[:2]]
+                    if parts < [4, 10]:
+                        status = "warn"
+                        detail = f"{ver}（需要 >=4.10）"
+                except (ValueError, IndexError):
+                    pass
+            checks.append({"item": pkg, "status": status, "detail": detail})
         except ImportError:
-            checks.append({"item": pkg, "status": "fail", "detail": "未安装"})
+            if pkg == "httpx":
+                checks.append({"item": pkg, "status": "warn", "detail": "未安装（urllib 兜底可用）"})
+            elif fix_mode and pkg == "selenium":
+                try:
+                    subprocess.run(
+                        [sys.executable, "-m", "pip", "install", "selenium>=4.10"],
+                        capture_output=True, timeout=120,
+                    )
+                    mod = __import__(import_name)
+                    ver = getattr(mod, "__version__", "?")
+                    checks.append({"item": pkg, "status": "ok", "detail": ver})
+                    fixes_applied.append(f"selenium: 已自动安装 ({ver})")
+                except Exception as e:
+                    checks.append({"item": pkg, "status": "fail", "detail": f"自动安装失败: {e}"})
+            else:
+                checks.append({"item": pkg, "status": "fail", "detail": "未安装"})
 
     encoding = sys.stdout.encoding or "unknown"
     checks.append({
@@ -1110,53 +1440,174 @@ def cmd_check(_args):
         "detail": encoding,
     })
 
-    browser = "unknown"
-    for name, cmd in [("Edge", "msedge"), ("Chrome", "chrome"), ("Chrome", "google-chrome")]:
-        try:
-            result = subprocess.run(
-                [cmd, "--version"], capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0:
-                browser = result.stdout.strip()
-                break
-        except Exception:
-            continue
+    browser_ok, browser_detail = _check_browser(subprocess)
     checks.append({
         "item": "浏览器",
-        "status": "ok" if browser != "unknown" else "warn",
-        "detail": browser if browser != "unknown" else "未检测到 Edge/Chrome",
+        "status": "ok" if browser_ok else "warn",
+        "detail": browser_detail,
     })
 
-    try:
-        accessible, msg = check_cnki_access()
-        checks.append({
-            "item": "知网连通性",
-            "status": "ok" if accessible else "fail",
-            "detail": "可访问" if accessible else msg,
-        })
-    except Exception as e:
-        checks.append({"item": "知网连通性", "status": "fail", "detail": str(e)})
+    driver_ok, driver_detail = _check_driver()
+    checks.append({
+        "item": "浏览器驱动",
+        "status": "ok" if driver_ok else "warn",
+        "detail": driver_detail,
+    })
+
+    cnki_ok, cnki_detail = _check_cnki()
+    checks.append({
+        "item": "知网连通性",
+        "status": "ok" if cnki_ok else "fail",
+        "detail": cnki_detail,
+    })
+
+    if fix_mode and not cnki_ok:
+        sandbox_fixes = _fix_sandbox_network()
+        if sandbox_fixes:
+            fixes_applied.extend(sandbox_fixes)
+            cnki_ok, cnki_detail = _check_cnki()
+            for c in checks:
+                if c["item"] == "知网连通性":
+                    c["status"] = "ok" if cnki_ok else "fail"
+                    c["detail"] = cnki_detail
+                    break
 
     cache_dir = Path.cwd() / ".scholar-kit"
     if cache_dir.exists():
-        import os as _os
-        total = sum(
-            f.stat().st_size for f in cache_dir.rglob("*") if f.is_file()
-        )
+        total = sum(f.stat().st_size for f in cache_dir.rglob("*") if f.is_file())
         checks.append({
-            "item": "缓存目录",
-            "status": "ok",
+            "item": "缓存目录", "status": "ok",
             "detail": f"{cache_dir} ({round(total/1024/1024, 2)} MB)",
         })
     else:
         checks.append({"item": "缓存目录", "status": "ok", "detail": "尚未创建"})
 
+    selenium_item = next((c for c in checks if c["item"] == "selenium"), None)
+    selenium_ok = selenium_item is not None and selenium_item["status"] != "fail"
+    sandbox_blocked = cnki_detail and "沙盒权限阻止" in cnki_detail
+    cnki_feasible = browser_ok and cnki_ok and selenium_ok and driver_ok
+    cnki_reasons = []
+    if not selenium_ok:
+        cnki_reasons.append("selenium 未安装")
+    if not browser_ok:
+        cnki_reasons.append("未检测到浏览器")
+    if not driver_ok:
+        cnki_reasons.append("浏览器驱动缺失（需联网下载）")
+    if not cnki_ok:
+        cnki_reasons.append("知网不可达（沙盒权限阻止）" if sandbox_blocked else "知网不可达")
+
+    is_codex = (Path.cwd() / ".codex").exists() or os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED")
+
+    capabilities: Dict[str, Any] = {
+        "cnki_feasible": cnki_feasible,
+        "sandbox_blocked": sandbox_blocked,
+        "driver_ok": driver_ok,
+        "api_sources": True,
+        "docx_tools": any(c["item"] == "python-docx" and c["status"] == "ok" for c in checks),
+    }
+    if not cnki_feasible:
+        capabilities["cnki_blocked_reasons"] = cnki_reasons
+        capabilities["suggested_sources"] = ["openalex", "semantic", "arxiv", "nssd"]
+
+        if sandbox_blocked or (is_codex and not driver_ok):
+            capabilities["fix_note"] = (
+                "沙盒限制导致预检/驱动下载失败。"
+                "解决：设置 SCHOLAR_SKIP_NETWORK_CHECK=1，"
+                "然后以提权方式运行知网命令（平台会弹窗让用户授权网络访问）。"
+                "提权后 Selenium Manager 自动下载驱动，所有卡点一步清零"
+            )
+        elif not driver_ok:
+            capabilities["fix_note"] = (
+                "浏览器驱动缺失。确保有网络连接后运行任意知网命令，"
+                "Selenium Manager 会自动下载匹配的驱动。"
+                "或手动设置 SCHOLAR_DRIVER_PATH 环境变量指向已有驱动"
+            )
+        elif fix_mode and not cnki_ok and fixes_applied:
+            capabilities["fix_note"] = "已写入沙箱网络配置但知网仍不可达。可能原因：未连接校园网/VPN"
+
+    update_info = _check_update()
+
     all_ok = all(c["status"] != "fail" for c in checks)
-    _output({
+    output: Dict[str, Any] = {
         "status": "success" if all_ok else "warning",
         "version": __version__,
+        "capabilities": capabilities,
         "checks": checks,
-    })
+    }
+    if fixes_applied:
+        output["fixes_applied"] = fixes_applied
+    if update_info:
+        output["update"] = update_info
+    _output(output)
+
+
+def _check_update():
+    """只读版本对比：本地版本 vs GitHub 最新 Release/Tag（超时不阻塞）"""
+    import re
+    _SEMVER_RE = re.compile(r"^\d+\.\d+(\.\d+)?$")
+
+    repo = "lottshin/scholar-kit"
+    urls = [
+        f"https://api.github.com/repos/{repo}/releases/latest",
+        f"https://api.github.com/repos/{repo}/tags?per_page=1",
+    ]
+
+    try:
+        latest = None
+        for url in urls:
+            if latest:
+                break
+            try:
+                data = _fetch_json(url, timeout=5)
+                if data is None:
+                    continue
+                if isinstance(data, list):
+                    latest = data[0].get("name", "") if data else ""
+                else:
+                    latest = data.get("tag_name", "")
+            except Exception:
+                continue
+
+        if not latest:
+            return None
+
+        latest = latest.removeprefix("v")
+        if not _SEMVER_RE.match(latest):
+            return None
+
+        if latest != __version__:
+            return {
+                "update_available": True,
+                "current": __version__,
+                "latest": latest,
+                "message": f"新版本 {latest} 可用，在 skill 目录执行 git pull 更新",
+            }
+        return {"update_available": False, "current": __version__, "latest": latest}
+    except Exception:
+        return None
+
+
+def _fetch_json(url: str, timeout: int = 10):
+    """HTTP GET 返回 JSON，httpx 优先，urllib 兜底。失败统一返回 None。"""
+    try:
+        import httpx
+        resp = httpx.get(url, timeout=timeout, follow_redirects=True)
+        return resp.json() if resp.status_code == 200 else None
+    except ImportError:
+        pass
+    except Exception:
+        return None
+    try:
+        from urllib.request import urlopen, Request
+        req = Request(url, headers={"User-Agent": "scholar-kit",
+                                    "Accept": "application/json"})
+        with urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            import json as _json
+            return _json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
 
 
 # ── 输出工具 ──────────────────────────────────────────
@@ -1184,6 +1635,12 @@ def main():
     p_search.add_argument("--limit", type=int, default=None, help="结果数量限制（默认 20，多页时自动扩展）")
     p_search.add_argument("--core",
                           help="知网侧边栏来源类别，逗号分隔: 北大核心,CSSCI,AMI,WJCI,CSCD,EI")
+    p_search.add_argument("--doc-type",
+                          choices=["journal", "master", "doctor", "thesis",
+                                   "conference", "newspaper"],
+                          help="文献类型筛选: journal/master/doctor/thesis/conference/newspaper")
+    p_search.add_argument("--field", default=None,
+                          help="搜索字段: 主题(默认)/篇名/关键词/摘要/全文/作者/来源")
     p_search.add_argument("--year-from", type=int, help="起始年份")
     p_search.add_argument("--year-to", type=int, help="截止年份")
     p_search.add_argument("--author", help="作者")
@@ -1199,6 +1656,8 @@ def main():
                           help="下载目录（配合 --download，默认 ./papers）")
     p_search.add_argument("--download-top-n", type=int, default=None,
                           help="下载前 N 篇（配合 --download，默认全部）")
+    p_search.add_argument("--append", action="store_true",
+                          help="追加到已有会话结果（而非覆盖）")
     p_search.set_defaults(func=cmd_search)
 
     # download
@@ -1247,6 +1706,12 @@ def main():
     p_batch.add_argument("--query-file", help="关键词文件路径（每行一个关键词）")
     p_batch.add_argument("--core",
                          help="知网侧边栏来源类别，逗号分隔: 北大核心,CSSCI,AMI,WJCI,CSCD,EI")
+    p_batch.add_argument("--doc-type",
+                         choices=["journal", "master", "doctor", "thesis",
+                                  "conference", "newspaper"],
+                         help="文献类型筛选: journal/master/doctor/thesis/conference/newspaper")
+    p_batch.add_argument("--field", default=None,
+                         help="搜索字段: 主题(默认)/篇名/关键词/摘要/全文/作者/来源")
     p_batch.add_argument("--author", help="作者（对每组关键词生效）")
     p_batch.add_argument("--journal", help="期刊名（对每组关键词生效）")
     p_batch.add_argument("--year-from", type=int, help="起始年份")
@@ -1264,6 +1729,8 @@ def main():
     p_read = sub.add_parser("read-detail", help="批量获取论文摘要/全文（需先搜索）")
     p_read.add_argument("--top-n", type=int, default=5,
                         help="获取前 N 篇论文的详情（默认 5）")
+    p_read.add_argument("--indices", type=str, default=None,
+                        help="指定论文序号（从1开始），如 '3' '1,3,9' '2-5'。指定后忽略 --top-n")
     p_read.add_argument("--fulltext", action="store_true",
                         help="抓取 HTML 全文（默认只抓摘要）")
     p_read.set_defaults(func=cmd_read_detail)
@@ -1299,8 +1766,23 @@ def main():
                          help="仅统计，不实际删除")
     p_clean.set_defaults(func=cmd_clean_cache)
 
+    # citations
+    p_cite_net = sub.add_parser("citations", help="引文网络分析（前向/后向引用）")
+    p_cite_net.add_argument("paper_id", help="论文标识（DOI、Semantic Scholar URL、arXiv ID 等）")
+    p_cite_net.add_argument("--direction", choices=["citing", "cited", "both"], default="both",
+                            help="引用方向：citing=谁引了它，cited=它引了谁，both=双向（默认）")
+    p_cite_net.add_argument("--limit", type=int, default=20,
+                            help="每个方向最多返回条数（默认 20）")
+    p_cite_net.set_defaults(func=cmd_citations)
+
+    # trends
+    p_trends = sub.add_parser("trends", help="研究趋势分析（基于会话中的搜索结果）")
+    p_trends.set_defaults(func=cmd_trends)
+
     # check
     p_check = sub.add_parser("check", help="环境自检（Python / 依赖 / 浏览器 / 知网连通性）")
+    p_check.add_argument("--fix", action="store_true",
+                         help="自动修复可修复项（安装 selenium、写入沙箱网络配置）")
     p_check.set_defaults(func=cmd_check)
 
     args = parser.parse_args()

@@ -4,15 +4,6 @@ cnki - 知网 (CNKI) 搜索与下载模块
 """
 from __future__ import annotations
 
-import sys
-
-if sys.stdout and hasattr(sys.stdout, "encoding") and (sys.stdout.encoding or "").lower() != "utf-8":
-    try:
-        sys.stdout = open(sys.stdout.fileno(), mode="w", encoding="utf-8", errors="replace", buffering=1)
-        sys.stderr = open(sys.stderr.fileno(), mode="w", encoding="utf-8", errors="replace", buffering=1)
-    except Exception:
-        pass
-
 from .constants import (
     CNKI_SEARCH_URL, REQUEST_INTERVAL, CNKI_SIDEBAR_CORES,
     HAS_SELENIUM, _log,

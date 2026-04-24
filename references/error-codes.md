@@ -1,6 +1,8 @@
 # 错误码对照表
 
-脚本返回 `{"status": "error", "code": "...", "message": "..."}`，不含建议。
+脚本在 `status` 为 `error`、`warning` 或 `partial` 时可能附带 `code` 字段，格式为 `{"status": "error|warning|partial", "code": "...", "message": "..."}`。
+注意：部分 `warning`/`partial` 响应无 `code` 字段（如 `check`、`write-docx`、`patch-docx`），需读 `message` 或 `warnings` 数组。
+`search --source all` 时知网失败不阻断，错误信息在 `cnki_error` 子字段中，Agent 应检查并提示用户。
 Agent 根据此表决定如何回应用户。
 
 | 错误码 | 含义 | Agent 应对 |
@@ -25,9 +27,15 @@ Agent 根据此表决定如何回应用户。
 | `DOCX_PARSE_FAILED` | docx 文件解析异常 | 提示用户确认文件完整性 |
 | `ENCODING_ERROR` | 文本文件编码无法识别 | 建议用户转为 UTF-8 编码 |
 | `IMPORT_PARSE_FAILED` | 题录文件解析失败 | 检查文件格式是否为 NoteExpress/Refworks/BibTeX |
-| `NO_SESSION_DATA` | 无会话数据 | 提示先执行 search 或 batch-search |
+| `NO_SESSION_DATA` | 无会话数据 | 提示先执行 search、batch-search 或 import。注意：`read-detail` 在会话仅含 API 源论文（无知网论文）时也返回此码（status=warning），此时应提示用户 read-detail 仅支持知网论文 |
 | `NO_URL` | 未提供 URL 参数 | Agent 应从搜索结果中获取 URL |
 | `UNSUPPORTED_EXPORT_FORMAT` | 不支持的导出格式 | 支持 bibtex/ris/markdown/json/excel/gbt7714/footnote/apa |
 | `MISSING_DEPENDENCY` | 缺少依赖包 | 提示用户 `pip install` |
 | `IO_ERROR` | 文件保存失败（磁盘满、只读等） | 检查磁盘空间和写入权限 |
 | `PATCH_PARSE_FAILED` | 补丁 JSON 解析失败 | 检查 JSON 格式是否正确 |
+| `BROWSER_CRASH` | 浏览器进程崩溃（如 0x80000003） | 脚本已内置 `--disable-gpu` + `--disable-features=RendererCodeIntegrity` + 独立 `--user-data-dir` 防护。若仍崩溃：提权运行（`required_permissions: ["all"]`） |
+| `DOWNLOAD_SOURCE_MISMATCH` | --download 仅支持 --source cnki | 提示用户搜索+下载一步到位仅限知网源 |
+| `NO_SESSION` | 无搜索会话记录 | 提示先执行 search 或 batch-search |
+| `NO_PAPER_ID` | 未提供论文标识 | Agent 应从搜索结果获取 DOI 或 URL |
+| `RESOLVE_FAILED` | 无法识别论文标识或 API 查询失败 | 检查 DOI/URL 格式；可能 S2 API 暂时不可用 |
+| `NO_DOWNLOAD_URLS` | search --download 但结果中无可用下载链接（warning） | 展示搜索结果，提示用户手动选取 URL 再 download |

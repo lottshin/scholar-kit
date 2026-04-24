@@ -60,15 +60,19 @@ def format_gbt7714(paper: dict, index: int = 1) -> str:
     return ref
 
 
+def _has_cjk(text: str) -> bool:
+    return any('\u4e00' <= c <= '\u9fff' for c in text)
+
+
 def _format_authors_gbt(authors_str: str) -> str:
-    """GB/T 7714 作者格式化：最多3个作者，超出用 等/et al"""
     if not authors_str:
         return "佚名"
     separators = re.split(r'[;；,，&]\s*', authors_str)
     authors = [a.strip() for a in separators if a.strip()]
     if len(authors) <= 3:
         return ", ".join(authors)
-    return ", ".join(authors[:3]) + ", 等"
+    suffix = ", 等" if _has_cjk(authors[0]) else ", et al."
+    return ", ".join(authors[:3]) + suffix
 
 
 def _detect_doc_type(paper: dict) -> str:
@@ -172,13 +176,11 @@ def _format_authors_apa(authors_str: str) -> str:
 
 def _bibtex_escape(s: str) -> str:
     """转义 BibTeX 特殊字符"""
-    return (
-        str(s)
-        .replace("\\", "\\\\")
-        .replace("{", "\\{")
-        .replace("}", "\\}")
-        .replace("\n", " ")
-    )
+    s = str(s)
+    for ch in ('\\', '{', '}', '%', '#', '$', '&', '_', '~', '^'):
+        s = s.replace(ch, '\\' + ch)
+    s = s.replace("\n", " ")
+    return s
 
 
 def to_bibtex(papers: List[Dict[str, Any]]) -> str:
@@ -233,7 +235,7 @@ def to_ris(papers: list[dict]) -> str:
 
         lines = [f"TY  - {ris_type}"]
         if p.get("title"):
-            lines.append(f"TI  - {p['title']}")
+            lines.append(f"TI  - {p['title'].replace(chr(10), ' ').replace(chr(13), '')}")
         if p.get("authors"):
             for author in re.split(r'[;；]\s*', p["authors"]):
                 if author.strip():
@@ -257,7 +259,7 @@ def to_ris(papers: list[dict]) -> str:
         if p.get("url"):
             lines.append(f"UR  - {p['url']}")
         if p.get("abstract"):
-            lines.append(f"AB  - {p['abstract']}")
+            lines.append(f"AB  - {p['abstract'].replace(chr(10), ' ').replace(chr(13), '')}")
         lines.append("ER  - ")
         entries.append("\n".join(lines))
 
@@ -360,7 +362,7 @@ def generate_reference_list(papers: list[dict], style: str = "gbt7714") -> str:
 
 # ── 统一导出入口 ──────────────────────────────────────
 
-def export_papers(papers: list[dict], fmt: str, output: str = None) -> str:
+def export_papers(papers: list[dict], fmt: str, output: str = None) -> str | dict:
     """
     统一导出入口。
 
@@ -390,7 +392,7 @@ def export_papers(papers: list[dict], fmt: str, output: str = None) -> str:
 
     gen = generators.get(fmt)
     if not gen:
-        return json.dumps({"status": "error", "code": "UNSUPPORTED_EXPORT_FORMAT", "message": f"不支持的格式: {fmt}"})
+        return {"status": "error", "code": "UNSUPPORTED_EXPORT_FORMAT", "message": f"不支持的格式: {fmt}"}
 
     content = gen()
 

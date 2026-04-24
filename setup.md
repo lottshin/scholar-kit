@@ -14,7 +14,10 @@ You are an AI agent. Follow these steps to install Scholar Kit.
    | **Gemini CLI** | `~/.gemini/skills/scholar-kit` |
    | **Other** | Ask the user where to install |
 
-2. If the target directory already exists, tell the user "Scholar Kit 已安装" and stop.
+2. If the target directory already exists:
+   - Check if it's a git repo (`git -C <target_path> rev-parse --is-inside-work-tree`)
+   - If yes: run `git -C <target_path> pull` and `pip install -r <target_path>/scripts/requirements.txt`, then tell the user "Scholar Kit 已更新！"
+   - If not a git repo: tell the user "Scholar Kit 已安装（非 git 安装，如需更新请重新下载）" and stop.
 
 3. Clone the repository (Gemini CLI can also use `gemini skills install`):
 
