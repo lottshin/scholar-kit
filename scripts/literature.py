@@ -173,7 +173,8 @@ def cmd_search(args):
         seen = set()
         deduped = []
         for r in results:
-            key = r.get("title", "").lower().strip()
+            # Some sources may return null titles for edge records.
+            key = (r.get("title") or "").lower().strip()
             if key and key not in seen:
                 seen.add(key)
                 deduped.append(r)
