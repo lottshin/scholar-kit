@@ -6,19 +6,19 @@
 
 ### 文献检索
 
-支持知网、OpenAlex、Semantic Scholar、arXiv、NSSD 五个数据源。知网侧支持核心期刊筛选（北大核心、CSSCI、CSCD 等）、文献类型筛选（硕士/博士/期刊/会议/报纸）、搜索字段指定（主题/篇名/关键词/摘要/全文/作者/来源）、按作者/期刊/年份的高级搜索、多关键词批量搜索。API 数据源基于标准库 urllib 即可运行，不依赖知网环境。
+支持知网、OpenAlex、Semantic Scholar、arXiv、NSSD 五个数据源。知网侧支持核心期刊筛选（北大核心、CSSCI、CSCD 等）、文献类型筛选（硕士/博士/期刊/会议/报纸）、搜索字段指定（主题/篇名/关键词/摘要/全文/作者/来源）、按作者/期刊/年份的高级搜索、多关键词批量搜索。`--enrich N` 参数可在搜索后自动补全前 N 篇论文的卷期页码。搜索结果 30 分钟内缓存复用，避免重复启动浏览器。API 数据源基于标准库 urllib 即可运行，不依赖知网环境。
 
 ### 论文下载
 
-知网 PDF 批量下载，支持搜索+下载一步完成（`search --download`），自动分批并设置冷却间隔避免触发风控。英文 OA 论文通过 DOI 获取。
+知网 PDF 批量下载，支持搜索+下载一步完成（`search --download`），自动分批并设置冷却间隔避免触发风控。断点续传机制确保中途失败后可从上次位置继续。英文 OA 论文通过 DOI 获取。
 
 ### 全文阅读
 
-知网论文全文抓取与本地缓存。期刊论文使用 HTML 阅读提取，硕博论文通过 FlowPDF 三级加速提取（PDF.js API 直取 → 批量滚动 → 逐页补漏）。支持 .docx / .txt / .md 文件解析，自动处理中文编码（UTF-8 / GBK / GB18030）。
+知网论文全文抓取与本地缓存。期刊论文使用 HTML 阅读提取，硕博论文通过 FlowPDF 三级加速提取（PDF.js API 直取 → 批量滚动 → 逐页补漏）。支持 .docx / .txt / .md 文件解析，自动处理中文编码（UTF-8 / GBK / GB18030）。`pdf-meta` 命令可从 PDF 文件中提取元数据（标题、作者、DOI），并通过 Crossref 自动补全完整书目信息。
 
 ### 引用生成与导出
 
-支持 GB/T 7714、BibTeX、RIS、APA、脚注五种引用格式。文献列表可导出为 BibTeX、RIS、Markdown、JSON、Excel。支持导入知网导出的 NoteExpress / Refworks / BibTeX 题录文件。
+支持 GB/T 7714、BibTeX、RIS、APA、脚注五种引用格式。文献列表可导出为 BibTeX、RIS、Markdown、JSON、Excel。支持导入知网导出的 NoteExpress / Refworks / BibTeX 题录文件（含卷期页码完整解析）。搜索结果自带引用预览（`citation_preview`），cite 命令对知网论文自动补全卷期页码。
 
 ### 引文网络分析
 

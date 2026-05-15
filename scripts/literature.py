@@ -50,7 +50,7 @@ from cnki import (  # noqa: E402
     get_detail, download_cnki, batch_download_cnki,
     parse_cnki_export, check_cnki_access,
 )
-from formatter import export_papers, generate_reference_list  # noqa: E402
+from formatter import export_papers, generate_reference_list, citation_preview  # noqa: E402
 
 def _session_file() -> Path:
     return Path.cwd() / ".scholar-kit" / "session.json"
@@ -90,6 +90,44 @@ def _load_session() -> List[Dict[str, Any]]:
     return []
 
 
+# ── CNKI 搜索缓存 ─────────────────────────────────────
+
+_CNKI_CACHE_TTL_MINUTES = 30
+
+
+def _cnki_cache_key(args) -> str:
+    import hashlib
+    key_parts = f"{args.query}|{args.core}|{args.year_from}|{args.year_to}|{args.author}|{args.journal}|{getattr(args, 'doc_type', '')}|{getattr(args, 'field', '')}|{args.sort}|{args.pages}"
+    return hashlib.md5(key_parts.encode()).hexdigest()
+
+
+def _cnki_cache_get(args) -> list | None:
+    cache_dir = Path.cwd() / ".scholar-kit" / "cache"
+    cache_file = cache_dir / f"cnki_{_cnki_cache_key(args)}.json"
+    if cache_file.exists():
+        try:
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+            from datetime import datetime, timedelta
+            cached_at = datetime.fromisoformat(data.get("_cached_at", ""))
+            if datetime.now() - cached_at < timedelta(minutes=_CNKI_CACHE_TTL_MINUTES):
+                return data.get("results")
+        except Exception:
+            pass
+    return None
+
+
+def _cnki_cache_set(args, results: list):
+    from datetime import datetime
+    cache_dir = Path.cwd() / ".scholar-kit" / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"cnki_{_cnki_cache_key(args)}.json"
+    data = {"_cached_at": datetime.now().isoformat(), "results": results}
+    try:
+        cache_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
 # ── search 命令 ───────────────────────────────────────
 
 def cmd_search(args):
@@ -110,33 +148,40 @@ def cmd_search(args):
     cnki_error = None
 
     if source in ("cnki", "all"):
-        keep = want_download and source == "cnki"
-        cnki_ret = search_cnki(
-            keyword=args.query,
-            core=args.core,
-            year_from=args.year_from,
-            year_to=args.year_to,
-            author=args.author,
-            journal=args.journal,
-            doc_type=getattr(args, "doc_type", None),
-            field=getattr(args, "field", None),
-            sort=args.sort or "relevance",
-            pages=args.pages or 1,
-            _keep_driver=keep,
-        )
-        if keep and isinstance(cnki_ret, tuple):
-            cnki_results, reuse_driver = cnki_ret
+        # 检查 CNKI 搜索缓存
+        cached_cnki = _cnki_cache_get(args) if not want_download else None
+        if cached_cnki is not None:
+            print("[cnki] 使用缓存结果", file=__import__('sys').stderr)
+            results.extend(cached_cnki)
         else:
-            cnki_results = cnki_ret
+            keep = want_download and source == "cnki"
+            cnki_ret = search_cnki(
+                keyword=args.query,
+                core=args.core,
+                year_from=args.year_from,
+                year_to=args.year_to,
+                author=args.author,
+                journal=args.journal,
+                doc_type=getattr(args, "doc_type", None),
+                field=getattr(args, "field", None),
+                sort=args.sort or "relevance",
+                pages=args.pages or 1,
+                _keep_driver=keep,
+            )
+            if keep and isinstance(cnki_ret, tuple):
+                cnki_results, reuse_driver = cnki_ret
+            else:
+                cnki_results = cnki_ret
 
-        if cnki_results and not (len(cnki_results) == 1 and cnki_results[0].get("status") == "error"):
-            results.extend(cnki_results)
-        elif cnki_results and cnki_results[0].get("status") == "error":
-            if source == "cnki":
-                _output(cnki_results[0])
-                if reuse_driver:
-                    try: reuse_driver.quit()
-                    except Exception: pass
+            if cnki_results and not (len(cnki_results) == 1 and cnki_results[0].get("status") == "error"):
+                results.extend(cnki_results)
+                _cnki_cache_set(args, cnki_results)
+            elif cnki_results and cnki_results[0].get("status") == "error":
+                if source == "cnki":
+                    _output(cnki_results[0])
+                    if reuse_driver:
+                        try: reuse_driver.quit()
+                        except Exception: pass
                 return
             # source == "all" 时知网失败不阻断，记录错误后继续 API 搜索
             cnki_error = cnki_results[0]
@@ -192,7 +237,29 @@ def cmd_search(args):
             effective_limit = 20
         deduped = deduped[:effective_limit]
 
+        # --enrich: 对知网结果自动补全卷期页码
+        enrich_n = getattr(args, "enrich", 0)
+        if enrich_n and enrich_n > 0:
+            cnki_papers = [(i, p) for i, p in enumerate(deduped)
+                           if _is_cnki_paper(p) and p.get("url") and not p.get("pages")]
+            to_enrich = cnki_papers[:enrich_n]
+            if to_enrich:
+                print(f"[enrich] 正在补全 {len(to_enrich)} 篇论文的卷期页码...",
+                      file=__import__('sys').stderr)
+                from cnki import get_detail
+                for idx, p in to_enrich:
+                    detail = get_detail(p["url"])
+                    if detail and detail.get("status") != "error":
+                        for k in ("volume", "issue", "pages", "doi", "year", "journal", "authors"):
+                            if detail.get(k) and not p.get(k):
+                                p[k] = detail[k]
+                    time.sleep(1)
+
         _save_session(deduped, append=getattr(args, "append", False))
+
+        # 为每条结果添加引用预览
+        for p in deduped:
+            p["citation_preview"] = citation_preview(p)
 
         search_output = {"status": "success", "count": len(deduped), "results": deduped}
         if cnki_error and source == "all":
@@ -350,6 +417,23 @@ def cmd_cite(args):
         _output({"status": "error", "code": "NO_SESSION_DATA", "message": "没有可格式化的数据，请先执行 search、batch-search 或 import"})
         return
 
+    # 对缺少卷期页码的知网论文，自动走 detail 补全
+    cnki_need_enrich = [
+        (i, p) for i, p in enumerate(papers)
+        if _is_cnki_paper(p) and p.get("url") and not p.get("pages") and "cnki.net" in p.get("url", "")
+    ]
+    if cnki_need_enrich:
+        print(f"[cite] 正在补全 {len(cnki_need_enrich)} 篇知网论文的卷期页码...",
+              file=__import__('sys').stderr)
+        from cnki import get_detail
+        for idx, p in cnki_need_enrich:
+            detail = get_detail(p["url"])
+            if detail and detail.get("status") != "error":
+                for k in ("volume", "issue", "pages", "doi", "year", "journal"):
+                    if detail.get(k) and not p.get(k):
+                        p[k] = detail[k]
+            time.sleep(1)
+
     enriched = []
     for i, p in enumerate(papers):
         if p.get("doi") and not p.get("volume"):
@@ -455,6 +539,75 @@ def cmd_read_paper(args):
                      "chars": char_count,
                      "paragraphs": para_count,
                      "text": text})
+
+
+# ── pdf-meta 命令 ──────────────────────────────────────
+
+def cmd_pdf_meta(args):
+    """从 PDF 文件中提取元数据（标题、作者、DOI 等）"""
+    filepath = Path(args.filepath)
+    if not filepath.exists():
+        _output({"status": "error", "code": "FILE_NOT_FOUND", "message": f"文件不存在: {args.filepath}"})
+        return
+
+    if filepath.suffix.lower() != ".pdf":
+        _output({"status": "error", "code": "NOT_PDF", "message": "仅支持 PDF 文件"})
+        return
+
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        _output({"status": "error", "code": "MISSING_DEPENDENCY", "message": "缺少 pypdf 依赖"})
+        return
+
+    try:
+        reader = PdfReader(str(filepath))
+        meta = reader.metadata or {}
+
+        result = {"status": "success", "file": str(filepath)}
+
+        if meta.title:
+            result["title"] = meta.title
+        if meta.author:
+            result["authors"] = meta.author
+        if meta.subject:
+            result["subject"] = meta.subject
+
+        # 从 XMP 元数据中提取 DOI
+        doi = None
+        if hasattr(reader, 'xmp_metadata') and reader.xmp_metadata:
+            xmp = reader.xmp_metadata
+            # DOI 可能在 dc:identifier 或自定义属性中
+            if hasattr(xmp, 'dc_identifier') and xmp.dc_identifier:
+                for ident in (xmp.dc_identifier if isinstance(xmp.dc_identifier, list) else [xmp.dc_identifier]):
+                    if ident and '10.' in str(ident):
+                        import re as _re
+                        doi_m = _re.search(r'(10\.\d{4,}/[^\s]+)', str(ident))
+                        if doi_m:
+                            doi = doi_m.group(1)
+                            break
+
+        # 从前几页文本中查找 DOI
+        if not doi:
+            import re as _re
+            for page_num in range(min(3, len(reader.pages))):
+                page_text = reader.pages[page_num].extract_text() or ""
+                doi_m = _re.search(r'(?:DOI|doi)[：:\s]*\s*(10\.\d{4,}/[^\s]+)', page_text)
+                if doi_m:
+                    doi = doi_m.group(1).rstrip(".")
+                    break
+
+        if doi:
+            result["doi"] = doi
+            # 用 DOI 从 Crossref 补全完整元数据
+            crossref_data = resolve_crossref(doi)
+            if crossref_data:
+                result["crossref"] = crossref_data
+
+        _output(result)
+
+    except Exception as e:
+        _output({"status": "error", "code": "PDF_READ_FAILED", "message": str(e)})
 
 
 # ── batch-search 命令 ─────────────────────────────────
@@ -1657,6 +1810,8 @@ def main():
                           help="下载目录（配合 --download，默认 ./papers）")
     p_search.add_argument("--download-top-n", type=int, default=None,
                           help="下载前 N 篇（配合 --download，默认全部）")
+    p_search.add_argument("--enrich", type=int, default=0, metavar="N",
+                          help="自动补全前 N 篇知网论文的卷期页码（需访问详情页）")
     p_search.add_argument("--append", action="store_true",
                           help="追加到已有会话结果（而非覆盖）")
     p_search.set_defaults(func=cmd_search)
@@ -1700,6 +1855,11 @@ def main():
     p_paper.add_argument("--output", help="输出到文件（默认直接打印）")
     p_paper.add_argument("--raw", action="store_true", help="输出纯文本而非 JSON")
     p_paper.set_defaults(func=cmd_read_paper)
+
+    # pdf-meta
+    p_pdf = sub.add_parser("pdf-meta", help="从 PDF 提取元数据（标题、DOI 等）")
+    p_pdf.add_argument("filepath", help="PDF 文件路径")
+    p_pdf.set_defaults(func=cmd_pdf_meta)
 
     # batch-search
     p_batch = sub.add_parser("batch-search", help="批量知网搜索（一次启动浏览器）")

@@ -1,6 +1,7 @@
 """cnki.download - 论文下载与导出文件解析"""
 from __future__ import annotations
 
+import json
 import math
 import os
 import random
@@ -261,6 +262,16 @@ def _is_already_downloaded(title: str, save_dir: str) -> bool:
     return False
 
 
+def _save_download_progress(progress_file: Path, completed_urls: set):
+    try:
+        progress_file.write_text(
+            json.dumps({"completed": list(completed_urls)}, ensure_ascii=False),
+            encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
 def _trigger_batch_window(
     driver, urls_window: List[str], save_dir: str, file_format: str,
     global_idx_offset: int, total: int,
@@ -454,6 +465,27 @@ def batch_download_cnki(
     os.makedirs(save_dir, exist_ok=True)
     abs_save_dir = os.path.abspath(save_dir)
 
+    # 断点续传：加载进度文件，跳过已成功下载的 URL
+    progress_file = Path(abs_save_dir) / ".download_progress.json"
+    completed_urls: set = set()
+    if progress_file.exists():
+        try:
+            progress_data = json.loads(progress_file.read_text(encoding="utf-8"))
+            completed_urls = set(progress_data.get("completed", []))
+        except Exception:
+            pass
+
+    remaining_urls = [u for u in urls if u not in completed_urls]
+    if not remaining_urls:
+        _log("[cnki-download] 所有 URL 已在之前的会话中下载完成")
+        return {"status": "success", "count": len(urls), "save_dir": save_dir,
+                "results": [{"url": u, "filename": "(previously completed)"} for u in urls]}
+
+    if len(remaining_urls) < len(urls):
+        _log(f"[cnki-download] 断点续传: 跳过 {len(urls) - len(remaining_urls)} 篇已完成，"
+             f"继续下载 {len(remaining_urls)} 篇")
+    urls = remaining_urls
+
     driver = _driver
     owns_driver = _driver is None
 
@@ -509,6 +541,12 @@ def batch_download_cnki(
             all_ok.extend(ok)
             all_errors.extend(errs)
             all_retry.extend(retries)
+
+            # 保存断点进度
+            for r in ok:
+                if r.get("url"):
+                    completed_urls.add(r["url"])
+            _save_download_progress(progress_file, completed_urls)
 
             batch_elapsed = time.time() - batch_start
             _log(f"[cnki-download] 批次 {batch_num} 完成:"
@@ -663,6 +701,15 @@ def _parse_bibtex_export(content: str) -> list[dict]:
         journal_m = re.search(r'journal\s*=\s*\{(.+?)\}', entry)
         if journal_m:
             paper["journal"] = journal_m.group(1).strip()
+        volume_m = re.search(r'volume\s*=\s*\{(.+?)\}', entry)
+        if volume_m:
+            paper["volume"] = volume_m.group(1).strip()
+        number_m = re.search(r'number\s*=\s*\{(.+?)\}', entry)
+        if number_m:
+            paper["issue"] = number_m.group(1).strip()
+        pages_m = re.search(r'pages\s*=\s*\{(.+?)\}', entry)
+        if pages_m:
+            paper["pages"] = pages_m.group(1).strip().replace('--', '-')
         doi_m = re.search(r'doi\s*=\s*\{(.+?)\}', entry)
         if doi_m:
             paper["doi"] = doi_m.group(1).strip()
@@ -687,6 +734,14 @@ def _parse_noteexpress_export(content: str) -> list[dict]:
                     paper["year"] = int(y.group())
             elif line.startswith("{Journal}") or line.startswith("JF "):
                 paper["journal"] = line.split(" ", 1)[-1].strip()
+            elif line.startswith("{Volume}") or line.startswith("VL "):
+                paper["volume"] = line.split(" ", 1)[-1].strip()
+            elif line.startswith("{Issue}") or line.startswith("IS "):
+                paper["issue"] = line.split(" ", 1)[-1].strip()
+            elif line.startswith("{Pages}") or line.startswith("SP "):
+                paper["pages"] = line.split(" ", 1)[-1].strip()
+            elif line.startswith("{DOI}") or line.startswith("DO "):
+                paper["doi"] = line.split(" ", 1)[-1].strip()
         if paper.get("title"):
             results.append(paper)
     return results
@@ -711,6 +766,23 @@ def _parse_refworks_export(content: str) -> list[dict]:
                     paper["year"] = int(y.group())
             elif line.startswith("JF "):
                 paper["journal"] = line[3:].strip()
+            elif line.startswith("VO "):
+                paper["volume"] = line[3:].strip()
+            elif line.startswith("IS "):
+                paper["issue"] = line[3:].strip()
+            elif line.startswith("SP "):
+                sp = line[3:].strip()
+                if paper.get("pages"):
+                    paper["pages"] = f"{sp}-{paper['pages']}"
+                else:
+                    paper["pages"] = sp
+            elif line.startswith("OP "):
+                ep = line[3:].strip()
+                sp = paper.get("pages", "")
+                if sp and "-" not in sp:
+                    paper["pages"] = f"{sp}-{ep}"
+                else:
+                    paper["pages"] = ep
             elif line.startswith("DO "):
                 paper["doi"] = line[3:].strip()
         if paper.get("title"):

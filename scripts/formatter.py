@@ -360,6 +360,42 @@ def generate_reference_list(papers: list[dict], style: str = "gbt7714") -> str:
     return "\n".join(refs)
 
 
+def citation_preview(paper: dict) -> str:
+    """生成简略引用预览（无需完整元数据也能输出）。
+    格式: 作者. 题名[J]. 期刊, 年, 卷(期): 页码.
+    """
+    authors = paper.get("authors", "")
+    if authors:
+        parts = re.split(r'[;；]\s*', authors)
+        if len(parts) > 2:
+            first = parts[0].strip()
+            suffix = "等" if _has_cjk(first) else "et al."
+            authors = f"{first} {suffix}"
+        else:
+            authors = "; ".join(p.strip() for p in parts)
+
+    title = paper.get("title", "")
+    journal = paper.get("journal", "")
+    year = paper.get("year", "")
+    volume = paper.get("volume", "")
+    issue = paper.get("issue", "")
+    pages = paper.get("pages", "")
+
+    ref = f"{authors}. {title}[J]. " if authors else f"{title}[J]. "
+    if journal:
+        ref += f"{journal}, "
+    if year:
+        ref += f"{year}"
+    if volume:
+        ref += f", {volume}"
+    if issue:
+        ref += f"({issue})"
+    if pages:
+        ref += f": {pages}"
+    ref += "."
+    return ref
+
+
 # ── 统一导出入口 ──────────────────────────────────────
 
 def export_papers(papers: list[dict], fmt: str, output: str = None) -> str | dict:

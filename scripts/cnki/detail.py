@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -59,6 +60,30 @@ def get_detail(url: str) -> Dict[str, Any]:
                 pass
 
 
+def _split_authors_institutions(raw_items: List[str]) -> tuple:
+    """将知网详情页作者列表中混入的机构信息分离出来。
+
+    知网 kcms2 版详情页的 .author a 元素可能包含：
+    - 纯作者名: "赵涛", "张智"
+    - 带上标编号的作者名: "赵涛1,2", "张智3"
+    - 机构名: "1.中央财经大学财政税务学院"
+    """
+    authors = []
+    institutions = []
+    for item in raw_items:
+        # 机构：以 "数字." 开头（如 "1.中央财经大学"）
+        if re.match(r'^\d+\.\s*', item):
+            inst = re.sub(r'^\d+\.\s*', '', item).strip()
+            if inst:
+                institutions.append(inst)
+        else:
+            # 作者：去掉尾部的上标数字（如 "赵涛1,2" → "赵涛"）
+            clean = re.sub(r'[\d,，]+$', '', item).strip()
+            if clean:
+                authors.append(clean)
+    return authors, institutions
+
+
 def _parse_detail_page(driver) -> Dict[str, Any]:
     """从已加载的知网详情页 DOM 中提取元数据（标题、摘要、关键词等）。
     调用者负责导航到详情页并处理验证码，本函数只做解析。
@@ -66,10 +91,18 @@ def _parse_detail_page(driver) -> Dict[str, Any]:
     detail: Dict[str, Any] = {}
 
     try:
-        title_el = driver.find_element(By.CSS_SELECTOR, "h1, .wx-tit h1")
+        title_el = driver.find_element(By.CSS_SELECTOR,
+            ".wx-tit h1, h1.title, h1[class*='title'], h1")
         detail["title"] = title_el.text.strip()
     except NoSuchElementException:
         detail["title"] = ""
+
+    if not detail["title"]:
+        try:
+            page_title = driver.title or ""
+            detail["title"] = page_title.split("-")[0].split("_")[0].strip()
+        except Exception:
+            pass
 
     try:
         abstract_el = driver.find_element(
@@ -87,19 +120,21 @@ def _parse_detail_page(driver) -> Dict[str, Any]:
     except Exception:
         detail["keywords"] = []
 
+    institutions = []
     try:
         author_els = driver.find_elements(By.CSS_SELECTOR, ".author a, h3.author a")
-        detail["authors"] = "; ".join(
-            a.text.strip() for a in author_els if a.text.strip()
-        )
+        raw_authors = [a.text.strip() for a in author_els if a.text.strip()]
+        authors, institutions = _split_authors_institutions(raw_authors)
+        detail["authors"] = "; ".join(authors)
     except NoSuchElementException:
         detail["authors"] = ""
 
     try:
         org_els = driver.find_elements(By.CSS_SELECTOR, ".orgn a, .organ a")
-        detail["institutions"] = [o.text.strip() for o in org_els if o.text.strip()]
+        orgs = [o.text.strip() for o in org_els if o.text.strip()]
+        detail["institutions"] = orgs if orgs else institutions
     except Exception:
-        detail["institutions"] = []
+        detail["institutions"] = institutions
 
     try:
         fund_els = driver.find_elements(By.CSS_SELECTOR, ".fund a, p.fund a")
@@ -107,7 +142,133 @@ def _parse_detail_page(driver) -> Dict[str, Any]:
     except Exception:
         detail["funds"] = []
 
+    # ── 卷期页码、DOI 提取 ──────────────────────────────
+    _extract_pub_info(driver, detail)
+
     return detail
+
+
+def _extract_pub_info(driver, detail: Dict[str, Any]):
+    """从知网详情页提取期刊名、年份、卷、期、页码、DOI。
+
+    知网详情页的出版信息分布在多个位置：
+    - .top-tip / .list-identify: 期刊名 + 年卷期页（如 "2023,39(03):45-58"）
+    - .top-tip a[href*=navi]: 期刊名链接
+    - #catalog_ZCLK / .doc-top: DOI 等标识
+    """
+    # 1) 期刊名（从链接或 .top-tip 文本中提取）
+    try:
+        journal_el = driver.find_element(
+            By.CSS_SELECTOR,
+            ".top-tip a[href*='navi'], .list-identify a[href*='navi'], "
+            ".top-tip a[href*='Journal'], a.journal-link"
+        )
+        journal = journal_el.text.strip().rstrip(". ．。")
+        if journal and not detail.get("journal"):
+            detail["journal"] = journal
+    except (NoSuchElementException, Exception):
+        pass
+
+    # 2) 年/卷/期/页码 — 从出版信息文本中正则提取
+    pub_text = ""
+    try:
+        tip_el = driver.find_element(
+            By.CSS_SELECTOR, ".top-tip, .list-identify, .doc-top .info"
+        )
+        pub_text = tip_el.text
+    except (NoSuchElementException, Exception):
+        pass
+
+    if pub_text:
+        # 年份: "2023," 或 "2023年" 或 "2019 (02)"（年份后跟逗号/年/空格+括号）
+        year_m = re.search(r'((?:19|20)\d{2})\s*[,，年\s(（]', pub_text)
+        if year_m and not detail.get("year"):
+            detail["year"] = int(year_m.group(1))
+
+        # 卷号: "39" in "2023,39(03)" or "第39卷"
+        vol_m = re.search(r'(?:,|，)\s*(\d+)\s*\(', pub_text) or \
+                re.search(r'第\s*(\d+)\s*卷', pub_text)
+        if vol_m and not detail.get("volume"):
+            detail["volume"] = vol_m.group(1)
+
+        # 期号: "(03)" or "第3期" or "No.3"
+        issue_m = re.search(r'\((\d+)\)', pub_text) or \
+                  re.search(r'第\s*(\d+)\s*期', pub_text) or \
+                  re.search(r'No\.?\s*(\d+)', pub_text)
+        if issue_m and not detail.get("issue"):
+            detail["issue"] = issue_m.group(1).lstrip("0") or "0"
+
+        # 页码: ":45-58" or "45-58页" or "P.45-58"
+        pages_m = re.search(r'[:：]\s*(\d+[-–—]\d+)', pub_text) or \
+                  re.search(r'(\d+[-–—]\d+)\s*页', pub_text) or \
+                  re.search(r'[Pp]\.?\s*(\d+[-–—]\d+)', pub_text)
+        if pages_m and not detail.get("pages"):
+            detail["pages"] = pages_m.group(1).replace('–', '-').replace('—', '-')
+
+    # 3) DOI — 多种策略提取
+    if not detail.get("doi"):
+        try:
+            doi_el = driver.find_element(
+                By.CSS_SELECTOR,
+                ".doc-doi a, a[href*='doi.org'], .romark a[href*='doi.org']"
+            )
+            doi_text = doi_el.get_attribute("href") or doi_el.text
+            doi_m = re.search(r'(10\.\d{4,}/[^\s]+)', doi_text)
+            if doi_m:
+                detail["doi"] = doi_m.group(1).rstrip(".")
+        except (NoSuchElementException, Exception):
+            pass
+
+    if not detail.get("doi"):
+        try:
+            doi_text = driver.execute_script(r"""
+                var els = document.querySelectorAll('.top-tip, .list-identify, .doc-top');
+                for (var i = 0; i < els.length; i++) {
+                    var m = els[i].textContent.match(/DOI[：:]\s*(10\.\d{4,}\/[^\s]+)/i);
+                    if (m) return m[1];
+                }
+                var meta = document.querySelector('meta[name="citation_doi"]');
+                if (meta) return meta.content;
+                return '';
+            """)
+            if doi_text:
+                detail["doi"] = doi_text.rstrip(".")
+        except Exception:
+            pass
+
+    # 4) 备用：通过 JavaScript 提取页面中的结构化数据
+    if not detail.get("pages") or not detail.get("volume"):
+        try:
+            meta_info = driver.execute_script("""
+                var info = {};
+                // 知网详情页有时在 meta 标签或隐藏字段中存储结构化数据
+                var metas = document.querySelectorAll('meta[name]');
+                metas.forEach(function(m) {
+                    var name = m.getAttribute('name').toLowerCase();
+                    if (name === 'citation_volume') info.volume = m.content;
+                    if (name === 'citation_issue') info.issue = m.content;
+                    if (name === 'citation_firstpage') info.firstpage = m.content;
+                    if (name === 'citation_lastpage') info.lastpage = m.content;
+                    if (name === 'citation_doi') info.doi = m.content;
+                });
+                return info;
+            """)
+            if meta_info:
+                if meta_info.get("volume") and not detail.get("volume"):
+                    detail["volume"] = meta_info["volume"]
+                if meta_info.get("issue") and not detail.get("issue"):
+                    detail["issue"] = meta_info["issue"]
+                if not detail.get("pages"):
+                    fp = meta_info.get("firstpage", "")
+                    lp = meta_info.get("lastpage", "")
+                    if fp and lp:
+                        detail["pages"] = f"{fp}-{lp}"
+                    elif fp:
+                        detail["pages"] = fp
+                if meta_info.get("doi") and not detail.get("doi"):
+                    detail["doi"] = meta_info["doi"]
+        except Exception:
+            pass
 
 
 # ── HTML 全文阅读 ─────────────────────────────────────
