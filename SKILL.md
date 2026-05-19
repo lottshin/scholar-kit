@@ -27,19 +27,19 @@ compatibility:
 
 ```bash
 # 0. 安装依赖（首次）
-pip install -r <skill_path>/scripts/requirements.txt
+<python> -m pip install -r <skill_path>/scripts/requirements.txt
 
 # 1. 搜索（用户要求核心期刊时加 --core）
-python <skill_path>/scripts/literature.py search "乡村振兴" --core 北大核心,CSSCI
+<python> <skill_path>/scripts/literature.py search "乡村振兴" --core 北大核心,CSSCI
 
 # 2. 获取全文（指定序号或前 N 篇）
-python <skill_path>/scripts/literature.py read-detail --indices 1,3,9 --fulltext
+<python> <skill_path>/scripts/literature.py read-detail --indices 1,3,9 --fulltext
 
 # 3. 导出引用
-python <skill_path>/scripts/literature.py cite --style gbt7714
+<python> <skill_path>/scripts/literature.py cite --style gbt7714
 ```
 
-> `<skill_path>` 是本 Skill 目录的实际路径，Agent 应根据自身环境自动解析。
+> `<skill_path>` 是本 Skill 目录的实际路径，Agent 应根据自身环境自动解析；`<python>` 是按 [Python 解释器发现](#python-解释器发现) 解析出的命令。
 
 ## 何时使用 / 不使用
 
@@ -77,13 +77,41 @@ network_access = true
 
 **运行环境**: Python 3.9+, Selenium 4.10+, Edge 或 Chrome, 知网需校园网/VPN。
 
+### Python 解释器发现
+
+Agent 不要假设 `python` 一定在 PATH 中。首次调用脚本前，应先解析可用 Python 命令，并在同一会话后续命令中复用：
+
+1. 若环境变量 `PYTHON` 存在，优先使用 `$PYTHON`
+2. 否则尝试 `python`
+3. 否则尝试 `python3`
+4. Windows 上再尝试 `py -3`
+5. 全部不可用时，才提示用户安装 Python 3.9+ 或将 Python 加入 PATH
+
+验证命令示例：
+
+```bash
+if [ -n "$PYTHON" ]; then
+  "$PYTHON" --version
+elif command -v python >/dev/null 2>&1; then
+  python --version
+elif command -v python3 >/dev/null 2>&1; then
+  python3 --version
+elif command -v py >/dev/null 2>&1; then
+  py -3 --version
+else
+  echo "Python 3.9+ not found"
+fi
+```
+
+下文命令中的 `python` 代表上述已解析出的解释器命令，不是固定字符串。
+
 Agent 在首次调用脚本前应运行 `check` 命令自检（同一会话只需运行一次，Agent 应缓存 `capabilities` 结果供后续命令使用）：
 
 ```bash
 python scripts/literature.py check --fix
 ```
 
-`--fix` 自动安装缺失的 selenium、检测沙箱环境并写入网络配置、重试知网连通性。任何 `fail` 项提示用户修复；`warn` 项提醒但不阻断。
+`--fix` 自动安装缺失的 selenium、检测沙箱环境并写入网络配置、重试知网连通性。Agent **不得因为 `check.status == "warning"` 或某个可选项 `fail` 直接退出**；必须读取 `capabilities` 决定下一步。只有 Python 无法运行、Python < 3.8、或当前任务必需能力不可用且无替代路径时，才算阻断。
 
 `check` 返回的 `capabilities` 字段是 Agent 的决策依据：
 
@@ -94,8 +122,10 @@ python scripts/literature.py check --fix
      - 硕士/博士/学位论文、知网全文等**只有知网能做的任务** → 告知用户"请确认已连接校园网/VPN"，**不要用 API 源替代**
      - 其他通用搜索 → 用 `--source openalex` 继续，一句话告知用户
 
-- `api_sources: true` → API 搜索（OpenAlex/S2/arXiv/NSSD）始终可用（基于标准库 urllib 兜底）
-- `docx_tools: true/false` → Word 文档功能是否可用（取决于 python-docx）。为 false 时：Agent 应输出 Markdown 替代 .docx，并提示用户 `pip install python-docx`
+- `python-docx` / `openpyxl` 失败只影响 Word/Excel 功能，不影响搜索、引用、下载；需要时降级输出 Markdown/JSON。
+- `selenium`、浏览器、驱动、知网连通性失败只影响 CNKI 自动化；若用户任务不是 CNKI 专属，可用 API 源继续。
+- `api_sources: true` 时，OpenAlex/Semantic Scholar/arXiv/NSSD 相关搜索不应因 CNKI 检查失败而中止。
+
 - `update.update_available: true` → 提示用户"有新版本可用，在 skill 目录执行 `git pull` 更新"（该字段仅在版本检测成功时存在，缺失时忽略）
 
 详见 [平台兼容性](references/environment.md#平台兼容性)。
@@ -179,7 +209,7 @@ python scripts/literature.py check --fix
 
 | 命令 | 用途 | 关键参数 |
 |------|------|----------|
-| `search "词"` | 单关键词搜索 | `--source` `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--limit` `--export` `--output` `--download` `--download-dir` `--download-top-n` `--append` |
+| `search "词"` | 单关键词搜索 | `--source` `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--limit` `--cite-enrich` `--export` `--output` `--download` `--download-dir` `--download-top-n` `--append` |
 | `batch-search "词1" "词2"` | 多关键词搜索 | `--query-file` `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--export` `--output` `--append` |
 | `read-detail` | 获取摘要/全文（CNKI 论文，含硕博论文） | `--top-n` `--indices` `--fulltext` |
 | `read-paper "file"` | 读取用户论文 | `--output` `--raw` |
@@ -199,6 +229,8 @@ python scripts/literature.py check --fix
 `--core` 接收知网侧边栏精确选项名（逗号分隔）：`北大核心,CSSCI,AMI,WJCI,CSCD,EI`
 Agent 负责将用户意图翻译为选项名，详见 [核心期刊知识](references/core-journals.md)。
 `--core` 使用规则：**仅在用户明确要求核心期刊时添加**。用户未提"核心""CSSCI""C刊"等词时不主动加，避免过滤掉有价值的非核心文献。
+
+`--cite-enrich N`：仅知网搜索可用。搜索时点击前 N 条结果的“引用”按钮，读取弹窗中的 GB/T 7714 文本，写入 `gbt7714_raw` 并快速补全 `pages`。当用户要某篇论文的引用、要求页码、或需要准确 GB/T 引用时优先使用，例如：`search "论文题名" --source cnki --limit 3 --cite-enrich 3`。它比 `--enrich` 访问详情页更快，但会多做 N 次弹窗点击。
 
 `--sort citations` 注意：arXiv 论文的 `cited_by` 始终为 0，按被引排序时 arXiv 结果会沉底。混合数据源时建议用默认排序（relevance）。
 

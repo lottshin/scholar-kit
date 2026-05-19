@@ -642,6 +642,7 @@ def _show_browser_for_captcha(
     deadline = time.time() + poll_timeout
     poll_count = 0
     clean_count = 0
+    verified = False
 
     while time.time() < deadline:
         time.sleep(3)
@@ -651,6 +652,7 @@ def _show_browser_for_captcha(
 
             if was_gate and "/verify/" not in current_url:
                 _log(f"[OK] 已离开验证页 → {current_url[:80]}")
+                verified = True
                 break
 
             on_gate = _is_cnki_security_gate(driver)
@@ -663,6 +665,7 @@ def _show_browser_for_captcha(
                 clean_count += 1
                 if clean_count >= 2:
                     _log("[OK] 连续无验证码检出，验证完成")
+                    verified = True
                     break
             else:
                 clean_count = 0
@@ -670,10 +673,17 @@ def _show_browser_for_captcha(
             _log(f"[cnki] 轮询异常: {e}")
 
     _save_cookies(driver)
-    _hide_browser(driver)
-    time.sleep(1)
-    _log("[cnki] 浏览器已隐藏，继续执行...")
-    return driver
+    if verified:
+        _hide_browser(driver)
+        time.sleep(1)
+        _log("[cnki] 浏览器已隐藏，继续执行...")
+        return driver
+
+    _show_browser(driver)
+    raise RuntimeError(
+        "知网人机验证超时，浏览器窗口已保持在前台。"
+        "请先在该窗口完成验证，然后重新执行命令。"
+    )
 
 
 def _has_captcha_elements(driver: "webdriver.Remote") -> bool:

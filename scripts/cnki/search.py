@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -68,6 +69,7 @@ def search_cnki(
     field: str = None,
     sort: str = "relevance",
     pages: int = 1,
+    cite_enrich: int = 0,
     _keep_driver: bool = False,
 ):
     """
@@ -185,6 +187,7 @@ def search_cnki(
         time.sleep(1)
         _log(f"[cnki] 筛选后页面: url={driver.current_url[:80]}  title={driver.title}")
 
+        cite_remaining = max(cite_enrich or 0, 0)
         all_results = []
         for page_num in range(pages):
             _log(f"[cnki] 解析第 {page_num + 1}/{pages} 页...")
@@ -192,7 +195,8 @@ def search_cnki(
                 _go_next_page(driver)
                 driver = _handle_captcha(driver)
 
-            page_results = _parse_search_results(driver)
+            page_results = _parse_search_results(driver, cite_enrich=cite_remaining)
+            cite_remaining = max(0, cite_remaining - len(page_results))
             _log(f"[cnki] 第 {page_num + 1} 页获取 {len(page_results)} 条结果")
             all_results.extend(page_results)
 
@@ -969,9 +973,26 @@ def _go_next_page(driver):
         pass
 
 
+def _extract_pages_from_gbt7714(ref: str) -> str:
+    ref = ref.strip()
+    if not ref:
+        return ""
+    patterns = (
+        r'[,，]\s*(\d+(?:[-–—]\d+)?)\s*\[(?:19|20)\d{2}',
+        r'\)\s*[:：]\s*(\d+(?:[-–—]\d+)?)',
+        r'(?:19|20)\d{2}[^.。]*[:：]\s*(\d+(?:[-–—]\d+)?)',
+        r'[,，]\s*(\d+[-–—]\d+)(?=\.|。|$)',
+    )
+    for pattern in patterns:
+        matches = re.findall(pattern, ref)
+        if matches:
+            return matches[-1].replace('–', '-').replace('—', '-')
+    return ""
+
+
 # ── 结果解析 ──────────────────────────────────────────
 
-def _parse_search_results(driver) -> list[dict]:
+def _parse_search_results(driver, cite_enrich: int = 0) -> list[dict]:
     """解析当前页的搜索结果"""
     results = []
 
@@ -987,15 +1008,62 @@ def _parse_search_results(driver) -> list[dict]:
         if rows:
             break
 
-    for row in rows:
+    for idx, row in enumerate(rows):
         try:
             result = _parse_single_row(row)
             if result and result.get("title"):
+                if idx < cite_enrich:
+                    try:
+                        _enrich_row_from_quote_popup(driver, row, result)
+                    except Exception as e:
+                        _log(f"[cnki] 引用补全跳过: {e}")
                 results.append(result)
-        except Exception:
+        except Exception as e:
+            _log(f"[cnki] 单行解析失败: {e}")
             continue
 
     return results
+
+def _enrich_row_from_quote_popup(driver, row, result: Dict[str, Any]) -> None:
+    try:
+        quote_btn = row.find_element(By.CSS_SELECTOR, "a.icon-quote")
+    except NoSuchElementException:
+        return
+
+    try:
+        driver.execute_script("arguments[0].click();", quote_btn)
+        WebDriverWait(driver, 8).until(
+            EC.visibility_of_element_located((By.CSS_SELECTOR, ".quote-pop"))
+        )
+        gbt_text = driver.execute_script(r"""
+            var rows = document.querySelectorAll('.quote-pop tr');
+            for (var i = 0; i < rows.length; i++) {
+                var left = rows[i].querySelector('.quote-l');
+                var right = rows[i].querySelector('.quote-r');
+                if (left && right && left.textContent.indexOf('GB/T') >= 0) {
+                    return right.textContent.trim();
+                }
+            }
+            var first = document.querySelector('.quote-pop .quote-r');
+            return first ? first.textContent.trim() : '';
+        """) or ""
+        if gbt_text:
+            result["gbt7714_raw"] = gbt_text
+            pages = _extract_pages_from_gbt7714(gbt_text)
+            if pages and not result.get("pages"):
+                result["pages"] = pages
+    except Exception as e:
+        _log(f"[cnki] 引用弹窗解析失败: {e}")
+    finally:
+        try:
+            close_btn = driver.find_element(By.CSS_SELECTOR, ".quote-pop .layui-layer-close")
+            driver.execute_script("arguments[0].click();", close_btn)
+            time.sleep(0.2)
+        except Exception:
+            try:
+                driver.execute_script("document.querySelectorAll('.quote-pop').forEach(function(e){e.remove();});")
+            except Exception:
+                pass
 
 
 def _parse_single_row(row) -> dict:
@@ -1034,6 +1102,9 @@ def _parse_single_row(row) -> dict:
     try:
         date_el = row.find_element(By.CSS_SELECTOR, "td.date, .date")
         result["date"] = date_el.text.strip()
+        year_m = re.search(r'(?:19|20)\d{2}', result["date"])
+        if year_m:
+            result["year"] = int(year_m.group(0))
     except NoSuchElementException:
         pass
 

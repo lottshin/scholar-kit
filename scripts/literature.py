@@ -97,7 +97,7 @@ _CNKI_CACHE_TTL_MINUTES = 30
 
 def _cnki_cache_key(args) -> str:
     import hashlib
-    key_parts = f"{args.query}|{args.core}|{args.year_from}|{args.year_to}|{args.author}|{args.journal}|{getattr(args, 'doc_type', '')}|{getattr(args, 'field', '')}|{args.sort}|{args.pages}"
+    key_parts = f"{args.query}|{args.core}|{args.year_from}|{args.year_to}|{args.author}|{args.journal}|{getattr(args, 'doc_type', '')}|{getattr(args, 'field', '')}|{args.sort}|{args.pages}|{getattr(args, 'cite_enrich', 0)}"
     return hashlib.md5(key_parts.encode()).hexdigest()
 
 
@@ -166,6 +166,7 @@ def cmd_search(args):
                 field=getattr(args, "field", None),
                 sort=args.sort or "relevance",
                 pages=args.pages or 1,
+                cite_enrich=getattr(args, "cite_enrich", 0),
                 _keep_driver=keep,
             )
             if keep and isinstance(cnki_ret, tuple):
@@ -182,9 +183,9 @@ def cmd_search(args):
                     if reuse_driver:
                         try: reuse_driver.quit()
                         except Exception: pass
-                return
-            # source == "all" 时知网失败不阻断，记录错误后继续 API 搜索
-            cnki_error = cnki_results[0]
+                    return
+                # source == "all" 时知网失败不阻断，记录错误后继续 API 搜索
+                cnki_error = cnki_results[0]
 
     try:
         has_keyword = bool(args.query and args.query.strip())
@@ -1812,6 +1813,8 @@ def main():
                           help="下载前 N 篇（配合 --download，默认全部）")
     p_search.add_argument("--enrich", type=int, default=0, metavar="N",
                           help="自动补全前 N 篇知网论文的卷期页码（需访问详情页）")
+    p_search.add_argument("--cite-enrich", type=int, default=0, metavar="N",
+                          help="搜索时点击前 N 篇知网引用按钮，快速补全 GB/T 引用和页码")
     p_search.add_argument("--append", action="store_true",
                           help="追加到已有会话结果（而非覆盖）")
     p_search.set_defaults(func=cmd_search)
