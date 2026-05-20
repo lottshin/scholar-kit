@@ -1,6 +1,6 @@
 ---
 name: scholar-kit
-version: 1.5.0
+version: 1.5.1
 description: >-
   Search, download, and manage academic papers from CNKI (知网), OpenAlex,
   Semantic Scholar, arXiv, and NSSD; enriches metadata via Crossref and
@@ -183,7 +183,7 @@ python scripts/literature.py check --fix
 - `search` / `batch-search` 成功时写入 session.json；加 `--append` 追加而非覆盖
 - 加 `--project <课题名>` 时读写 `.scholar-kit/projects/<课题名>/session.json`，用于课题级文献库；不加时仍读写默认 `.scholar-kit/session.json`
 - `projects` 列出已有课题文献库，`library --project <课题名>` 查看指定课题的文献列表
-- `review` 基于当前 session 或 `--project` 文献库生成可追溯综述材料，输出包含检索证据、主题线索、综述草稿、证据条目和待核对提示
+- `review` 基于当前 session 或 `--project` 文献库生成可追溯综述材料，输出包含检索证据、推荐精读文献、待核对原文、可能不相关/需剔除文献、主题线索、综述草稿和证据条目
 - `import` 成功时也会覆盖 session（可配合 `--project` 导入到指定课题）
 - `read-detail` 执行后会写回 session（去掉 fulltext 字段以减小体积）
 - 读取 session 的命令：`trends`、`batch-download --from-session`、`read-detail`、`cite`、`export`、`library`，均支持 `--project`（`projects` 除外）
@@ -202,7 +202,7 @@ python scripts/literature.py check --fix
 - [学术表达优化](references/workflows.md#学术表达优化) — 诊断 → 逐段优化 → patch-docx 写回
 - [引文网络分析](references/workflows.md#引文网络分析) — citations 命令，不依赖知网
 - [研究趋势分析](references/workflows.md#研究趋势分析) — trends 命令，基于会话数据
-- `review --project <课题名> --topic <主题>` — 基于课题文献库生成可追溯综述材料，必须保留证据条目和“待核对原文”提示
+- `review --project <课题名> --topic <主题>` — 基于课题文献库生成可追溯综述材料，必须保留证据条目、“待核对原文”、撤稿/低相关提示；CNKI 题录缺摘要时先建议 `read-detail --project <课题名> --indices <序号>`
 - [文献对比矩阵](references/workflows.md#文献对比矩阵) — 多篇论文按维度结构化对比
 - [阅读笔记生成](references/workflows.md#阅读笔记生成) — 按模板提取核心信息
 

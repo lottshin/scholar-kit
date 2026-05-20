@@ -1,5 +1,5 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.5.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.5.1)
 用法:
   python literature.py search "关键词" [--project 课题名] [--source cnki|openalex|semantic|arxiv|nssd|all] [--doc-type master] [--field 摘要] [--author] [--journal] [--download] ...
   python literature.py batch-search "词1" "词2" ... [--project 课题名] [--query-file kw.txt] [--core CSSCI] [--doc-type master] [--field 摘要] [--author] [--journal] [--append]
@@ -23,7 +23,7 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.5.0)
 
 from __future__ import annotations
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 import argparse
 import json
@@ -505,9 +505,24 @@ def _review_query_terms(topic: str) -> List[str]:
     return terms
 
 
-def _select_review_papers(papers: List[Dict[str, Any]], topic: str, limit: int) -> List[Dict[str, Any]]:
+def _review_quality_flags(paper: Dict[str, Any], relevance: int) -> List[str]:
+    title = str(paper.get("title") or "")
+    source = str(paper.get("source") or "")
+    flags = []
+    if "retracted" in title.lower() or "撤稿" in title:
+        flags.append("retracted")
+    if relevance <= 0:
+        flags.append("low_relevance")
+    if not paper.get("abstract"):
+        flags.append("needs_fulltext_check")
+    if source in ("CNKI", "CNKI-export") and not paper.get("abstract"):
+        flags.append("cnki_read_detail_recommended")
+    return flags
+
+
+def _review_candidates(papers: List[Dict[str, Any]], topic: str) -> List[Dict[str, Any]]:
     query_terms = _review_query_terms(topic)
-    scored = []
+    candidates = []
     for idx, paper in enumerate(papers, 1):
         title = str(paper.get("title") or "").lower()
         abstract = str(paper.get("abstract") or "").lower()
@@ -534,17 +549,42 @@ def _select_review_papers(papers: List[Dict[str, Any]], topic: str, limit: int) 
         if paper.get("keywords"):
             metadata_score += 1
         cited_score = min(int(paper.get("cited_by") or 0), 50)
-        scored.append((relevance, metadata_score, cited_score, idx, paper))
-    scored.sort(key=lambda item: (item[0], item[1], item[2], item[4].get("year") or ""), reverse=True)
-    relevant = [item for item in scored if item[0] > 0]
-    selected_pool = relevant or scored
-    return [{"index": idx, "paper": paper} for _, _, _, idx, paper in selected_pool[:limit]]
+        flags = _review_quality_flags(paper, relevance)
+        sort_relevance = relevance - 1000 if "retracted" in flags else relevance
+        candidates.append({
+            "index": idx,
+            "paper": paper,
+            "relevance": relevance,
+            "sort_relevance": sort_relevance,
+            "metadata_score": metadata_score,
+            "cited_score": cited_score,
+            "flags": flags,
+        })
+    candidates.sort(
+        key=lambda item: (
+            item["sort_relevance"], item["metadata_score"],
+            item["cited_score"], item["paper"].get("year") or ""
+        ),
+        reverse=True,
+    )
+    return candidates
 
 
-def _build_review_markdown(topic: str, project: Optional[str], selected: List[Dict[str, Any]], total: int) -> str:
+def _select_review_papers(papers: List[Dict[str, Any]], topic: str, limit: int) -> List[Dict[str, Any]]:
+    candidates = _review_candidates(papers, topic)
+    relevant = [item for item in candidates if item["relevance"] > 0 and "retracted" not in item["flags"]]
+    selected_pool = relevant or candidates
+    return selected_pool[:limit]
+
+
+def _build_review_markdown(topic: str, project: Optional[str], selected: List[Dict[str, Any]], total: int, diagnostics: List[Dict[str, Any]] = None) -> str:
+    diagnostics = diagnostics or selected
     sources = sorted({item["paper"].get("source", "未获取") or "未获取" for item in selected})
     years = [str(_paper_year(item["paper"])) for item in selected if _paper_year(item["paper"])]
     year_range = f"{min(years)}-{max(years)}" if years else "未获取"
+    close_reading = [item for item in selected if item.get("relevance", 0) > 0 and "retracted" not in item.get("flags", [])][:5]
+    needs_check = [item for item in selected if "needs_fulltext_check" in item.get("flags", [])]
+    risky = [item for item in diagnostics if "retracted" in item.get("flags", []) or "low_relevance" in item.get("flags", [])]
     lines = [
         f"# {topic} 文献综述材料",
         "",
@@ -555,21 +595,49 @@ def _build_review_markdown(topic: str, project: Optional[str], selected: List[Di
         f"- 年份范围：{year_range}",
         "- 说明：以下内容基于文献题录、关键词和摘要生成；缺少摘要的条目标注为待核对原文。",
         "",
-        "## 主题线索",
+        "## 推荐精读文献",
     ]
+    if close_reading:
+        for item in close_reading:
+            paper = item["paper"]
+            lines.append(f"- [{item['index']}] {paper.get('title', '未获取')}（相关性分：{item.get('relevance', 0)}）")
+    else:
+        lines.append("- 暂无高相关文献；建议调整关键词重新检索。")
+    lines.extend(["", "## 待核对原文"])
+    if needs_check:
+        for item in needs_check:
+            paper = item["paper"]
+            hint = "；建议先执行 read-detail --project <课题名> --indices " + str(item["index"]) if paper.get("source") in ("CNKI", "CNKI-export") else ""
+            lines.append(f"- [{item['index']}] {paper.get('title', '未获取')}：当前缺少摘要或全文{hint}")
+    else:
+        lines.append("- 暂无。")
+    lines.extend(["", "## 可能不相关或需剔除文献"])
+    if risky:
+        for item in risky:
+            paper = item["paper"]
+            flags = "、".join(item.get("flags") or [])
+            lines.append(f"- [{item['index']}] {paper.get('title', '未获取')}：{flags}")
+    else:
+        lines.append("- 暂无明显撤稿或低相关条目。")
+    lines.extend(["", "## 主题线索"])
     for item in selected:
         paper = item["paper"]
         idx = item["index"]
         terms = "、".join(_review_terms(topic, paper)[:6]) or "待提取"
+        suffix = ""
+        if item.get("flags"):
+            suffix = f"（提示：{'、'.join(item['flags'])}）"
         lines.extend([
-            f"- [{idx}] {paper.get('title', '未获取')}：{terms}",
+            f"- [{idx}] {paper.get('title', '未获取')}：{terms}{suffix}",
         ])
     lines.extend(["", "## 综述草稿", ""])
     for item in selected:
         paper = item["paper"]
         idx = item["index"]
         abstract = str(paper.get("abstract") or "").strip()
-        if abstract:
+        if "retracted" in item.get("flags", []):
+            point = "该文献标题显示可能为撤稿文献，不建议作为正面证据使用，仅可作为剔除或风险提示。"
+        elif abstract:
             point = abstract[:180]
         else:
             point = "该文献当前仅有题录信息，具体观点需补充摘要或原文后核对。"
@@ -580,6 +648,7 @@ def _build_review_markdown(topic: str, project: Optional[str], selected: List[Di
             "证据：",
             f"- 作者：{paper.get('authors', '未获取') or '未获取'}",
             f"- 来源：{paper.get('journal', '未获取') or '未获取'}，{_paper_year(paper) or '未获取'}",
+            f"- 相关性分：{item.get('relevance', 0)}",
             f"- 追溯状态：{'摘要可追溯' if abstract else '待核对原文'}",
             "",
         ])
@@ -597,9 +666,15 @@ def cmd_review(args):
         return
     topic = args.topic or _session_project(args) or "当前课题"
     limit = min(args.limit or 12, len(papers))
+    candidates = _review_candidates(papers, topic)
     selected = _select_review_papers(papers, topic, limit)
-    evidence = [_paper_evidence(item["paper"], item["index"]) for item in selected]
-    markdown = _build_review_markdown(topic, _session_project(args), selected, len(papers))
+    evidence = []
+    for item in selected:
+        entry = _paper_evidence(item["paper"], item["index"])
+        entry["relevance"] = item.get("relevance", 0)
+        entry["flags"] = item.get("flags", [])
+        evidence.append(entry)
+    markdown = _build_review_markdown(topic, _session_project(args), selected, len(papers), candidates)
     if args.output:
         out = Path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)
