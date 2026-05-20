@@ -1,6 +1,6 @@
 ---
 name: scholar-kit
-version: 1.6.0
+version: 1.7.0
 description: >-
   Search, download, and manage academic papers from CNKI (知网), OpenAlex,
   Semantic Scholar, arXiv, and NSSD; enriches metadata via Crossref and
@@ -184,6 +184,7 @@ python scripts/literature.py check --fix
 - 加 `--project <课题名>` 时读写 `.scholar-kit/projects/<课题名>/session.json`，用于课题级文献库；不加时仍读写默认 `.scholar-kit/session.json`
 - `projects` 列出已有课题文献库，`library --project <课题名>` 查看指定课题的文献列表
 - `review` 基于当前 session 或 `--project` 文献库生成可追溯综述材料，输出包含检索证据、推荐精读文献、待核对原文、可能不相关/需剔除文献、主题线索、综述草稿和证据条目
+- `review --cluster --gaps` 可按主题聚类组织综述，并基于当前文献库统计生成研究空白提示；研究空白必须展示命中数量、总文献数和证据序号，不得凭空编造
 - `review --auto-detail --detail-top-n N` 会在生成综述前自动挑选高相关、缺摘要的 CNKI 文献调用详情页补摘要，并写回同一 `--project` 文献库；适合用户要写综述但检索结果只有题录时使用
 - `import` 成功时也会覆盖 session（可配合 `--project` 导入到指定课题）
 - `read-detail` 执行后会写回 session（去掉 fulltext 字段以减小体积）
@@ -203,7 +204,7 @@ python scripts/literature.py check --fix
 - [学术表达优化](references/workflows.md#学术表达优化) — 诊断 → 逐段优化 → patch-docx 写回
 - [引文网络分析](references/workflows.md#引文网络分析) — citations 命令，不依赖知网
 - [研究趋势分析](references/workflows.md#研究趋势分析) — trends 命令，基于会话数据
-- `review --project <课题名> --topic <主题>` — 基于课题文献库生成可追溯综述材料，必须保留证据条目、“待核对原文”、撤稿/低相关提示；若 CNKI 题录缺摘要，优先使用 `review --auto-detail --detail-top-n 5` 自动补摘要后再生成
+- `review --project <课题名> --topic <主题> --cluster --gaps` — 基于课题文献库生成主题聚类和研究空白提示，必须保留证据条目、命中数量、“待核对原文”、撤稿/低相关提示；若 CNKI 题录缺摘要，优先叠加 `--auto-detail --detail-top-n 5` 自动补摘要后再生成
 - [文献对比矩阵](references/workflows.md#文献对比矩阵) — 多篇论文按维度结构化对比
 - [阅读笔记生成](references/workflows.md#阅读笔记生成) — 按模板提取核心信息
 
@@ -230,7 +231,7 @@ python scripts/literature.py check --fix
 | `import "file"` | 导入知网导出的题录文件 | NoteExpress/Refworks/BibTeX |
 | `citations "DOI/URL"` | 引文网络分析 | `--direction citing/cited/both` `--limit` |
 | `trends` | 研究趋势分析（基于会话） | `--project` |
-| `review` | 生成可追溯综述材料 | `--project` `--topic` `--limit` `--output` `--auto-detail` `--detail-top-n` `--raw` |
+| `review` | 生成可追溯综述材料 | `--project` `--topic` `--limit` `--output` `--auto-detail` `--detail-top-n` `--cluster` `--gaps` `--raw` |
 | `check` | 环境自检 | `--fix`（自动修复） |
 | `clean-cache` | 清理过期缓存 | `--all` `--dry-run` |
 

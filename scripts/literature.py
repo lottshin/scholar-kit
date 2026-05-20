@@ -1,5 +1,5 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.6.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.7.0)
 用法:
   python literature.py search "关键词" [--project 课题名] [--source cnki|openalex|semantic|arxiv|nssd|all] [--doc-type master] [--field 摘要] [--author] [--journal] [--download] ...
   python literature.py batch-search "词1" "词2" ... [--project 课题名] [--query-file kw.txt] [--core CSSCI] [--doc-type master] [--field 摘要] [--author] [--journal] [--append]
@@ -23,7 +23,7 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.6.0)
 
 from __future__ import annotations
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 import argparse
 import json
@@ -499,6 +499,13 @@ def _review_query_terms(topic: str) -> List[str]:
         token = token.strip(" .-_—")
         if len(token) >= 3 and token not in stopwords and token not in terms:
             terms.append(token)
+    cn_phrases = (
+        "国家形象", "国际传播", "对外传播", "社交媒体", "官方叙事", "中国故事",
+        "传播能力", "文化符号", "受众", "认知", "传播效果", "话语", "平台",
+    )
+    for phrase in cn_phrases:
+        if phrase in topic and phrase not in terms:
+            terms.append(phrase)
     compact = topic.lower().replace(" ", "")
     if compact and compact not in terms:
         terms.append(compact)
@@ -577,7 +584,82 @@ def _select_review_papers(papers: List[Dict[str, Any]], topic: str, limit: int) 
     return selected_pool[:limit]
 
 
-def _build_review_markdown(topic: str, project: Optional[str], selected: List[Dict[str, Any]], total: int, diagnostics: List[Dict[str, Any]] = None) -> str:
+def _cluster_label_for_paper(paper: Dict[str, Any], topic: str) -> str:
+    text = " ".join(str(paper.get(k, "")) for k in ("title", "abstract", "keywords", "journal"))
+    rules = [
+        ("国家形象建构与官方叙事", ("国家形象", "形象建构", "官方叙事", "中国形象", "national image")),
+        ("国际传播能力与对外传播", ("国际传播", "对外传播", "外宣", "传播能力", "international communication")),
+        ("平台机制与社交媒体", ("社交媒体", "平台", "youtube", "tiktok", "facebook", "x", "cgtn", "media")),
+        ("文化符号与中国故事", ("中国故事", "文化", "符号", "文明", "cultural", "story")),
+        ("受众认知与传播效果", ("受众", "认知", "效果", "态度", "audience", "perception", "effect")),
+        ("方法与模型", ("模型", "算法", "推荐", "实证", "扎根", "内容分析", "model", "method")),
+    ]
+    lowered = text.lower()
+    for label, terms in rules:
+        for term in terms:
+            if term.lower() in lowered:
+                return label
+    terms = _review_terms(topic, paper)
+    return terms[0] if terms else "其他相关研究"
+
+
+def _review_clusters(selected: List[Dict[str, Any]], topic: str) -> List[Dict[str, Any]]:
+    clusters: Dict[str, List[Dict[str, Any]]] = {}
+    for item in selected:
+        label = _cluster_label_for_paper(item["paper"], topic)
+        clusters.setdefault(label, []).append(item)
+    result = []
+    for label, items in sorted(clusters.items(), key=lambda kv: len(kv[1]), reverse=True):
+        evidence = []
+        for item in items:
+            p = item["paper"]
+            abstract = str(p.get("abstract") or "").strip()
+            evidence.append({
+                "index": item["index"],
+                "title": p.get("title", ""),
+                "trace_status": "abstract" if abstract else "metadata_only",
+                "abstract_excerpt": abstract[:160],
+            })
+        result.append({"label": label, "count": len(items), "papers": evidence})
+    return result
+
+
+def _review_gaps(papers: List[Dict[str, Any]], topic: str) -> List[Dict[str, Any]]:
+    dimensions = [
+        ("跨平台比较不足", ("youtube", "tiktok", "facebook", " x ", "微博", "微信", "抖音", "平台"), "平台"),
+        ("受众实证研究不足", ("受众", "认知", "效果", "问卷", "访谈", "实验", "audience", "perception"), "受众/效果"),
+        ("方法多样性不足", ("内容分析", "话语分析", "扎根", "实验", "问卷", "访谈", "模型", "算法"), "方法"),
+        ("非西方或比较视角不足", ("比较", "跨国", "区域", "非洲", "东南亚", "拉美", "一带一路", "comparative"), "比较/区域"),
+    ]
+    corpus = []
+    for p in papers:
+        corpus.append(" ".join(str(p.get(k, "")) for k in ("title", "abstract", "keywords", "journal")).lower())
+    gaps = []
+    for title, terms, dimension in dimensions:
+        matches = []
+        for i, text in enumerate(corpus, 1):
+            if any(term.lower() in f" {text} " for term in terms):
+                matches.append(i)
+        if len(matches) <= max(1, len(papers) // 10):
+            gaps.append({
+                "title": title,
+                "dimension": dimension,
+                "matched_count": len(matches),
+                "total": len(papers),
+                "evidence_indices": matches[:10],
+                "basis": f"当前文献库 {len(papers)} 篇中，{dimension} 相关线索约 {len(matches)} 篇。",
+            })
+    if not gaps:
+        gaps.append({
+            "title": "需扩大检索后再判断研究空白",
+            "dimension": "检索覆盖",
+            "matched_count": len(papers),
+            "total": len(papers),
+            "evidence_indices": [],
+            "basis": "当前文献库各预设维度均有一定覆盖，建议扩展关键词和数据库后再判断空白。",
+        })
+    return gaps
+def _build_review_markdown(topic: str, project: Optional[str], selected: List[Dict[str, Any]], total: int, diagnostics: List[Dict[str, Any]] = None, clusters: List[Dict[str, Any]] = None, gaps: List[Dict[str, Any]] = None) -> str:
     diagnostics = diagnostics or selected
     sources = sorted({item["paper"].get("source", "未获取") or "未获取" for item in selected})
     years = [str(_paper_year(item["paper"])) for item in selected if _paper_year(item["paper"])]
@@ -619,6 +701,27 @@ def _build_review_markdown(topic: str, project: Optional[str], selected: List[Di
             lines.append(f"- [{item['index']}] {paper.get('title', '未获取')}：{flags}")
     else:
         lines.append("- 暂无明显撤稿或低相关条目。")
+    lines.extend(["", "## 主题聚类"])
+    if clusters:
+        for cluster in clusters:
+            lines.append(f"### {cluster['label']}（{cluster['count']} 篇）")
+            for paper in cluster["papers"]:
+                status = "摘要可追溯" if paper.get("trace_status") == "abstract" else "待核对原文"
+                lines.append(f"- [{paper['index']}] {paper.get('title', '未获取')}：{status}")
+            lines.append("")
+    else:
+        lines.append("- 未启用聚类；可使用 `--cluster` 生成主题聚类章节。")
+    lines.extend(["## 研究空白提示"])
+    if gaps:
+        for gap in gaps:
+            indices = ",".join(str(i) for i in gap.get("evidence_indices", [])) or "无"
+            lines.extend([
+                f"### {gap['title']}",
+                f"- 检索证据：{gap['basis']}",
+                f"- 相关文献序号：{indices}",
+            ])
+    else:
+        lines.append("- 未启用研究空白分析；可使用 `--gaps` 基于当前文献库生成统计提示。")
     lines.extend(["", "## 主题线索"])
     for item in selected:
         paper = item["paper"]
@@ -712,13 +815,15 @@ def cmd_review(args):
             papers = _load_session(_session_project(args))
             candidates = _review_candidates(papers, topic)
     selected = _select_review_papers(papers, topic, limit)
+    clusters = _review_clusters(selected, topic) if getattr(args, "cluster", False) else None
+    gaps = _review_gaps(papers, topic) if getattr(args, "gaps", False) else None
     evidence = []
     for item in selected:
         entry = _paper_evidence(item["paper"], item["index"])
         entry["relevance"] = item.get("relevance", 0)
         entry["flags"] = item.get("flags", [])
         evidence.append(entry)
-    markdown = _build_review_markdown(topic, _session_project(args), selected, len(papers), candidates)
+    markdown = _build_review_markdown(topic, _session_project(args), selected, len(papers), candidates, clusters, gaps)
     if args.output:
         out = Path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -734,6 +839,8 @@ def cmd_review(args):
             "total": len(papers),
             "output_file": args.output,
             "auto_detail": auto_detail,
+            "clusters": clusters,
+            "gaps": gaps,
             "evidence": evidence,
             "markdown": markdown,
         })
@@ -2323,6 +2430,8 @@ def main():
     p_review.add_argument("--output", help="输出 Markdown 文件路径")
     p_review.add_argument("--auto-detail", action="store_true", help="生成综述前自动补全高相关知网文献摘要")
     p_review.add_argument("--detail-top-n", type=int, default=5, help="配合 --auto-detail，最多补全 N 篇知网文献（默认 5）")
+    p_review.add_argument("--cluster", action="store_true", help="按主题聚类组织综述材料")
+    p_review.add_argument("--gaps", action="store_true", help="基于当前文献库统计生成研究空白提示")
     p_review.add_argument("--raw", action="store_true", help="直接输出 Markdown 文本")
     p_review.set_defaults(func=cmd_review)
 
