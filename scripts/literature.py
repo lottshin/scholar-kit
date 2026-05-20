@@ -486,22 +486,59 @@ def _review_terms(topic: str, paper: Dict[str, Any]) -> List[str]:
     return terms[:12]
 
 
+def _review_query_terms(topic: str) -> List[str]:
+    stopwords = {
+        "the", "and", "of", "in", "on", "for", "to", "with", "from", "via", "a", "an",
+        "中的", "问题", "研究", "基于", "视域", "视角", "下的",
+    }
+    normalized = topic.lower()
+    for sep in "：:，,；;、/\\()（）[]【】《》<>\"'\n\t":
+        normalized = normalized.replace(sep, " ")
+    terms = []
+    for token in normalized.split():
+        token = token.strip(" .-_—")
+        if len(token) >= 3 and token not in stopwords and token not in terms:
+            terms.append(token)
+    compact = topic.lower().replace(" ", "")
+    if compact and compact not in terms:
+        terms.append(compact)
+    return terms
+
+
 def _select_review_papers(papers: List[Dict[str, Any]], topic: str, limit: int) -> List[Dict[str, Any]]:
-    topic_l = topic.lower()
+    query_terms = _review_query_terms(topic)
     scored = []
     for idx, paper in enumerate(papers, 1):
-        text = " ".join(str(paper.get(k, "")) for k in ("title", "abstract", "keywords", "journal")).lower()
-        score = int(paper.get("cited_by") or 0)
-        if topic_l and topic_l in text:
-            score += 1000
-        for part in topic_l.split():
-            if part and part in text:
-                score += 100
+        title = str(paper.get("title") or "").lower()
+        abstract = str(paper.get("abstract") or "").lower()
+        keywords = str(paper.get("keywords") or "").lower()
+        journal = str(paper.get("journal") or "").lower()
+        text = " ".join((title, abstract, keywords, journal))
+        relevance = 0
+        for term in query_terms:
+            if term in title:
+                relevance += 40
+            if term in keywords:
+                relevance += 25
+            if term in abstract:
+                relevance += 10
+            if term in journal:
+                relevance += 5
+        if topic.lower() in text:
+            relevance += 80
+        if not query_terms:
+            relevance = 1
+        metadata_score = 0
         if paper.get("abstract"):
-            score += 20
-        scored.append((score, idx, paper))
-    scored.sort(key=lambda item: (item[0], item[2].get("year") or ""), reverse=True)
-    return [{"index": idx, "paper": paper} for _, idx, paper in scored[:limit]]
+            metadata_score += 2
+        if paper.get("keywords"):
+            metadata_score += 1
+        cited_score = min(int(paper.get("cited_by") or 0), 50)
+        scored.append((relevance, metadata_score, cited_score, idx, paper))
+    scored.sort(key=lambda item: (item[0], item[1], item[2], item[4].get("year") or ""), reverse=True)
+    relevant = [item for item in scored if item[0] > 0]
+    selected_pool = relevant or scored
+    return [{"index": idx, "paper": paper} for _, _, _, idx, paper in selected_pool[:limit]]
 
 
 def _build_review_markdown(topic: str, project: Optional[str], selected: List[Dict[str, Any]], total: int) -> str:
