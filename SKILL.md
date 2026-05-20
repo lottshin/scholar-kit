@@ -1,6 +1,6 @@
 ---
 name: scholar-kit
-version: 1.9.0
+version: 1.10.0
 description: >-
   Search, download, and manage academic papers from CNKI (知网), OpenAlex,
   Semantic Scholar, arXiv, and NSSD; enriches metadata via Crossref and
@@ -183,7 +183,7 @@ python scripts/literature.py check --fix
 - `search` / `batch-search` 成功时写入 session.json；加 `--append` 追加而非覆盖
 - 加 `--project <课题名>` 时读写 `.scholar-kit/projects/<课题名>/session.json`，用于课题级文献库；不加时仍读写默认 `.scholar-kit/session.json`
 - `projects` 列出已有课题文献库，`library --project <课题名>` 查看指定课题的文献列表
-- `write --project <课题名> --topic <主题>` 基于课题文献库直接写作综述正文；`--format markdown/docx` 控制输出形态，`--with-citations` 自动附参考文献，`--validate` 同时输出证据质量校验。Agent 需要“写出来”时优先用 `write`，需要分析/材料/证据检查时用 `review`。
+- `write --project <课题名> --topic <主题>` 基于课题文献库直接写作综述正文；`--mode outline/draft/section` 控制写作阶段，`--section` 可只写指定章节，`--format markdown/docx` 控制输出形态，`--with-citations` 自动附参考文献，`--validate` 同时输出证据质量校验。Agent 需要“写出来”时优先用 `write`，需要分析/材料/证据检查时用 `review`。
 - `validate --project <课题名> --topic <主题> [--file draft.md]` 校验综述正文是否存在无证据论断、弱证据、无效证据编号和高相关证据未使用等问题；用户要求“检查综述/证据是否稳/引用是否支撑论断”时优先使用。
 - `review` 基于当前 session 或 `--project` 文献库生成可追溯综述材料，输出包含检索证据、推荐精读文献、待核对原文、可能不相关/需剔除文献、主题线索、综述草稿和证据条目
 - `review --cluster --gaps` 可按主题聚类组织综述，并基于当前文献库统计生成研究空白提示；研究空白必须展示命中数量、总文献数和证据序号，不得凭空编造
@@ -206,7 +206,7 @@ python scripts/literature.py check --fix
 - [学术表达优化](references/workflows.md#学术表达优化) — 诊断 → 逐段优化 → patch-docx 写回
 - [引文网络分析](references/workflows.md#引文网络分析) — citations 命令，不依赖知网
 - [研究趋势分析](references/workflows.md#研究趋势分析) — trends 命令，基于会话数据
-- `write --project <课题名> --topic <主题> --format markdown/docx --with-citations --validate` — 基于课题文献库直接生成综述正文；docx 只是输出格式，不再作为单独写作目标。`review` 用于分析材料，`write` 用于生成正文，`validate` 用于检查证据支撑质量。
+- `write --project <课题名> --topic <主题> --mode outline/draft/section --section <章节名> --format markdown/docx --with-citations --validate` — 基于课题文献库直接生成综述大纲、正文或指定章节；docx 只是输出格式，不再作为单独写作目标。`review` 用于分析材料，`write` 用于生成正文，`validate` 用于检查证据支撑质量。
 - `review --project <课题名> --topic <主题> --cluster --gaps` — 基于课题文献库生成主题聚类和研究空白提示，必须保留证据条目、命中数量、“待核对原文”、撤稿/低相关提示；若 CNKI 题录缺摘要，优先叠加 `--auto-detail --detail-top-n 5` 自动补摘要后再生成
 - [文献对比矩阵](references/workflows.md#文献对比矩阵) — 多篇论文按维度结构化对比
 - [阅读笔记生成](references/workflows.md#阅读笔记生成) — 按模板提取核心信息
@@ -229,7 +229,7 @@ python scripts/literature.py check --fix
 | `cite` | 生成引用 | `--style`（gbt7714/gb/footnote/apa） `--raw` `--project` |
 | `projects` | 列出课题文献库 | |
 | `library` | 查看当前/指定课题文献库 | `--project` `--limit` |
-| `write` | 基于文献库写综述正文 | `--project` `--topic` `--limit` `--format markdown/docx` `--output` `--with-citations` `--citation-style` `--validate` `--raw` |
+| `write` | 基于文献库写综述正文 | `--project` `--topic` `--limit` `--mode outline/draft/section` `--section` `--format markdown/docx` `--output` `--with-citations` `--citation-style` `--validate` `--raw` |
 | `validate` | 校验综述证据支撑质量 | `--project` `--topic` `--limit` `--file` |
 | `write-docx "file.md"` | Markdown → 学术格式 Word | `--output` |
 | `patch-docx "file.docx"` | 在原 .docx 上打补丁 | `--patch` `--output` |

@@ -1,5 +1,5 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.9.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.10.0)
 用法:
   python literature.py search "关键词" [--project 课题名] [--source cnki|openalex|semantic|arxiv|nssd|all] [--doc-type master] [--field 摘要] [--author] [--journal] [--download] ...
   python literature.py batch-search "词1" "词2" ... [--project 课题名] [--query-file kw.txt] [--core CSSCI] [--doc-type master] [--field 摘要] [--author] [--journal] [--append]
@@ -17,7 +17,7 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.9.0)
   python literature.py citations <DOI|URL> [--direction citing|cited|both] [--limit 20]
   python literature.py trends                  # 研究趋势（基于会话数据）
   python literature.py review [--project 课题名] [--topic 综述主题] [--auto-detail] [--output review.md]
-  python literature.py write [--project 课题名] [--topic 主题] [--format markdown|docx] [--with-citations] [--validate]
+  python literature.py write [--project 课题名] [--topic 主题] [--mode outline|draft|section] [--section 章节名] [--format markdown|docx] [--with-citations] [--validate]
   python literature.py validate [--project 课题名] [--topic 主题] [--file draft.md]
   python literature.py check                   # 环境自检
   python literature.py clean-cache [--all] [--dry-run]  # 缓存清理
@@ -25,7 +25,7 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.9.0)
 
 from __future__ import annotations
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 
 import argparse
 import json
@@ -783,42 +783,120 @@ def _build_review_markdown(topic: str, project: Optional[str], selected: List[Di
     return "\n".join(lines)
 
 
-def _build_review_draft(topic: str, selected: List[Dict[str, Any]], clusters: List[Dict[str, Any]], gaps: List[Dict[str, Any]]) -> str:
-    lines = [f"# {topic} 文献综述初稿", "", "## 文献综述"]
+def _paper_write_excerpt(paper: Dict[str, Any], limit: int = 120) -> str:
+    text = str(paper.get("abstract") or paper.get("summary") or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text)
+    return text[:limit]
+
+
+def _evidence_indices(items: List[Dict[str, Any]], limit: int = 5) -> str:
+    return "".join(f"[{item['index']}]" for item in items[:limit])
+
+
+def _cluster_evidence_indices(cluster: Dict[str, Any], limit: int = 5) -> str:
+    return "".join(f"[{paper['index']}]" for paper in cluster.get("papers", [])[:limit])
+
+
+def _build_review_outline(topic: str, clusters: List[Dict[str, Any]], gaps: List[Dict[str, Any]]) -> str:
+    lines = [f"# {topic} 文献综述大纲", "", "## 一、研究背景与问题提出"]
+    intro_indices = _cluster_evidence_indices(clusters[0]) if clusters else ""
+    lines.append(f"- 交代“{topic}”的研究缘起、核心概念和现实背景{intro_indices}。")
+    lines.append("- 明确本文综述的对象、范围和资料来源。")
+    lines.extend(["", "## 二、研究脉络与主题分支"])
+    if clusters:
+        for i, cluster in enumerate(clusters, 1):
+            indices = _cluster_evidence_indices(cluster)
+            lines.append(f"- {i}. {cluster['label']}：梳理该方向的主要问题、代表观点和证据边界{indices}。")
+    else:
+        lines.append("- 当前文献库尚未形成稳定主题分支，建议先扩展检索。")
+    lines.extend(["", "## 三、研究不足与后续方向"])
+    for gap in gaps[:4]:
+        indices = "".join(f"[{i}]" for i in gap.get("evidence_indices", [])[:5]) or "（需补检索）"
+        lines.append(f"- {gap['title']}：{gap['basis']}，证据线索 {indices}。")
+    lines.extend(["", "## 四、段落证据映射", "- 写作时每个实质段落需保留证据编号，并对缺摘要文献标注“待核对原文”。"])
+    return "\n".join(lines)
+
+
+def _build_review_section(topic: str, selected: List[Dict[str, Any]], clusters: List[Dict[str, Any]], gaps: List[Dict[str, Any]], section: str) -> str:
+    section_key = section.strip() if section else "文献综述"
+    draft = _build_review_draft(topic, selected, clusters, gaps, mode="draft")
+    if section_key in ("研究背景", "背景", "问题提出"):
+        usable = [item for item in selected if item.get("relevance", 0) > 0 and "retracted" not in item.get("flags", [])]
+        indices = _evidence_indices(usable)
+        return "\n".join([
+            f"# {topic}：研究背景",
+            "",
+            f"“{topic}”相关研究的展开，通常与媒介技术变迁、知识生产方式更新以及具体社会议题的外部传播需求有关{indices}。现有文献显示，该领域已经积累了一批围绕概念界定、传播路径、媒介平台和效果评价的研究，但不同文献之间在资料来源和原文可追溯性上并不均衡，因此后续写作需要区分摘要可追溯证据与待核对原文证据。",
+            "",
+            "## 段落证据映射",
+            *[f"- [{item['index']}] {item['paper'].get('title', '未获取')}：{'摘要可追溯' if item['paper'].get('abstract') else '待核对原文'}，相关性分 {item.get('relevance', 0)}" for item in usable],
+        ])
+    if section_key in ("研究不足", "不足", "未来方向", "后续方向"):
+        lines = [f"# {topic}：研究不足与后续方向", ""]
+        for gap in gaps[:4]:
+            indices = "".join(f"[{i}]" for i in gap.get("evidence_indices", [])[:5]) or "（当前库无直接证据）"
+            lines.append(f"从现有文献库的覆盖情况看，{gap['title']}仍值得进一步展开。{gap['basis']}，相关证据序号为{indices}。这一不足并不意味着相关研究不存在，而是提示后续检索应在该维度上补充数据库、关键词和原文核对。")
+        return "\n\n".join(lines)
+    for cluster in clusters:
+        if section_key in cluster["label"] or cluster["label"] in section_key:
+            indices = _cluster_evidence_indices(cluster)
+            body = cluster.get("synthesis") or "该方向下部分文献仍缺少摘要，现阶段只能作为题录线索处理。"
+            return "\n".join([
+                f"# {topic}：{cluster['label']}",
+                "",
+                f"在{cluster['label']}这一分支中，相关文献主要提供了关于“{topic}”的概念、对象或案例线索{indices}。{body}。由于该分支内部证据密度可能不均，写作时应优先使用摘要可追溯文献，并将缺少摘要的条目标注为待核对原文。",
+                "",
+                "## 段落证据映射",
+                *[f"- [{paper['index']}] {paper.get('title', '未获取')}：{'摘要可追溯' if paper.get('trace_status') == 'abstract' else '待核对原文'}" for paper in cluster.get("papers", [])],
+            ])
+    return draft
+
+
+def _build_review_draft(topic: str, selected: List[Dict[str, Any]], clusters: List[Dict[str, Any]], gaps: List[Dict[str, Any]], mode: str = "draft", section: str = "") -> str:
     usable = [item for item in selected if item.get("relevance", 0) > 0 and "retracted" not in item.get("flags", [])]
+    cluster_list = clusters or _review_clusters(usable, topic)
+    if mode == "outline":
+        return _build_review_outline(topic, cluster_list, gaps)
+    if mode == "section" or section:
+        return _build_review_section(topic, selected, cluster_list, gaps, section)
+
+    lines = [f"# {topic} 文献综述初稿", "", "## 一、研究背景与问题提出"]
     if not usable:
         lines.append("当前文献库中尚未形成足够高相关、可追溯的文献基础，建议扩大检索或补充摘要后再生成综述初稿。")
     else:
-        cluster_list = clusters or _review_clusters(usable, topic)
-        intro_indices = "".join(f"[{item['index']}]" for item in usable[:5])
+        intro_indices = _evidence_indices(usable)
+        sources = sorted({item["paper"].get("source", "未获取") or "未获取" for item in usable})
         lines.append(
-            f"围绕“{topic}”，现有文献主要从" +
-            "、".join(cluster["label"] for cluster in cluster_list[:4]) +
-            f"等方面展开讨论{intro_indices}。总体来看，相关研究已经从宏观理论建构、传播路径选择、媒介形态变化和具体案例分析等角度积累了初步成果，但不同主题之间的证据密度和原文可追溯程度仍存在差异。"
+            f"围绕“{topic}”，当前文献库已经形成以{ '、'.join(cluster['label'] for cluster in cluster_list[:4]) }为主的若干研究分支{intro_indices}。从资料来源看，相关证据主要来自{ '、'.join(sources) }；从证据质量看，部分文献具有摘要支撑，部分条目仍需继续补充详情页或原文。因而，后续写作应把已有摘要作为直接论证基础，把题录信息作为待核对线索。"
         )
-        lines.append("")
+        lines.extend(["", "## 二、研究脉络与主题分支"])
         for cluster in cluster_list:
-            indices = "".join(f"[{paper['index']}]" for paper in cluster.get("papers", [])[:5])
+            indices = _cluster_evidence_indices(cluster)
             if cluster.get("synthesis"):
                 body = cluster["synthesis"]
+                evidence_note = "这些摘要能够为该分支的基本判断提供初步依据"
             else:
-                body = "该主题下部分文献仍缺少摘要或全文证据，相关判断需要进一步核对原文。"
+                body = "该分支目前主要由题录信息构成，尚不足以支撑细节性结论"
+                evidence_note = "相关判断需在补充摘要或全文后再强化"
             lines.extend([
                 f"### {cluster['label']}",
-                f"在{cluster['label']}方面，已有研究围绕“{topic}”形成了若干线索。{body}{indices}",
+                f"{cluster['label']}是“{topic}”研究中的一个重要切面{indices}。现有材料显示，{body}。因此，写作时可将该分支作为综述的一个层次展开，但需要注意证据边界：{evidence_note}。",
                 "",
             ])
-        if gaps:
-            lines.extend(["## 研究不足与后续方向"])
-            for gap in gaps[:4]:
-                indices = "".join(f"[{i}]" for i in gap.get("evidence_indices", [])[:5]) or "（当前库无直接证据）"
-                lines.append(f"其一，{gap['title']}。{gap['basis']}，相关证据序号为{indices}。这一结果提示后续研究可围绕该维度进一步扩展检索和原文核对。")
+        lines.extend(["## 三、研究不足与后续方向"])
+        for i, gap in enumerate(gaps[:4], 1):
+            indices = "".join(f"[{idx}]" for idx in gap.get("evidence_indices", [])[:5]) or "（当前库无直接证据）"
+            lines.append(f"{i}. {gap['title']}。{gap['basis']}，相关证据序号为{indices}。这一提示只反映当前文献库的覆盖情况，后续应通过扩展关键词、数据库和原文核对进一步确认。")
     lines.append("")
-    lines.append("## 段落证据映射")
+    lines.append("## 四、段落证据映射")
     for item in usable:
         p = item["paper"]
         status = "摘要可追溯" if p.get("abstract") else "待核对原文"
-        lines.append(f"- [{item['index']}] {p.get('title', '未获取')}：{status}，相关性分 {item.get('relevance', 0)}")
+        excerpt = _paper_write_excerpt(p, 80)
+        excerpt_text = f"；摘要线索：{excerpt}" if excerpt else ""
+        lines.append(f"- [{item['index']}] {p.get('title', '未获取')}：{status}，相关性分 {item.get('relevance', 0)}{excerpt_text}")
     return "\n".join(lines)
 
 
@@ -967,7 +1045,11 @@ def cmd_write(args):
     topic = args.topic or _session_project(args) or "当前课题"
     limit = min(args.limit or 12, len(papers))
     selected, clusters, gaps = _review_write_inputs(papers, topic, limit)
-    markdown = _build_review_draft(topic, selected, clusters, gaps)
+    mode = getattr(args, "mode", "draft") or "draft"
+    section = getattr(args, "section", "") or ""
+    if section and mode == "draft":
+        mode = "section"
+    markdown = _build_review_draft(topic, selected, clusters, gaps, mode=mode, section=section)
     if args.with_citations:
         markdown = _append_references(markdown, selected, args.citation_style or "gbt7714")
     validation = _validate_writing(markdown, selected) if getattr(args, "validate", False) else None
@@ -979,7 +1061,7 @@ def cmd_write(args):
         elif output_path.suffix.lower() != ".docx":
             output_path = output_path.with_suffix(".docx")
         result = _write_docx_from_markdown(markdown, output_path)
-        result.update({"project": _session_project(args), "topic": topic, "format": "docx", "validation": validation})
+        result.update({"project": _session_project(args), "topic": topic, "mode": mode, "section": section or None, "format": "docx", "validation": validation})
         _output(result)
         return
 
@@ -993,6 +1075,8 @@ def cmd_write(args):
             "status": "success",
             "project": _session_project(args),
             "topic": topic,
+            "mode": mode,
+            "section": section or None,
             "format": "markdown",
             "output_file": str(output_path) if output_path else None,
             "validation": validation,
@@ -1010,7 +1094,7 @@ def cmd_validate(args):
     if args.file:
         markdown = Path(args.file).read_text(encoding="utf-8")
     else:
-        markdown = _build_review_draft(topic, selected, clusters, gaps)
+        markdown = _build_review_draft(topic, selected, clusters, gaps, mode="draft")
     validation = _validate_writing(markdown, selected)
     validation.update({
         "project": _session_project(args),
@@ -2660,6 +2744,8 @@ def main():
     p_write.add_argument("--topic", help="写作主题；默认使用 --project 或当前课题")
     p_write.add_argument("--limit", type=int, default=12, help="最多纳入前 N 篇相关文献（默认 12）")
     p_write.add_argument("--format", choices=["markdown", "md", "docx"], default="markdown", help="输出格式：markdown/md/docx")
+    p_write.add_argument("--mode", choices=["outline", "draft", "section"], default="draft", help="写作模式：outline 大纲 / draft 正文 / section 单节")
+    p_write.add_argument("--section", help="只生成指定章节，如 研究背景、研究不足、某个主题聚类名称")
     p_write.add_argument("--output", help="输出文件路径")
     p_write.add_argument("--with-citations", action="store_true", help="附加参考文献列表")
     p_write.add_argument("--citation-style", default="gbt7714", choices=["gbt7714", "gb", "footnote", "apa"])
