@@ -1,6 +1,6 @@
 ---
 name: scholar-kit
-version: 1.4.0
+version: 1.5.0
 description: >-
   Search, download, and manage academic papers from CNKI (知网), OpenAlex,
   Semantic Scholar, arXiv, and NSSD; enriches metadata via Crossref and
@@ -181,10 +181,12 @@ python scripts/literature.py check --fix
 ### 会话机制
 
 - `search` / `batch-search` 成功时写入 session.json；加 `--append` 追加而非覆盖
-- `import` 成功时也会覆盖 session
+- 加 `--project <课题名>` 时读写 `.scholar-kit/projects/<课题名>/session.json`，用于课题级文献库；不加时仍读写默认 `.scholar-kit/session.json`
+- `projects` 列出已有课题文献库，`library --project <课题名>` 查看指定课题的文献列表
+- `import` 成功时也会覆盖 session（可配合 `--project` 导入到指定课题）
 - `read-detail` 执行后会写回 session（去掉 fulltext 字段以减小体积）
-- 读取 session 的命令：`trends`、`batch-download --from-session`、`read-detail`、`cite`、`export`
-- 会话路径：当前工作目录下 `.scholar-kit/session.json`
+- 读取 session 的命令：`trends`、`batch-download --from-session`、`read-detail`、`cite`、`export`、`library`，均支持 `--project`（`projects` 除外）
+- 默认会话路径：当前工作目录下 `.scholar-kit/session.json`
 
 ## 工作流
 
@@ -209,20 +211,22 @@ python scripts/literature.py check --fix
 
 | 命令 | 用途 | 关键参数 |
 |------|------|----------|
-| `search "词"` | 单关键词搜索 | `--source` `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--limit` `--cite-enrich` `--export` `--output` `--download` `--download-dir` `--download-top-n` `--append` |
-| `batch-search "词1" "词2"` | 多关键词搜索 | `--query-file` `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--export` `--output` `--append` |
-| `read-detail` | 获取摘要/全文（CNKI 论文，含硕博论文） | `--top-n` `--indices` `--fulltext` |
+| `search "词"` | 单关键词搜索 | `--source` `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--limit` `--cite-enrich` `--export` `--output` `--download` `--download-dir` `--download-top-n` `--append` `--project` |
+| `batch-search "词1" "词2"` | 多关键词搜索 | `--query-file` `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--export` `--output` `--append` `--project` |
+| `read-detail` | 获取摘要/全文（CNKI 论文，含硕博论文） | `--top-n` `--indices` `--fulltext` `--project` |
 | `read-paper "file"` | 读取用户论文 | `--output` `--raw` |
 | `detail "url"` | 单篇详情 | |
 | `download [url]` | 单篇下载 | `--dir` `--doi` `--file-format` |
-| `batch-download [url1 url2 ...]` | 批量下载（推荐） | `--from-session` `--top-n` `--dir` `--file-format` |
-| `export` | 导出文献列表 | `--format` `--output` `--raw` |
-| `cite` | 生成引用 | `--style`（gbt7714/gb/footnote/apa） `--raw` |
+| `batch-download [url1 url2 ...]` | 批量下载（推荐） | `--from-session` `--top-n` `--dir` `--file-format` `--project` |
+| `export` | 导出文献列表 | `--format` `--output` `--raw` `--project` |
+| `cite` | 生成引用 | `--style`（gbt7714/gb/footnote/apa） `--raw` `--project` |
+| `projects` | 列出课题文献库 | |
+| `library` | 查看当前/指定课题文献库 | `--project` `--limit` |
 | `write-docx "file.md"` | Markdown → 学术格式 Word | `--output` |
 | `patch-docx "file.docx"` | 在原 .docx 上打补丁 | `--patch` `--output` |
 | `import "file"` | 导入知网导出的题录文件 | NoteExpress/Refworks/BibTeX |
 | `citations "DOI/URL"` | 引文网络分析 | `--direction citing/cited/both` `--limit` |
-| `trends` | 研究趋势分析（基于会话） | |
+| `trends` | 研究趋势分析（基于会话） | `--project` |
 | `check` | 环境自检 | `--fix`（自动修复） |
 | `clean-cache` | 清理过期缓存 | `--all` `--dry-run` |
 

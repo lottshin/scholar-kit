@@ -1,9 +1,9 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.4.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.5.0)
 用法:
-  python literature.py search "关键词" [--source cnki|openalex|semantic|arxiv|nssd|all] [--doc-type master] [--field 摘要] [--author] [--journal] [--download] ...
-  python literature.py batch-search "词1" "词2" ... [--query-file kw.txt] [--core CSSCI] [--doc-type master] [--field 摘要] [--author] [--journal] [--append]
-  python literature.py read-detail [--top-n 5] [--fulltext]
+  python literature.py search "关键词" [--project 课题名] [--source cnki|openalex|semantic|arxiv|nssd|all] [--doc-type master] [--field 摘要] [--author] [--journal] [--download] ...
+  python literature.py batch-search "词1" "词2" ... [--project 课题名] [--query-file kw.txt] [--core CSSCI] [--doc-type master] [--field 摘要] [--author] [--journal] [--append]
+  python literature.py read-detail [--project 课题名] [--top-n 5] [--fulltext]
   python literature.py read-paper <论文.docx> [--output paper.txt]
   python literature.py download <url_or_doi> [--dir ./papers] [--doi DOI]
   python literature.py batch-download --from-session [--top-n 20] [--dir ./papers]
@@ -22,7 +22,7 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.4.0)
 
 from __future__ import annotations
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 import argparse
 import json
@@ -30,7 +30,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout = open(sys.stdout.fileno(), mode="w", encoding="utf-8", errors="replace", buffering=1)
@@ -52,16 +52,32 @@ from cnki import (  # noqa: E402
 )
 from formatter import export_papers, generate_reference_list, citation_preview  # noqa: E402
 
-def _session_file() -> Path:
+def _safe_project_name(project: str) -> str:
+    cleaned = "".join(c if c.isalnum() or c in "._- 一-鿿" else "_" for c in project.strip())
+    cleaned = cleaned.strip(" .")
+    return cleaned or "default"
+
+
+def _project_dir(project: str) -> Path:
+    return Path.cwd() / ".scholar-kit" / "projects" / _safe_project_name(project)
+
+
+def _session_file(project: Optional[str] = None) -> Path:
+    if project:
+        return _project_dir(project) / "session.json"
     return Path.cwd() / ".scholar-kit" / "session.json"
 
 
-def _save_session(results: List[Dict[str, Any]], append: bool = False):
+def _session_project(args) -> Optional[str]:
+    return getattr(args, "project", None) or None
+
+
+def _save_session(results: List[Dict[str, Any]], append: bool = False, project: Optional[str] = None):
     """保存搜索结果到会话文件。append=True 时追加并按标题去重。"""
-    sf = _session_file()
+    sf = _session_file(project)
     sf.parent.mkdir(parents=True, exist_ok=True)
     if append:
-        existing = _load_session()
+        existing = _load_session(project)
         seen: Dict[str, Dict[str, Any]] = {}
         no_title: List[Dict[str, Any]] = []
         for r in existing:
@@ -80,8 +96,8 @@ def _save_session(results: List[Dict[str, Any]], append: bool = False):
     sf.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _load_session() -> List[Dict[str, Any]]:
-    sf = _session_file()
+def _load_session(project: Optional[str] = None) -> List[Dict[str, Any]]:
+    sf = _session_file(project)
     if sf.exists():
         try:
             return json.loads(sf.read_text(encoding="utf-8"))
@@ -101,7 +117,7 @@ def _cnki_cache_key(args) -> str:
     return hashlib.md5(key_parts.encode()).hexdigest()
 
 
-def _cnki_cache_get(args) -> list | None:
+def _cnki_cache_get(args) -> Optional[list]:
     cache_dir = Path.cwd() / ".scholar-kit" / "cache"
     cache_file = cache_dir / f"cnki_{_cnki_cache_key(args)}.json"
     if cache_file.exists():
@@ -256,7 +272,7 @@ def cmd_search(args):
                                 p[k] = detail[k]
                     time.sleep(1)
 
-        _save_session(deduped, append=getattr(args, "append", False))
+        _save_session(deduped, append=getattr(args, "append", False), project=_session_project(args))
 
         # 为每条结果添加引用预览
         for p in deduped:
@@ -357,7 +373,7 @@ def cmd_batch_download(args):
     urls = list(args.urls) if args.urls else []
 
     if args.from_session:
-        session_data = _load_session()
+        session_data = _load_session(_session_project(args))
         if not session_data:
             _output({"status": "error", "code": "NO_SESSION",
                      "message": "没有搜索记录，请先执行 search 或 batch-search"})
@@ -394,7 +410,7 @@ def cmd_detail(args):
 # ── export 命令 ───────────────────────────────────────
 
 def cmd_export(args):
-    papers = _load_session()
+    papers = _load_session(_session_project(args))
     if not papers:
         _output({"status": "error", "code": "NO_SESSION_DATA", "message": "没有可导出的数据，请先执行 search、batch-search 或 import"})
         return
@@ -406,14 +422,58 @@ def cmd_export(args):
     if args.raw:
         print(result)
     else:
-        _output({"status": "success", "format": args.export_format,
+        _output({"status": "success", "project": _session_project(args), "format": args.export_format,
                  "output_file": args.output, "content": result})
+
+
+# ── project/library 命令 ───────────────────────────────
+
+def _paper_year(paper: Dict[str, Any]) -> Any:
+    return paper.get("year") or str(paper.get("date", ""))[:4]
+
+
+def _paper_summary(paper: Dict[str, Any], index: int) -> Dict[str, Any]:
+    return {
+        "index": index,
+        "title": paper.get("title", ""),
+        "authors": paper.get("authors", ""),
+        "journal": paper.get("journal", ""),
+        "year": _paper_year(paper),
+        "cited_by": paper.get("cited_by", 0),
+        "source": paper.get("source", ""),
+        "tags": paper.get("tags", []),
+        "note": paper.get("note", ""),
+    }
+
+
+def cmd_projects(args):
+    base = Path.cwd() / ".scholar-kit" / "projects"
+    projects = []
+    if base.exists():
+        for project_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+            papers = _load_session(project_dir.name)
+            projects.append({
+                "name": project_dir.name,
+                "count": len(papers),
+                "session_file": str(project_dir / "session.json"),
+            })
+    _output({"status": "success", "count": len(projects), "projects": projects})
+
+
+def cmd_library(args):
+    papers = _load_session(_session_project(args))
+    if not papers:
+        _output({"status": "error", "code": "NO_SESSION_DATA", "message": "没有可查看的文献，请先执行 search、batch-search 或 import"})
+        return
+    limit = args.limit or len(papers)
+    rows = [_paper_summary(p, i + 1) for i, p in enumerate(papers[:limit])]
+    _output({"status": "success", "project": _session_project(args), "count": len(papers), "results": rows})
 
 
 # ── cite 命令 ─────────────────────────────────────────
 
 def cmd_cite(args):
-    papers = _load_session()
+    papers = _load_session(_session_project(args))
     if not papers:
         _output({"status": "error", "code": "NO_SESSION_DATA", "message": "没有可格式化的数据，请先执行 search、batch-search 或 import"})
         return
@@ -449,7 +509,7 @@ def cmd_cite(args):
     if args.raw:
         print(ref_list)
     else:
-        _output({"status": "success", "style": args.style or "gbt7714",
+        _output({"status": "success", "project": _session_project(args), "style": args.style or "gbt7714",
                  "count": len(enriched), "references": ref_list})
 
 
@@ -458,7 +518,7 @@ def cmd_cite(args):
 def cmd_import(args):
     results = parse_cnki_export(args.filepath)
     if results and not (len(results) == 1 and results[0].get("status") == "error"):
-        _save_session(results)
+        _save_session(results, project=_session_project(args))
         _output({"status": "success", "count": len(results), "results": results})
     else:
         _output(results[0] if results else {"status": "error", "code": "IMPORT_PARSE_FAILED", "message": "解析失败"})
@@ -657,7 +717,7 @@ def cmd_batch_search(args):
     )
 
     if result.get("status") in ("success", "partial") and result.get("results"):
-        _save_session(result.get("results") or [], append=args.append)
+        _save_session(result.get("results") or [], append=args.append, project=_session_project(args))
 
     if args.export and result.get("results"):
         content = export_papers(result["results"], args.export, args.output)
@@ -704,7 +764,7 @@ def _parse_indices(raw: str, total: int) -> List[int]:
 
 def cmd_read_detail(args):
     """对会话中的论文批量获取摘要/全文"""
-    papers = _load_session()
+    papers = _load_session(_session_project(args))
     if not papers:
         _output({"status": "error", "code": "NO_SESSION_DATA",
                  "message": "没有可读取的论文，请先执行 search、batch-search 或 import"})
@@ -758,7 +818,7 @@ def cmd_read_detail(args):
         for p in enriched:
             sp = {k: v for k, v in p.items() if k != "fulltext"}
             session_papers.append(sp)
-    _save_session(session_papers)
+    _save_session(session_papers, project=_session_project(args))
 
     output_papers = enriched
     results = []
@@ -1376,7 +1436,7 @@ def cmd_citations(args):
 
 def cmd_trends(args):
     """研究趋势分析：基于当前会话数据进行聚合统计"""
-    papers = _load_session()
+    papers = _load_session(_session_project(args))
     if not papers:
         _output({"status": "error", "code": "NO_SESSION_DATA",
                  "message": "没有可分析的论文，请先执行 search、batch-search 或 import"})
@@ -1385,7 +1445,7 @@ def cmd_trends(args):
     print(f"[trends] 分析 {len(papers)} 篇论文的研究趋势...", file=sys.stderr)
 
     result = analyze_trends(papers)
-    _output({"status": "success", **result})
+    _output({"status": "success", "project": _session_project(args), **result})
 
 
 # ── check 命令 ────────────────────────────────────────
@@ -1817,6 +1877,7 @@ def main():
                           help="搜索时点击前 N 篇知网引用按钮，快速补全 GB/T 引用和页码")
     p_search.add_argument("--append", action="store_true",
                           help="追加到已有会话结果（而非覆盖）")
+    p_search.add_argument("--project", help="课题文献库名称；指定后读写 .scholar-kit/projects/<project>/session.json")
     p_search.set_defaults(func=cmd_search)
 
     # download
@@ -1838,18 +1899,31 @@ def main():
                           choices=["bibtex", "ris", "markdown", "json", "excel", "gbt7714", "footnote", "apa"])
     p_export.add_argument("--output", help="输出文件路径")
     p_export.add_argument("--raw", action="store_true", help="输出纯文本而非 JSON")
+    p_export.add_argument("--project", help="课题文献库名称")
     p_export.set_defaults(func=cmd_export)
+
+    # projects
+    p_projects = sub.add_parser("projects", help="列出课题文献库")
+    p_projects.set_defaults(func=cmd_projects)
+
+    # library
+    p_library = sub.add_parser("library", help="查看当前或指定课题文献库")
+    p_library.add_argument("--project", help="课题文献库名称")
+    p_library.add_argument("--limit", type=int, help="最多显示前 N 篇")
+    p_library.set_defaults(func=cmd_library)
 
     # cite
     p_cite = sub.add_parser("cite", help="生成引用格式")
     p_cite.add_argument("--style", default="gbt7714",
                         choices=["gbt7714", "gb", "footnote", "apa"])
     p_cite.add_argument("--raw", action="store_true", help="输出纯文本而非 JSON")
+    p_cite.add_argument("--project", help="课题文献库名称")
     p_cite.set_defaults(func=cmd_cite)
 
     # import
     p_import = sub.add_parser("import", help="导入知网导出的题录文件")
     p_import.add_argument("filepath", help="题录文件路径")
+    p_import.add_argument("--project", help="课题文献库名称")
     p_import.set_defaults(func=cmd_import)
 
     # read-paper
@@ -1887,6 +1961,7 @@ def main():
     p_batch.add_argument("--output", help="导出文件路径")
     p_batch.add_argument("--append", action="store_true",
                          help="追加到已有会话结果（而非覆盖）")
+    p_batch.add_argument("--project", help="课题文献库名称")
     p_batch.set_defaults(func=cmd_batch_search)
 
     # read-detail
@@ -1897,6 +1972,7 @@ def main():
                         help="指定论文序号（从1开始），如 '3' '1,3,9' '2-5'。指定后忽略 --top-n")
     p_read.add_argument("--fulltext", action="store_true",
                         help="抓取 HTML 全文（默认只抓摘要）")
+    p_read.add_argument("--project", help="课题文献库名称")
     p_read.set_defaults(func=cmd_read_detail)
 
     # batch-download
@@ -1907,6 +1983,7 @@ def main():
     p_bdl.add_argument("--top-n", type=int, help="配合 --from-session，只下载前 N 篇")
     p_bdl.add_argument("--dir", default="./papers", help="保存目录")
     p_bdl.add_argument("--file-format", choices=["pdf", "caj"], default="pdf")
+    p_bdl.add_argument("--project", help="课题文献库名称；配合 --from-session 使用")
     p_bdl.set_defaults(func=cmd_batch_download)
 
     # write-docx
@@ -1941,6 +2018,7 @@ def main():
 
     # trends
     p_trends = sub.add_parser("trends", help="研究趋势分析（基于会话中的搜索结果）")
+    p_trends.add_argument("--project", help="课题文献库名称")
     p_trends.set_defaults(func=cmd_trends)
 
     # check
