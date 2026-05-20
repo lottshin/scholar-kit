@@ -1,5 +1,5 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.5.1)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.6.0)
 用法:
   python literature.py search "关键词" [--project 课题名] [--source cnki|openalex|semantic|arxiv|nssd|all] [--doc-type master] [--field 摘要] [--author] [--journal] [--download] ...
   python literature.py batch-search "词1" "词2" ... [--project 课题名] [--query-file kw.txt] [--core CSSCI] [--doc-type master] [--field 摘要] [--author] [--journal] [--append]
@@ -16,14 +16,14 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.5.1)
   python literature.py patch-docx <原论文.docx> --patch patch.json [--output 修改后.docx]
   python literature.py citations <DOI|URL> [--direction citing|cited|both] [--limit 20]
   python literature.py trends                  # 研究趋势（基于会话数据）
-  python literature.py review [--project 课题名] [--topic 综述主题] [--output review.md]
+  python literature.py review [--project 课题名] [--topic 综述主题] [--auto-detail] [--output review.md]
   python literature.py check                   # 环境自检
   python literature.py clean-cache [--all] [--dry-run]  # 缓存清理
 """
 
 from __future__ import annotations
 
-__version__ = "1.5.1"
+__version__ = "1.6.0"
 
 import argparse
 import json
@@ -659,6 +659,42 @@ def _build_review_markdown(topic: str, project: Optional[str], selected: List[Di
     return "\n".join(lines)
 
 
+def _auto_detail_for_review(papers: List[Dict[str, Any]], candidates: List[Dict[str, Any]], detail_top_n: int, project: Optional[str]) -> Dict[str, Any]:
+    targets = []
+    for item in candidates:
+        paper = item["paper"]
+        if item.get("relevance", 0) <= 0 or "retracted" in item.get("flags", []):
+            continue
+        if _is_cnki_paper(paper) and paper.get("url") and not paper.get("abstract"):
+            targets.append(item)
+        if len(targets) >= detail_top_n:
+            break
+    if not targets:
+        return {"attempted": 0, "updated": 0, "indices": []}
+
+    selected = [item["paper"] for item in targets]
+    enriched = batch_read_detail(papers=selected, top_n=len(selected), fulltext=False)
+    enriched_map = {p.get("url", ""): p for p in enriched if isinstance(p, dict) and p.get("url")}
+    updated = list(papers)
+    updated_count = 0
+    for item in targets:
+        idx = item["index"] - 1
+        url = updated[idx].get("url", "")
+        detail = enriched_map.get(url)
+        if not detail:
+            continue
+        merged = {k: v for k, v in detail.items() if k != "fulltext"}
+        merged.update({k: updated[idx][k] for k in updated[idx] if k not in merged})
+        if merged.get("abstract") and not updated[idx].get("abstract"):
+            updated_count += 1
+        updated[idx] = merged
+    _save_session(updated, project=project)
+    return {
+        "attempted": len(targets),
+        "updated": updated_count,
+        "indices": [item["index"] for item in targets],
+    }
+
 def cmd_review(args):
     papers = _load_session(_session_project(args))
     if not papers:
@@ -667,6 +703,14 @@ def cmd_review(args):
     topic = args.topic or _session_project(args) or "当前课题"
     limit = min(args.limit or 12, len(papers))
     candidates = _review_candidates(papers, topic)
+    auto_detail = None
+    if getattr(args, "auto_detail", False):
+        detail_top_n = max(getattr(args, "detail_top_n", 5) or 5, 1)
+        print(f"[review] 自动补全高相关知网文献摘要（最多 {detail_top_n} 篇）...", file=sys.stderr)
+        auto_detail = _auto_detail_for_review(papers, candidates, detail_top_n, _session_project(args))
+        if auto_detail.get("attempted"):
+            papers = _load_session(_session_project(args))
+            candidates = _review_candidates(papers, topic)
     selected = _select_review_papers(papers, topic, limit)
     evidence = []
     for item in selected:
@@ -689,6 +733,7 @@ def cmd_review(args):
             "count": len(selected),
             "total": len(papers),
             "output_file": args.output,
+            "auto_detail": auto_detail,
             "evidence": evidence,
             "markdown": markdown,
         })
@@ -2276,6 +2321,8 @@ def main():
     p_review.add_argument("--project", help="课题文献库名称")
     p_review.add_argument("--limit", type=int, default=12, help="最多纳入前 N 篇相关文献（默认 12）")
     p_review.add_argument("--output", help="输出 Markdown 文件路径")
+    p_review.add_argument("--auto-detail", action="store_true", help="生成综述前自动补全高相关知网文献摘要")
+    p_review.add_argument("--detail-top-n", type=int, default=5, help="配合 --auto-detail，最多补全 N 篇知网文献（默认 5）")
     p_review.add_argument("--raw", action="store_true", help="直接输出 Markdown 文本")
     p_review.set_defaults(func=cmd_review)
 
