@@ -611,16 +611,27 @@ def _review_clusters(selected: List[Dict[str, Any]], topic: str) -> List[Dict[st
     result = []
     for label, items in sorted(clusters.items(), key=lambda kv: len(kv[1]), reverse=True):
         evidence = []
+        claims = []
         for item in items:
             p = item["paper"]
             abstract = str(p.get("abstract") or "").strip()
+            if abstract:
+                claims.append(abstract[:90])
             evidence.append({
                 "index": item["index"],
                 "title": p.get("title", ""),
                 "trace_status": "abstract" if abstract else "metadata_only",
                 "abstract_excerpt": abstract[:160],
             })
-        result.append({"label": label, "count": len(items), "papers": evidence})
+        synthesis = ""
+        if claims:
+            synthesis = "；".join(claims[:3])
+        result.append({
+            "label": label,
+            "count": len(items),
+            "papers": evidence,
+            "synthesis": synthesis,
+        })
     return result
 
 
@@ -705,9 +716,16 @@ def _build_review_markdown(topic: str, project: Optional[str], selected: List[Di
     if clusters:
         for cluster in clusters:
             lines.append(f"### {cluster['label']}（{cluster['count']} 篇）")
+            if cluster.get("synthesis"):
+                lines.append(f"该主题下的文献主要围绕“{topic}”展开，现有摘要显示：{cluster['synthesis']}。")
+            else:
+                lines.append("该主题下文献当前多为题录信息，具体观点仍需补充摘要或原文后核对。")
+            lines.append("")
+            lines.append("代表文献与证据：")
             for paper in cluster["papers"]:
                 status = "摘要可追溯" if paper.get("trace_status") == "abstract" else "待核对原文"
-                lines.append(f"- [{paper['index']}] {paper.get('title', '未获取')}：{status}")
+                excerpt = f"；摘要依据：{paper['abstract_excerpt']}" if paper.get("abstract_excerpt") else ""
+                lines.append(f"- [{paper['index']}] {paper.get('title', '未获取')}：{status}{excerpt}")
             lines.append("")
     else:
         lines.append("- 未启用聚类；可使用 `--cluster` 生成主题聚类章节。")
@@ -786,9 +804,14 @@ def _auto_detail_for_review(papers: List[Dict[str, Any]], candidates: List[Dict[
         detail = enriched_map.get(url)
         if not detail:
             continue
-        merged = {k: v for k, v in detail.items() if k != "fulltext"}
-        merged.update({k: updated[idx][k] for k in updated[idx] if k not in merged})
-        if merged.get("abstract") and not updated[idx].get("abstract"):
+        before_had_abstract = bool(updated[idx].get("abstract"))
+        merged = dict(updated[idx])
+        for k, v in detail.items():
+            if k == "fulltext":
+                continue
+            if v:
+                merged[k] = v
+        if merged.get("abstract") and not before_had_abstract:
             updated_count += 1
         updated[idx] = merged
     _save_session(updated, project=project)
