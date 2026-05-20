@@ -124,7 +124,7 @@ _STEALTH_JS = """
 """
 
 
-_OFFSCREEN_POS = (-10000, -10000)
+_VISIBLE_POS = (100, 100)
 
 _DEFAULT_DEBUG_PORT = 9222
 
@@ -177,8 +177,8 @@ def _launch_browser_outside_sandbox(browser: str, port: int = _DEFAULT_DEBUG_POR
         "--no-default-browser-check",
         "--disable-blink-features=AutomationControlled",
         f"--user-agent={_REALISTIC_UA}",
-        f"--window-position={_OFFSCREEN_POS[0]},{_OFFSCREEN_POS[1]}",
-        "--window-size=1920,1080",
+        f"--window-position={_VISIBLE_POS[0]},{_VISIBLE_POS[1]}",
+        "--window-size=1200,900",
     ]
 
     if sys.platform == "win32":
@@ -203,7 +203,7 @@ def _launch_browser_outside_sandbox(browser: str, port: int = _DEFAULT_DEBUG_POR
         try:
             import ctypes
             ret = ctypes.windll.shell32.ShellExecuteW(
-                None, "open", exe, " ".join(args), None, 0  # SW_HIDE=0
+                None, "open", exe, " ".join(args), None, 7  # SW_SHOWMINNOACTIVE
             )
             if ret > 32:
                 _log(f"[cnki] 已通过 ShellExecuteW 在沙盒外启动 {browser}")
@@ -270,14 +270,13 @@ def _connect_remote_browser(browser: str, port: int = _DEFAULT_DEBUG_PORT) -> "w
 
 
 def _hide_browser(driver: "webdriver.Remote"):
-    """将浏览器移到屏幕外，实现静默运行。
-    比 minimize_window() 更可靠：Selenium 的 switch_to / get 不会把窗口拉回来。
-    """
+    """将浏览器最小化到任务栏，便于用户随时恢复查看状态。"""
     try:
-        driver.set_window_position(*_OFFSCREEN_POS)
+        driver.minimize_window()
     except Exception:
         try:
-            driver.minimize_window()
+            driver.set_window_position(*_VISIBLE_POS)
+            driver.set_window_size(1200, 900)
         except Exception:
             pass
 
@@ -285,7 +284,7 @@ def _hide_browser(driver: "webdriver.Remote"):
 def _show_browser(driver: "webdriver.Remote"):
     """将浏览器移回屏幕可见区域并置顶到前台。"""
     try:
-        driver.set_window_position(100, 100)
+        driver.set_window_position(*_VISIBLE_POS)
         driver.set_window_size(1200, 900)
     except Exception as e:
         _log(f"[cnki] 无法移动窗口: {e}")
@@ -448,7 +447,7 @@ def _find_local_driver(browser: str) -> Optional[str]:
 
 
 def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Remote":
-    """创建浏览器实例。默认有头模式（窗口移至屏幕外静默运行），避免无头被知网检测。"""
+    """创建浏览器实例。默认有头模式，完成验证后最小化到任务栏，便于随时恢复查看。"""
     if not HAS_SELENIUM:
         raise RuntimeError(
             "selenium 未安装。请运行: pip install selenium>=4.10\n"
@@ -477,7 +476,7 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
         "--window-size=1920,1080",
     ]
     if not headless:
-        startup_args.append(f"--window-position={_OFFSCREEN_POS[0]},{_OFFSCREEN_POS[1]}")
+        startup_args.append(f"--window-position={_VISIBLE_POS[0]},{_VISIBLE_POS[1]}")
     for arg in startup_args:
         options.add_argument(arg)
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -629,7 +628,7 @@ def _show_browser_for_captcha(
     poll_timeout: int = 180,
 ) -> "webdriver.Remote":
     """将浏览器移回屏幕让用户完成验证。
-    验证通过后自动移到屏幕外并保存 cookies。
+    验证通过后自动最小化到任务栏并保存 cookies。
     """
     _show_browser(driver)
 
@@ -676,7 +675,7 @@ def _show_browser_for_captcha(
     if verified:
         _hide_browser(driver)
         time.sleep(1)
-        _log("[cnki] 浏览器已隐藏，继续执行...")
+        _log("[cnki] 浏览器已最小化到任务栏，继续执行；如需查看状态可从任务栏恢复窗口...")
         return driver
 
     _show_browser(driver)
