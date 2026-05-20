@@ -183,6 +183,7 @@ python scripts/literature.py check --fix
 - `search` / `batch-search` 成功时写入 session.json；加 `--append` 追加而非覆盖
 - 加 `--project <课题名>` 时读写 `.scholar-kit/projects/<课题名>/session.json`，用于课题级文献库；不加时仍读写默认 `.scholar-kit/session.json`
 - `projects` 列出已有课题文献库，`library --project <课题名>` 查看指定课题的文献列表
+- `review` 基于当前 session 或 `--project` 文献库生成可追溯综述材料，输出包含检索证据、主题线索、综述草稿、证据条目和待核对提示
 - `import` 成功时也会覆盖 session（可配合 `--project` 导入到指定课题）
 - `read-detail` 执行后会写回 session（去掉 fulltext 字段以减小体积）
 - 读取 session 的命令：`trends`、`batch-download --from-session`、`read-detail`、`cite`、`export`、`library`，均支持 `--project`（`projects` 除外）
@@ -201,6 +202,7 @@ python scripts/literature.py check --fix
 - [学术表达优化](references/workflows.md#学术表达优化) — 诊断 → 逐段优化 → patch-docx 写回
 - [引文网络分析](references/workflows.md#引文网络分析) — citations 命令，不依赖知网
 - [研究趋势分析](references/workflows.md#研究趋势分析) — trends 命令，基于会话数据
+- `review --project <课题名> --topic <主题>` — 基于课题文献库生成可追溯综述材料，必须保留证据条目和“待核对原文”提示
 - [文献对比矩阵](references/workflows.md#文献对比矩阵) — 多篇论文按维度结构化对比
 - [阅读笔记生成](references/workflows.md#阅读笔记生成) — 按模板提取核心信息
 
@@ -227,6 +229,7 @@ python scripts/literature.py check --fix
 | `import "file"` | 导入知网导出的题录文件 | NoteExpress/Refworks/BibTeX |
 | `citations "DOI/URL"` | 引文网络分析 | `--direction citing/cited/both` `--limit` |
 | `trends` | 研究趋势分析（基于会话） | `--project` |
+| `review` | 生成可追溯综述材料 | `--project` `--topic` `--limit` `--output` `--raw` |
 | `check` | 环境自检 | `--fix`（自动修复） |
 | `clean-cache` | 清理过期缓存 | `--all` `--dry-run` |
 

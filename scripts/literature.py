@@ -16,6 +16,7 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.5.0)
   python literature.py patch-docx <原论文.docx> --patch patch.json [--output 修改后.docx]
   python literature.py citations <DOI|URL> [--direction citing|cited|both] [--limit 20]
   python literature.py trends                  # 研究趋势（基于会话数据）
+  python literature.py review [--project 课题名] [--topic 综述主题] [--output review.md]
   python literature.py check                   # 环境自检
   python literature.py clean-cache [--all] [--dry-run]  # 缓存清理
 """
@@ -444,6 +445,142 @@ def _paper_summary(paper: Dict[str, Any], index: int) -> Dict[str, Any]:
         "tags": paper.get("tags", []),
         "note": paper.get("note", ""),
     }
+
+
+def _paper_evidence(paper: Dict[str, Any], index: int) -> Dict[str, Any]:
+    abstract = str(paper.get("abstract") or "").strip()
+    keywords = paper.get("keywords") or []
+    if isinstance(keywords, str):
+        keywords = [k.strip() for k in keywords.replace("；", ";").replace("，", ";").split(";") if k.strip()]
+    evidence = {
+        "index": index,
+        "title": paper.get("title", ""),
+        "authors": paper.get("authors", ""),
+        "journal": paper.get("journal", ""),
+        "year": _paper_year(paper),
+        "source": paper.get("source", ""),
+        "doi": paper.get("doi", ""),
+        "url": paper.get("url", ""),
+        "keywords": keywords[:8],
+        "abstract_excerpt": abstract[:220],
+        "trace_status": "abstract" if abstract else "metadata_only",
+    }
+    if paper.get("pages"):
+        evidence["pages"] = paper.get("pages")
+    return evidence
+
+
+def _review_terms(topic: str, paper: Dict[str, Any]) -> List[str]:
+    terms: List[str] = []
+    raw_terms = [topic, paper.get("title", ""), paper.get("journal", "")]
+    keywords = paper.get("keywords") or []
+    if isinstance(keywords, list):
+        raw_terms.extend(str(k) for k in keywords)
+    elif isinstance(keywords, str):
+        raw_terms.extend(keywords.replace("；", ";").replace("，", ";").split(";"))
+    for text in raw_terms:
+        for token in str(text).replace("：", " ").replace(":", " ").replace("——", " ").split():
+            token = token.strip(" ，。；;、,.()（）[]【】《》<>\"'")
+            if len(token) >= 2 and token not in terms:
+                terms.append(token)
+    return terms[:12]
+
+
+def _select_review_papers(papers: List[Dict[str, Any]], topic: str, limit: int) -> List[Dict[str, Any]]:
+    topic_l = topic.lower()
+    scored = []
+    for idx, paper in enumerate(papers, 1):
+        text = " ".join(str(paper.get(k, "")) for k in ("title", "abstract", "keywords", "journal")).lower()
+        score = int(paper.get("cited_by") or 0)
+        if topic_l and topic_l in text:
+            score += 1000
+        for part in topic_l.split():
+            if part and part in text:
+                score += 100
+        if paper.get("abstract"):
+            score += 20
+        scored.append((score, idx, paper))
+    scored.sort(key=lambda item: (item[0], item[2].get("year") or ""), reverse=True)
+    return [{"index": idx, "paper": paper} for _, idx, paper in scored[:limit]]
+
+
+def _build_review_markdown(topic: str, project: Optional[str], selected: List[Dict[str, Any]], total: int) -> str:
+    sources = sorted({item["paper"].get("source", "未获取") or "未获取" for item in selected})
+    years = [str(_paper_year(item["paper"])) for item in selected if _paper_year(item["paper"])]
+    year_range = f"{min(years)}-{max(years)}" if years else "未获取"
+    lines = [
+        f"# {topic} 文献综述材料",
+        "",
+        "## 检索证据",
+        f"- 课题文献库：{project or '默认 session'}",
+        f"- 分析文献数：{len(selected)} / {total}",
+        f"- 数据来源：{', '.join(sources) if sources else '未获取'}",
+        f"- 年份范围：{year_range}",
+        "- 说明：以下内容基于文献题录、关键词和摘要生成；缺少摘要的条目标注为待核对原文。",
+        "",
+        "## 主题线索",
+    ]
+    for item in selected:
+        paper = item["paper"]
+        idx = item["index"]
+        terms = "、".join(_review_terms(topic, paper)[:6]) or "待提取"
+        lines.extend([
+            f"- [{idx}] {paper.get('title', '未获取')}：{terms}",
+        ])
+    lines.extend(["", "## 综述草稿", ""])
+    for item in selected:
+        paper = item["paper"]
+        idx = item["index"]
+        abstract = str(paper.get("abstract") or "").strip()
+        if abstract:
+            point = abstract[:180]
+        else:
+            point = "该文献当前仅有题录信息，具体观点需补充摘要或原文后核对。"
+        lines.extend([
+            f"### 线索 {idx}：{paper.get('title', '未获取')}",
+            f"围绕“{topic}”，该文献可作为相关研究线索。{point}",
+            "",
+            "证据：",
+            f"- 作者：{paper.get('authors', '未获取') or '未获取'}",
+            f"- 来源：{paper.get('journal', '未获取') or '未获取'}，{_paper_year(paper) or '未获取'}",
+            f"- 追溯状态：{'摘要可追溯' if abstract else '待核对原文'}",
+            "",
+        ])
+    lines.extend(["## 参考文献线索"])
+    for item in selected:
+        p = item["paper"]
+        lines.append(f"[{item['index']}] {p.get('authors', '未获取') or '未获取'}. {p.get('title', '未获取') or '未获取'}. {p.get('journal', '未获取') or '未获取'}, {_paper_year(p) or '未获取'}.")
+    return "\n".join(lines)
+
+
+def cmd_review(args):
+    papers = _load_session(_session_project(args))
+    if not papers:
+        _output({"status": "error", "code": "NO_SESSION_DATA", "message": "没有可生成综述的文献，请先执行 search、batch-search 或 import"})
+        return
+    topic = args.topic or _session_project(args) or "当前课题"
+    limit = min(args.limit or 12, len(papers))
+    selected = _select_review_papers(papers, topic, limit)
+    evidence = [_paper_evidence(item["paper"], item["index"]) for item in selected]
+    markdown = _build_review_markdown(topic, _session_project(args), selected, len(papers))
+    if args.output:
+        out = Path(args.output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(markdown, encoding="utf-8")
+    if args.raw:
+        print(markdown)
+    else:
+        _output({
+            "status": "success",
+            "project": _session_project(args),
+            "topic": topic,
+            "count": len(selected),
+            "total": len(papers),
+            "output_file": args.output,
+            "evidence": evidence,
+            "markdown": markdown,
+        })
+
 
 
 def cmd_projects(args):
@@ -2020,6 +2157,15 @@ def main():
     p_trends = sub.add_parser("trends", help="研究趋势分析（基于会话中的搜索结果）")
     p_trends.add_argument("--project", help="课题文献库名称")
     p_trends.set_defaults(func=cmd_trends)
+
+    # review
+    p_review = sub.add_parser("review", help="基于会话/课题文献库生成可追溯综述材料")
+    p_review.add_argument("--topic", help="综述主题；默认使用 --project 或当前课题")
+    p_review.add_argument("--project", help="课题文献库名称")
+    p_review.add_argument("--limit", type=int, default=12, help="最多纳入前 N 篇相关文献（默认 12）")
+    p_review.add_argument("--output", help="输出 Markdown 文件路径")
+    p_review.add_argument("--raw", action="store_true", help="直接输出 Markdown 文本")
+    p_review.set_defaults(func=cmd_review)
 
     # check
     p_check = sub.add_parser("check", help="环境自检（Python / 依赖 / 浏览器 / 知网连通性）")
