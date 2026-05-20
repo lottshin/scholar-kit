@@ -1,5 +1,5 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.7.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.8.0)
 用法:
   python literature.py search "关键词" [--project 课题名] [--source cnki|openalex|semantic|arxiv|nssd|all] [--doc-type master] [--field 摘要] [--author] [--journal] [--download] ...
   python literature.py batch-search "词1" "词2" ... [--project 课题名] [--query-file kw.txt] [--core CSSCI] [--doc-type master] [--field 摘要] [--author] [--journal] [--append]
@@ -17,13 +17,14 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.7.0)
   python literature.py citations <DOI|URL> [--direction citing|cited|both] [--limit 20]
   python literature.py trends                  # 研究趋势（基于会话数据）
   python literature.py review [--project 课题名] [--topic 综述主题] [--auto-detail] [--output review.md]
+  python literature.py write [--project 课题名] [--topic 主题] [--format markdown|docx] [--with-citations]
   python literature.py check                   # 环境自检
   python literature.py clean-cache [--all] [--dry-run]  # 缓存清理
 """
 
 from __future__ import annotations
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 import argparse
 import json
@@ -780,6 +781,45 @@ def _build_review_markdown(topic: str, project: Optional[str], selected: List[Di
     return "\n".join(lines)
 
 
+def _build_review_draft(topic: str, selected: List[Dict[str, Any]], clusters: List[Dict[str, Any]], gaps: List[Dict[str, Any]]) -> str:
+    lines = [f"# {topic} 文献综述初稿", "", "## 文献综述"]
+    usable = [item for item in selected if item.get("relevance", 0) > 0 and "retracted" not in item.get("flags", [])]
+    if not usable:
+        lines.append("当前文献库中尚未形成足够高相关、可追溯的文献基础，建议扩大检索或补充摘要后再生成综述初稿。")
+    else:
+        cluster_list = clusters or _review_clusters(usable, topic)
+        intro_indices = "".join(f"[{item['index']}]" for item in usable[:5])
+        lines.append(
+            f"围绕“{topic}”，现有文献主要从" +
+            "、".join(cluster["label"] for cluster in cluster_list[:4]) +
+            f"等方面展开讨论{intro_indices}。总体来看，相关研究已经从宏观理论建构、传播路径选择、媒介形态变化和具体案例分析等角度积累了初步成果，但不同主题之间的证据密度和原文可追溯程度仍存在差异。"
+        )
+        lines.append("")
+        for cluster in cluster_list:
+            indices = "".join(f"[{paper['index']}]" for paper in cluster.get("papers", [])[:5])
+            if cluster.get("synthesis"):
+                body = cluster["synthesis"]
+            else:
+                body = "该主题下部分文献仍缺少摘要或全文证据，相关判断需要进一步核对原文。"
+            lines.extend([
+                f"### {cluster['label']}",
+                f"在{cluster['label']}方面，已有研究围绕“{topic}”形成了若干线索。{body}{indices}",
+                "",
+            ])
+        if gaps:
+            lines.extend(["## 研究不足与后续方向"])
+            for gap in gaps[:4]:
+                indices = "".join(f"[{i}]" for i in gap.get("evidence_indices", [])[:5]) or "（当前库无直接证据）"
+                lines.append(f"其一，{gap['title']}。{gap['basis']}，相关证据序号为{indices}。这一结果提示后续研究可围绕该维度进一步扩展检索和原文核对。")
+    lines.append("")
+    lines.append("## 段落证据映射")
+    for item in usable:
+        p = item["paper"]
+        status = "摘要可追溯" if p.get("abstract") else "待核对原文"
+        lines.append(f"- [{item['index']}] {p.get('title', '未获取')}：{status}，相关性分 {item.get('relevance', 0)}")
+    return "\n".join(lines)
+
+
 def _auto_detail_for_review(papers: List[Dict[str, Any]], candidates: List[Dict[str, Any]], detail_top_n: int, project: Optional[str]) -> Dict[str, Any]:
     targets = []
     for item in candidates:
@@ -820,6 +860,60 @@ def _auto_detail_for_review(papers: List[Dict[str, Any]], candidates: List[Dict[
         "updated": updated_count,
         "indices": [item["index"] for item in targets],
     }
+
+
+def _review_write_inputs(papers: List[Dict[str, Any]], topic: str, limit: int) -> tuple:
+    selected = _select_review_papers(papers, topic, limit)
+    clusters = _review_clusters(selected, topic)
+    gaps = _review_gaps(papers, topic)
+    return selected, clusters, gaps
+
+
+def _append_references(markdown: str, selected: List[Dict[str, Any]], style: str = "gbt7714") -> str:
+    papers = [item["paper"] for item in selected]
+    refs = generate_reference_list(papers, style)
+    if refs:
+        markdown = markdown.rstrip() + "\n\n## 参考文献\n" + refs.strip() + "\n"
+    return markdown
+
+
+def cmd_write(args):
+    papers = _load_session(_session_project(args))
+    if not papers:
+        _output({"status": "error", "code": "NO_SESSION_DATA", "message": "没有可写作的文献，请先执行 search、batch-search 或 import"})
+        return
+    topic = args.topic or _session_project(args) or "当前课题"
+    limit = min(args.limit or 12, len(papers))
+    selected, clusters, gaps = _review_write_inputs(papers, topic, limit)
+    markdown = _build_review_draft(topic, selected, clusters, gaps)
+    if args.with_citations:
+        markdown = _append_references(markdown, selected, args.citation_style or "gbt7714")
+
+    output_path = Path(args.output) if args.output else None
+    if args.format == "docx":
+        if output_path is None:
+            output_path = Path("review.docx")
+        elif output_path.suffix.lower() != ".docx":
+            output_path = output_path.with_suffix(".docx")
+        result = _write_docx_from_markdown(markdown, output_path)
+        result.update({"project": _session_project(args), "topic": topic, "format": "docx"})
+        _output(result)
+        return
+
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(markdown, encoding="utf-8")
+    if args.raw:
+        print(markdown)
+    else:
+        _output({
+            "status": "success",
+            "project": _session_project(args),
+            "topic": topic,
+            "format": "markdown",
+            "output_file": str(output_path) if output_path else None,
+            "markdown": markdown,
+        })
 
 def cmd_review(args):
     papers = _load_session(_session_project(args))
@@ -1467,41 +1561,17 @@ def _find_run_containing(paragraph, text):
     return runs[-1]._element
 
 
-# ── write-docx 命令 ───────────────────────────────────
-
-def cmd_write_docx(args):
-    """Markdown 文件 → 学术格式 .docx"""
+def _write_docx_from_markdown(md_text: str, output_path: Path) -> Dict[str, Any]:
+    """Markdown 文本 → 学术格式 .docx"""
     import re
     try:
         from docx import Document
         from docx.shared import Pt, Cm
         from docx.oxml.ns import qn
     except ImportError:
-        _output({"status": "error", "code": "MISSING_DEPENDENCY",
-                 "message": "缺少 python-docx 依赖"})
-        return
+        return {"status": "error", "code": "MISSING_DEPENDENCY", "message": "缺少 python-docx 依赖"}
 
-    md_path = Path(args.filepath)
-    if not md_path.exists():
-        _output({"status": "error", "code": "FILE_NOT_FOUND",
-                 "message": f"文件不存在: {args.filepath}"})
-        return
-
-    md_text = None
-    for enc in ("utf-8", "utf-8-sig", "gbk", "gb2312", "gb18030"):
-        try:
-            md_text = md_path.read_text(encoding=enc)
-            break
-        except (UnicodeDecodeError, LookupError):
-            continue
-    if md_text is None:
-        _output({"status": "error", "code": "ENCODING_ERROR",
-                 "message": "文件编码无法识别"})
-        return
-
-    output_path = Path(args.output) if args.output else md_path.with_suffix(".docx")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
     doc = Document()
 
     section = doc.sections[0]
@@ -1582,7 +1652,6 @@ def cmd_write_docx(args):
             p.style = doc.styles[f"Heading {level}"]
             _parse_inline(p, heading.group(2).strip())
             continue
-
         ul_match = re.match(r"^[-*]\s+(.+)$", line)
         if ul_match:
             try:
@@ -1591,7 +1660,6 @@ def cmd_write_docx(args):
                 p = doc.add_paragraph()
             _parse_inline(p, ul_match.group(1).strip())
             continue
-
         ol_match = re.match(r"^\d{1,3}[.)]\s+(.+)$", line)
         if ol_match:
             try:
@@ -1600,7 +1668,6 @@ def cmd_write_docx(args):
                 p = doc.add_paragraph()
             _parse_inline(p, ol_match.group(1).strip())
             continue
-
         if not line.strip():
             continue
         p = doc.add_paragraph()
@@ -1618,9 +1685,7 @@ def cmd_write_docx(args):
     try:
         doc.save(str(output_path))
     except Exception as e:
-        _output({"status": "error", "code": "IO_ERROR",
-                 "message": f"保存失败: {e}"})
-        return
+        return {"status": "error", "code": "IO_ERROR", "message": f"保存失败: {e}"}
 
     result: Dict[str, Any] = {
         "status": "success" if not warnings else "warning",
@@ -1631,7 +1696,33 @@ def cmd_write_docx(args):
     }
     if warnings:
         result["warnings"] = warnings
-    _output(result)
+    return result
+
+
+# ── write-docx 命令 ───────────────────────────────────
+
+def cmd_write_docx(args):
+    """Markdown 文件 → 学术格式 .docx"""
+    md_path = Path(args.filepath)
+    if not md_path.exists():
+        _output({"status": "error", "code": "FILE_NOT_FOUND",
+                 "message": f"文件不存在: {args.filepath}"})
+        return
+
+    md_text = None
+    for enc in ("utf-8", "utf-8-sig", "gbk", "gb2312", "gb18030"):
+        try:
+            md_text = md_path.read_text(encoding=enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if md_text is None:
+        _output({"status": "error", "code": "ENCODING_ERROR",
+                 "message": "文件编码无法识别"})
+        return
+
+    output_path = Path(args.output) if args.output else md_path.with_suffix(".docx")
+    _output(_write_docx_from_markdown(md_text, output_path))
 
 
 # ── patch-docx 命令 ───────────────────────────────────
@@ -2457,6 +2548,18 @@ def main():
     p_review.add_argument("--gaps", action="store_true", help="基于当前文献库统计生成研究空白提示")
     p_review.add_argument("--raw", action="store_true", help="直接输出 Markdown 文本")
     p_review.set_defaults(func=cmd_review)
+
+    # write
+    p_write = sub.add_parser("write", help="基于课题文献库直接写作文献综述")
+    p_write.add_argument("--project", help="课题文献库名称")
+    p_write.add_argument("--topic", help="写作主题；默认使用 --project 或当前课题")
+    p_write.add_argument("--limit", type=int, default=12, help="最多纳入前 N 篇相关文献（默认 12）")
+    p_write.add_argument("--format", choices=["markdown", "md", "docx"], default="markdown", help="输出格式：markdown/md/docx")
+    p_write.add_argument("--output", help="输出文件路径")
+    p_write.add_argument("--with-citations", action="store_true", help="附加参考文献列表")
+    p_write.add_argument("--citation-style", default="gbt7714", choices=["gbt7714", "gb", "footnote", "apa"])
+    p_write.add_argument("--raw", action="store_true", help="直接输出 Markdown 文本")
+    p_write.set_defaults(func=cmd_write)
 
     # check
     p_check = sub.add_parser("check", help="环境自检（Python / 依赖 / 浏览器 / 知网连通性）")
