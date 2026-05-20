@@ -1,5 +1,5 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.8.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.9.0)
 用法:
   python literature.py search "关键词" [--project 课题名] [--source cnki|openalex|semantic|arxiv|nssd|all] [--doc-type master] [--field 摘要] [--author] [--journal] [--download] ...
   python literature.py batch-search "词1" "词2" ... [--project 课题名] [--query-file kw.txt] [--core CSSCI] [--doc-type master] [--field 摘要] [--author] [--journal] [--append]
@@ -17,18 +17,20 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.8.0)
   python literature.py citations <DOI|URL> [--direction citing|cited|both] [--limit 20]
   python literature.py trends                  # 研究趋势（基于会话数据）
   python literature.py review [--project 课题名] [--topic 综述主题] [--auto-detail] [--output review.md]
-  python literature.py write [--project 课题名] [--topic 主题] [--format markdown|docx] [--with-citations]
+  python literature.py write [--project 课题名] [--topic 主题] [--format markdown|docx] [--with-citations] [--validate]
+  python literature.py validate [--project 课题名] [--topic 主题] [--file draft.md]
   python literature.py check                   # 环境自检
   python literature.py clean-cache [--all] [--dry-run]  # 缓存清理
 """
 
 from __future__ import annotations
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -877,6 +879,86 @@ def _append_references(markdown: str, selected: List[Dict[str, Any]], style: str
     return markdown
 
 
+def _sentence_evidence_indices(text: str) -> List[int]:
+    return [int(i) for i in re.findall(r"\[(\d+)\]", text)]
+
+
+def _validate_writing(markdown: str, selected: List[Dict[str, Any]]) -> Dict[str, Any]:
+    evidence_by_index = {item["index"]: item for item in selected}
+    usable_indices = {
+        item["index"] for item in selected
+        if item.get("relevance", 0) > 0 and "retracted" not in item.get("flags", [])
+    }
+    issues = []
+    unsupported = []
+    weak_evidence = []
+    invalid_indices = []
+
+    for index in sorted(set(_sentence_evidence_indices(markdown))):
+        item = evidence_by_index.get(index)
+        if not item:
+            invalid_indices.append(index)
+            continue
+        paper = item["paper"]
+        flags = item.get("flags", [])
+        if not paper.get("abstract") or "needs_fulltext_check" in flags:
+            weak_evidence.append({
+                "index": index,
+                "title": paper.get("title", "未获取"),
+                "reason": "缺少摘要或全文证据，需核对原文",
+            })
+        if "retracted" in flags:
+            weak_evidence.append({
+                "index": index,
+                "title": paper.get("title", "未获取"),
+                "reason": "疑似撤稿文献，不应作为正面证据",
+            })
+
+    body = re.sub(r"## 参考文献[\s\S]*$", "", markdown)
+    body = re.sub(r"## 段落证据映射[\s\S]*$", "", body)
+    for raw in re.split(r"(?<=[。！？.!?])\s*", body):
+        sentence = raw.strip()
+        if not sentence or sentence.startswith("#") or sentence.startswith("-"):
+            continue
+        if len(sentence) < 35:
+            continue
+        if not _sentence_evidence_indices(sentence):
+            unsupported.append(sentence[:180])
+
+    cited_indices = set(_sentence_evidence_indices(body))
+    unused_usable = sorted(usable_indices - cited_indices)
+    if invalid_indices:
+        issues.append({"type": "invalid_evidence_index", "indices": invalid_indices, "message": "正文引用了不存在于本次写作证据集的编号"})
+    if unsupported:
+        issues.append({"type": "unsupported_claim", "count": len(unsupported), "examples": unsupported[:5], "message": "存在未附证据编号的实质性句子"})
+    if weak_evidence:
+        issues.append({"type": "weak_evidence", "count": len(weak_evidence), "examples": weak_evidence[:8], "message": "部分引用证据缺少摘要、需核对原文或存在风险"})
+    if unused_usable:
+        issues.append({"type": "unused_relevant_evidence", "indices": unused_usable[:12], "message": "部分高相关证据未进入正文论证，可按需补充"})
+
+    score = 100
+    score -= min(len(unsupported) * 6, 36)
+    score -= min(len(weak_evidence) * 5, 30)
+    score -= min(len(invalid_indices) * 15, 30)
+    score = max(score, 0)
+    status = "success" if score >= 80 and not invalid_indices else "warning"
+    recommendations = []
+    if unsupported:
+        recommendations.append("为未附编号的论断补充 [证据序号]，或删除无法由当前文献库支撑的判断。")
+    if weak_evidence:
+        recommendations.append("对缺摘要或需核对原文的文献执行 read-detail/read-detail --fulltext 后再作为强证据。")
+    if unused_usable:
+        recommendations.append("检查未使用的高相关文献，必要时补充到相应段落。")
+    return {
+        "status": status,
+        "score": score,
+        "evidence_count": len(selected),
+        "cited_evidence_count": len(cited_indices),
+        "issues": issues,
+        "recommendations": recommendations,
+    }
+
+
 def cmd_write(args):
     papers = _load_session(_session_project(args))
     if not papers:
@@ -888,6 +970,7 @@ def cmd_write(args):
     markdown = _build_review_draft(topic, selected, clusters, gaps)
     if args.with_citations:
         markdown = _append_references(markdown, selected, args.citation_style or "gbt7714")
+    validation = _validate_writing(markdown, selected) if getattr(args, "validate", False) else None
 
     output_path = Path(args.output) if args.output else None
     if args.format == "docx":
@@ -896,7 +979,7 @@ def cmd_write(args):
         elif output_path.suffix.lower() != ".docx":
             output_path = output_path.with_suffix(".docx")
         result = _write_docx_from_markdown(markdown, output_path)
-        result.update({"project": _session_project(args), "topic": topic, "format": "docx"})
+        result.update({"project": _session_project(args), "topic": topic, "format": "docx", "validation": validation})
         _output(result)
         return
 
@@ -912,8 +995,30 @@ def cmd_write(args):
             "topic": topic,
             "format": "markdown",
             "output_file": str(output_path) if output_path else None,
+            "validation": validation,
             "markdown": markdown,
         })
+
+def cmd_validate(args):
+    papers = _load_session(_session_project(args))
+    if not papers:
+        _output({"status": "error", "code": "NO_SESSION_DATA", "message": "没有可校验的文献，请先执行 search、batch-search 或 import"})
+        return
+    topic = args.topic or _session_project(args) or "当前课题"
+    limit = min(args.limit or 12, len(papers))
+    selected, clusters, gaps = _review_write_inputs(papers, topic, limit)
+    if args.file:
+        markdown = Path(args.file).read_text(encoding="utf-8")
+    else:
+        markdown = _build_review_draft(topic, selected, clusters, gaps)
+    validation = _validate_writing(markdown, selected)
+    validation.update({
+        "project": _session_project(args),
+        "topic": topic,
+        "checked_file": args.file,
+    })
+    _output(validation)
+
 
 def cmd_review(args):
     papers = _load_session(_session_project(args))
@@ -2558,8 +2663,16 @@ def main():
     p_write.add_argument("--output", help="输出文件路径")
     p_write.add_argument("--with-citations", action="store_true", help="附加参考文献列表")
     p_write.add_argument("--citation-style", default="gbt7714", choices=["gbt7714", "gb", "footnote", "apa"])
+    p_write.add_argument("--validate", action="store_true", help="同时输出写作证据质量校验报告")
     p_write.add_argument("--raw", action="store_true", help="直接输出 Markdown 文本")
     p_write.set_defaults(func=cmd_write)
+
+    p_validate = sub.add_parser("validate", help="校验综述正文的证据支撑质量")
+    p_validate.add_argument("--project", help="课题文献库名称")
+    p_validate.add_argument("--topic", help="写作主题；默认使用 --project 或当前课题")
+    p_validate.add_argument("--limit", type=int, default=12, help="最多纳入前 N 篇相关文献（默认 12）")
+    p_validate.add_argument("--file", help="待校验的 Markdown 文件；缺省时校验当前自动生成草稿")
+    p_validate.set_defaults(func=cmd_validate)
 
     # check
     p_check = sub.add_parser("check", help="环境自检（Python / 依赖 / 浏览器 / 知网连通性）")
