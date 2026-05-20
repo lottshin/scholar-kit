@@ -1,5 +1,5 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.11.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.12.0)
 用法:
   python literature.py search "关键词" [--project 课题名] [--source cnki|openalex|semantic|arxiv|nssd|all] [--doc-type master] [--field 摘要] [--author] [--journal] [--download] ...
   python literature.py batch-search "词1" "词2" ... [--project 课题名] [--query-file kw.txt] [--core CSSCI] [--doc-type master] [--field 摘要] [--author] [--journal] [--append]
@@ -19,13 +19,14 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.11.0)
   python literature.py review [--project 课题名] [--topic 综述主题] [--auto-detail] [--output review.md]
   python literature.py write [--project 课题名] [--topic 主题] [--mode outline|draft|section] [--section 章节名] [--format markdown|docx] [--with-citations] [--validate]
   python literature.py validate [--project 课题名] [--topic 主题] [--file draft.md]
+  python literature.py topics [--project 课题名] [--topic 主题]
   python literature.py check                   # 环境自检
   python literature.py clean-cache [--all] [--dry-run]  # 缓存清理
 """
 
 from __future__ import annotations
 
-__version__ = "1.11.0"
+__version__ = "1.12.0"
 
 import argparse
 import json
@@ -1191,6 +1192,84 @@ def cmd_write(args):
             "validation": validation,
             "markdown": markdown,
         })
+
+def _topic_methods(label: str, gap_title: str) -> List[str]:
+    text = label + gap_title
+    methods = []
+    if any(term in text for term in ("平台", "社交媒体", "传播效果", "受众")):
+        methods.extend(["内容分析", "问卷/访谈", "平台比较"])
+    if any(term in text for term in ("话语", "叙事", "文化", "中国故事", "国家形象")):
+        methods.extend(["话语分析", "案例研究", "符号分析"])
+    if any(term in text for term in ("方法", "模型", "算法")):
+        methods.extend(["模型构建", "计算传播分析", "混合方法"])
+    if not methods:
+        methods.extend(["文献综述", "案例研究", "比较研究"])
+    return list(dict.fromkeys(methods))[:4]
+
+
+def _build_topics(topic: str, papers: List[Dict[str, Any]], limit: int = 8) -> List[Dict[str, Any]]:
+    candidates = _review_candidates(papers, topic)
+    selected = [item for item in candidates if item.get("relevance", 0) > 0 and "retracted" not in item.get("flags", [])][:max(limit, 1)]
+    clusters = _review_clusters(selected, topic)
+    gaps = _review_gaps(papers, topic)
+    suggestions = []
+    for cluster in clusters[:4]:
+        cluster_indices = [paper["index"] for paper in cluster.get("papers", [])[:5]]
+        matched_gap = None
+        for gap in gaps:
+            if gap.get("evidence_indices"):
+                if set(cluster_indices) & set(gap.get("evidence_indices", [])):
+                    matched_gap = gap
+                    break
+        if matched_gap is None and gaps:
+            matched_gap = gaps[min(len(suggestions), len(gaps) - 1)]
+        gap_title = matched_gap.get("title", "需进一步明确研究空白") if matched_gap else "需进一步明确研究空白"
+        evidence_indices = sorted(set(cluster_indices + (matched_gap.get("evidence_indices", [])[:5] if matched_gap else [])))
+        if not evidence_indices:
+            evidence_indices = cluster_indices
+        risks = []
+        if not evidence_indices:
+            risks.append("当前文献库证据不足，需先补充检索")
+        if any("metadata_only" == paper.get("trace_status") for paper in cluster.get("papers", [])):
+            risks.append("部分证据仅有题录信息，需补摘要或原文")
+        if matched_gap and matched_gap.get("matched_count", 0) == 0:
+            risks.append("该方向当前库无直接命中文献，不能直接断言真实研究空白")
+        suggestions.append({
+            "title": f"{topic}中的{cluster['label']}研究",
+            "rationale": f"当前文献库中“{cluster['label']}”聚类包含 {cluster.get('count', 0)} 篇线索；{matched_gap.get('basis', '需结合更多检索证据判断研究空间') if matched_gap else '需结合更多检索证据判断研究空间'}",
+            "evidence_indices": evidence_indices[:8],
+            "possible_methods": _topic_methods(cluster["label"], gap_title),
+            "risks": risks or ["需在开题前继续核对核心文献和原文证据"],
+            "followup_search": [topic, cluster["label"], gap_title],
+        })
+    if not suggestions:
+        suggestions.append({
+            "title": f"{topic}的研究现状与问题重构",
+            "rationale": f"当前文献库共有 {len(papers)} 篇记录，但高相关聚类不足，适合先做综述型选题或扩大检索。",
+            "evidence_indices": [],
+            "possible_methods": ["文献综述", "关键词扩展检索", "题录筛选"],
+            "risks": ["证据基础不足，不能直接进入实证设计"],
+            "followup_search": [topic, f"{topic} 研究现状", f"{topic} 研究空白"],
+        })
+    return suggestions[:limit]
+
+
+def cmd_topics(args):
+    papers = _load_session(_session_project(args))
+    if not papers:
+        _output({"status": "error", "code": "NO_SESSION_DATA", "message": "没有可生成选题的数据，请先执行 search、batch-search 或 import"})
+        return
+    topic = args.topic or _session_project(args) or "当前课题"
+    suggestions = _build_topics(topic, papers, args.limit or 8)
+    _output({
+        "status": "success",
+        "project": _session_project(args),
+        "topic": topic,
+        "total": len(papers),
+        "count": len(suggestions),
+        "topics": suggestions,
+    })
+
 
 def cmd_validate(args):
     papers = _load_session(_session_project(args))
@@ -2868,6 +2947,12 @@ def main():
     p_validate.add_argument("--limit", type=int, default=12, help="最多纳入前 N 篇相关文献（默认 12）")
     p_validate.add_argument("--file", help="待校验的 Markdown 文件；缺省时校验当前自动生成草稿")
     p_validate.set_defaults(func=cmd_validate)
+
+    p_topics = sub.add_parser("topics", help="基于课题文献库生成带证据的选题建议")
+    p_topics.add_argument("--project", help="课题文献库名称")
+    p_topics.add_argument("--topic", help="选题方向；默认使用 --project 或当前课题")
+    p_topics.add_argument("--limit", type=int, default=6, help="最多生成 N 个选题建议（默认 6）")
+    p_topics.set_defaults(func=cmd_topics)
 
     # check
     p_check = sub.add_parser("check", help="环境自检（Python / 依赖 / 浏览器 / 知网连通性）")

@@ -1,6 +1,6 @@
 ---
 name: scholar-kit
-version: 1.11.0
+version: 1.12.0
 description: >-
   Search, download, and manage academic papers from CNKI (知网), OpenAlex,
   Semantic Scholar, arXiv, and NSSD; enriches metadata via Crossref and
@@ -8,7 +8,7 @@ description: >-
   (GB/T 7714, BibTeX, RIS, APA), writes literature reviews, suggests
   inline references, analyzes citation networks, and generates research trend reports.
   Use when the user asks to 搜索/检索/查找 文献/论文, 下载论文/全文, 写文献综述,
-  引用建议/插入文献, 选题分析, 格式化参考文献, 参考文献, 引文追踪/引用网络/谁引用了,
+  引用建议/插入文献, 选题分析/研究选题/研究问题, 格式化参考文献, 参考文献, 引文追踪/引用网络/谁引用了,
   研究趋势/热点分析, 文献对比/对比矩阵, 阅读笔记,
   学术表达优化/论文改写/提升原创性, 查重/降重/降低重复率/重复率,
   知网/CNKI, 批量导出/计量分析, or 导出BibTeX/RIS.
@@ -171,6 +171,7 @@ python scripts/literature.py check --fix
 | 学术表达优化 | 读 [工作流](references/workflows.md#学术表达优化) | 同左（不依赖知网） |
 | 引文网络 | `citations <DOI>` | 同左（不依赖知网） |
 | 趋势分析 | `trends`（基于 session） | 同左 |
+| 选题分析 / 研究问题 | `topics`（基于 session/project） | 同左 |
 | 对比矩阵 / 阅读笔记 | 读 [工作流](references/workflows.md#文献对比矩阵) | 同左 |
 | 导入题录 | `import "file"` | 同左 |
 | 导出 | `export --format bibtex/ris/...` | 同左 |
@@ -185,6 +186,7 @@ python scripts/literature.py check --fix
 - `projects` 列出已有课题文献库，`library --project <课题名>` 查看指定课题的文献列表
 - `write --project <课题名> --topic <主题>` 基于课题文献库直接写作综述正文；`--mode outline/draft/section` 控制写作阶段，`--section` 可只写指定章节，`--format markdown/docx` 控制输出形态，`--with-citations` 自动附参考文献，`--validate` 同时输出证据质量校验。Agent 需要“写出来”时优先用 `write`，需要分析/材料/证据检查时用 `review`。
 - `validate --project <课题名> --topic <主题> [--file draft.md]` 校验综述正文是否存在无证据论断、弱证据、无效证据编号和高相关证据未使用等问题，并对每个论断给出 `support_level`（strong/medium/weak/needs_fulltext_check/unsupported/invalid）；用户要求“检查综述/证据是否稳/引用是否支撑论断”时优先使用。
+- `topics --project <课题名> --topic <方向>` 基于课题文献库、主题聚类和研究空白提示生成带证据编号的选题建议；用户要求“帮我选题/研究问题/创新点/开题方向”时优先使用，并明确风险和需补检索方向。
 - `review` 基于当前 session 或 `--project` 文献库生成可追溯综述材料，输出包含检索证据、推荐精读文献、待核对原文、可能不相关/需剔除文献、主题线索、综述草稿和证据条目
 - `review --cluster --gaps` 可按主题聚类组织综述，并基于当前文献库统计生成研究空白提示；研究空白必须展示命中数量、总文献数和证据序号，不得凭空编造
 - `review --auto-detail --detail-top-n N` 会在生成综述前自动挑选高相关、缺摘要的 CNKI 文献调用详情页补摘要，并写回同一 `--project` 文献库；适合用户要写综述但检索结果只有题录时使用
@@ -231,6 +233,7 @@ python scripts/literature.py check --fix
 | `library` | 查看当前/指定课题文献库 | `--project` `--limit` |
 | `write` | 基于文献库写综述正文 | `--project` `--topic` `--limit` `--mode outline/draft/section` `--section` `--format markdown/docx` `--output` `--with-citations` `--citation-style` `--validate` `--raw` |
 | `validate` | 校验综述证据支撑质量 | `--project` `--topic` `--limit` `--file` |
+| `topics` | 生成带证据的选题建议 | `--project` `--topic` `--limit` |
 | `write-docx "file.md"` | Markdown → 学术格式 Word | `--output` |
 | `patch-docx "file.docx"` | 在原 .docx 上打补丁 | `--patch` `--output` |
 | `import "file"` | 导入知网导出的题录文件 | NoteExpress/Refworks/BibTeX |
