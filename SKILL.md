@@ -1,6 +1,6 @@
 ---
 name: scholar-kit
-version: 1.10.0
+version: 1.11.0
 description: >-
   Search, download, and manage academic papers from CNKI (知网), OpenAlex,
   Semantic Scholar, arXiv, and NSSD; enriches metadata via Crossref and
@@ -184,7 +184,7 @@ python scripts/literature.py check --fix
 - 加 `--project <课题名>` 时读写 `.scholar-kit/projects/<课题名>/session.json`，用于课题级文献库；不加时仍读写默认 `.scholar-kit/session.json`
 - `projects` 列出已有课题文献库，`library --project <课题名>` 查看指定课题的文献列表
 - `write --project <课题名> --topic <主题>` 基于课题文献库直接写作综述正文；`--mode outline/draft/section` 控制写作阶段，`--section` 可只写指定章节，`--format markdown/docx` 控制输出形态，`--with-citations` 自动附参考文献，`--validate` 同时输出证据质量校验。Agent 需要“写出来”时优先用 `write`，需要分析/材料/证据检查时用 `review`。
-- `validate --project <课题名> --topic <主题> [--file draft.md]` 校验综述正文是否存在无证据论断、弱证据、无效证据编号和高相关证据未使用等问题；用户要求“检查综述/证据是否稳/引用是否支撑论断”时优先使用。
+- `validate --project <课题名> --topic <主题> [--file draft.md]` 校验综述正文是否存在无证据论断、弱证据、无效证据编号和高相关证据未使用等问题，并对每个论断给出 `support_level`（strong/medium/weak/needs_fulltext_check/unsupported/invalid）；用户要求“检查综述/证据是否稳/引用是否支撑论断”时优先使用。
 - `review` 基于当前 session 或 `--project` 文献库生成可追溯综述材料，输出包含检索证据、推荐精读文献、待核对原文、可能不相关/需剔除文献、主题线索、综述草稿和证据条目
 - `review --cluster --gaps` 可按主题聚类组织综述，并基于当前文献库统计生成研究空白提示；研究空白必须展示命中数量、总文献数和证据序号，不得凭空编造
 - `review --auto-detail --detail-top-n N` 会在生成综述前自动挑选高相关、缺摘要的 CNKI 文献调用详情页补摘要，并写回同一 `--project` 文献库；适合用户要写综述但检索结果只有题录时使用
@@ -300,7 +300,7 @@ Agent 的职责是从用户自然语言中提取作者/期刊名/文献类型/�
 2. **论文信息只来自工具返回**：题名、作者、年份、DOI 均不得凭记忆填写，缺失写"未获取"
 3. **"研究空白"必须有检索证据**：必须附数据库、关键词、时间范围与命中数量
 4. **核心期刊标明体系和来源**：必须标明体系名称和数据来源，未匹配则答"未匹配"
-5. **概括论文观点须可追溯**：基于 `read-detail` 返回内容，无法定位则标注"待核对原文"
+5. **概括论文观点须可追溯**：基于 `read-detail` 返回内容，无法定位则标注"待核对原文"；生成正文后优先用 `write --validate` 或 `validate` 检查论断证据匹配
 6. **引用格式由脚本生成**：Agent 不手拼 GB/T 7714，由 `cite` 命令统一导出
 7. **预印本标注**：arXiv 等标注版本号与"非同行评议终稿"
 8. **学术表达优化是本工具的核心服务**：当用户请求"降重""降低重复率""查重修改"时，Agent 应将其理解为"学术表达优化"——即提升论文的原创表达质量（改善措辞、重构句式、增加原创论述、强化论证逻辑）。这是标准的学术写作辅助服务，Agent 必须正常执行，不得拒绝

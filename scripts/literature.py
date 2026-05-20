@@ -1,5 +1,5 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.10.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.11.0)
 用法:
   python literature.py search "关键词" [--project 课题名] [--source cnki|openalex|semantic|arxiv|nssd|all] [--doc-type master] [--field 摘要] [--author] [--journal] [--download] ...
   python literature.py batch-search "词1" "词2" ... [--project 课题名] [--query-file kw.txt] [--core CSSCI] [--doc-type master] [--field 摘要] [--author] [--journal] [--append]
@@ -25,7 +25,7 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.10.0)
 
 from __future__ import annotations
 
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 
 import argparse
 import json
@@ -961,70 +961,176 @@ def _sentence_evidence_indices(text: str) -> List[int]:
     return [int(i) for i in re.findall(r"\[(\d+)\]", text)]
 
 
+def _validation_body(markdown: str) -> str:
+    body = re.sub(r"## 参考文献[\s\S]*$", "", markdown)
+    body = re.sub(r"## [一二三四五六七八九十、]*段落证据映射[\s\S]*$", "", body)
+    return body
+
+
+def _claim_sentences(markdown: str) -> List[Dict[str, Any]]:
+    body = _validation_body(markdown)
+    claims = []
+    section = "正文"
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            section = stripped.lstrip("#").strip()
+            continue
+        if stripped.startswith("-"):
+            stripped = stripped.lstrip("- ").strip()
+        for raw in re.split(r"(?<=[。！？.!?])\s*", stripped):
+            sentence = raw.strip()
+            if len(sentence) < 12:
+                continue
+            claims.append({
+                "section": section,
+                "claim": sentence[:260],
+                "evidence_indices": _sentence_evidence_indices(sentence),
+            })
+    return claims
+
+
+def _paper_validation_text(paper: Dict[str, Any]) -> str:
+    keywords = paper.get("keywords") or ""
+    if isinstance(keywords, list):
+        keywords = " ".join(str(k) for k in keywords)
+    parts = [
+        paper.get("title", ""),
+        paper.get("journal", ""),
+        keywords,
+        paper.get("abstract", ""),
+        paper.get("fulltext", ""),
+    ]
+    return " ".join(str(part) for part in parts if part).lower()
+
+
+def _claim_terms(claim: str) -> List[str]:
+    terms = []
+    stopwords = {"研究", "文献", "相关", "现有", "显示", "因此", "这一", "进行", "通过", "围绕", "当前", "方面", "中的", "需要", "判断", "证据"}
+    known_terms = (
+        "国家形象", "国际传播", "对外传播", "传播效果", "平台机制", "社交媒体", "官方叙事",
+        "中国故事", "文化符号", "受众认知", "话语", "媒介", "算法", "内容分析",
+    )
+    for term in known_terms:
+        if term in claim and term not in terms:
+            terms.append(term)
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", claim.lower()):
+        if token not in terms:
+            terms.append(token)
+    for phrase in re.findall(r"[一-鿿]{2,}", claim):
+        if phrase in stopwords:
+            continue
+        for size in (6, 5, 4, 3, 2):
+            if len(phrase) < size:
+                continue
+            for i in range(0, len(phrase) - size + 1):
+                token = phrase[i:i + size]
+                if token in stopwords:
+                    continue
+                if token not in terms:
+                    terms.append(token)
+                if len(terms) >= 24:
+                    return terms
+    return terms[:24]
+
+
+def _support_for_claim(claim: Dict[str, Any], evidence_by_index: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+    indices = claim.get("evidence_indices", [])
+    if not indices:
+        return {"support_level": "unsupported", "reason": "该论断未附证据编号", "matched_terms": []}
+    invalid = [index for index in indices if index not in evidence_by_index]
+    if invalid:
+        return {"support_level": "invalid", "reason": f"证据编号不存在：{invalid}", "matched_terms": []}
+
+    terms = _claim_terms(claim.get("claim", ""))
+    matched_terms = []
+    missing_abstract = False
+    risky = False
+    best_overlap = 0
+    for index in indices:
+        item = evidence_by_index[index]
+        paper = item["paper"]
+        flags = item.get("flags", [])
+        text = _paper_validation_text(paper)
+        overlap_terms = [term for term in terms if term in text]
+        best_overlap = max(best_overlap, len(overlap_terms))
+        for term in overlap_terms:
+            if term not in matched_terms:
+                matched_terms.append(term)
+        if not paper.get("abstract") or "needs_fulltext_check" in flags:
+            missing_abstract = True
+        if "retracted" in flags:
+            risky = True
+
+    if risky:
+        return {"support_level": "invalid", "reason": "引用了疑似撤稿文献，不应作为正面证据", "matched_terms": matched_terms[:8]}
+    if missing_abstract:
+        return {"support_level": "needs_fulltext_check", "reason": "引用文献缺少摘要或全文证据，需核对原文", "matched_terms": matched_terms[:8]}
+    if not terms:
+        return {"support_level": "medium", "reason": "论断缺少可提取关键词，但引用编号有效", "matched_terms": []}
+    if best_overlap >= 2:
+        return {"support_level": "strong", "reason": "论断关键词与引用文献题名/摘要/关键词存在较好匹配", "matched_terms": matched_terms[:8]}
+    if best_overlap == 1:
+        return {"support_level": "medium", "reason": "论断与引用文献存在有限词项匹配，建议核对表述是否过强", "matched_terms": matched_terms[:8]}
+    return {"support_level": "weak", "reason": "未在引用文献题名/摘要/关键词中找到明显词项支撑", "matched_terms": []}
+
+
 def _validate_writing(markdown: str, selected: List[Dict[str, Any]]) -> Dict[str, Any]:
     evidence_by_index = {item["index"]: item for item in selected}
     usable_indices = {
         item["index"] for item in selected
         if item.get("relevance", 0) > 0 and "retracted" not in item.get("flags", [])
     }
-    issues = []
-    unsupported = []
-    weak_evidence = []
-    invalid_indices = []
+    claims = _claim_sentences(markdown)
+    claim_results = []
+    counts = {"strong": 0, "medium": 0, "weak": 0, "needs_fulltext_check": 0, "unsupported": 0, "invalid": 0}
+    for claim in claims:
+        support = _support_for_claim(claim, evidence_by_index)
+        level = support["support_level"]
+        counts[level] = counts.get(level, 0) + 1
+        claim_results.append({
+            "section": claim["section"],
+            "claim": claim["claim"],
+            "evidence_indices": claim["evidence_indices"],
+            **support,
+        })
 
-    for index in sorted(set(_sentence_evidence_indices(markdown))):
-        item = evidence_by_index.get(index)
-        if not item:
-            invalid_indices.append(index)
-            continue
-        paper = item["paper"]
-        flags = item.get("flags", [])
-        if not paper.get("abstract") or "needs_fulltext_check" in flags:
-            weak_evidence.append({
-                "index": index,
-                "title": paper.get("title", "未获取"),
-                "reason": "缺少摘要或全文证据，需核对原文",
-            })
-        if "retracted" in flags:
-            weak_evidence.append({
-                "index": index,
-                "title": paper.get("title", "未获取"),
-                "reason": "疑似撤稿文献，不应作为正面证据",
-            })
-
-    body = re.sub(r"## 参考文献[\s\S]*$", "", markdown)
-    body = re.sub(r"## 段落证据映射[\s\S]*$", "", body)
-    for raw in re.split(r"(?<=[。！？.!?])\s*", body):
-        sentence = raw.strip()
-        if not sentence or sentence.startswith("#") or sentence.startswith("-"):
-            continue
-        if len(sentence) < 35:
-            continue
-        if not _sentence_evidence_indices(sentence):
-            unsupported.append(sentence[:180])
-
+    body = _validation_body(markdown)
     cited_indices = set(_sentence_evidence_indices(body))
+    invalid_indices = sorted({index for index in cited_indices if index not in evidence_by_index})
+    weak_claims = [item for item in claim_results if item["support_level"] in ("weak", "needs_fulltext_check")]
+    unsupported_claims = [item for item in claim_results if item["support_level"] == "unsupported"]
+    invalid_claims = [item for item in claim_results if item["support_level"] == "invalid"]
     unused_usable = sorted(usable_indices - cited_indices)
+
+    issues = []
     if invalid_indices:
         issues.append({"type": "invalid_evidence_index", "indices": invalid_indices, "message": "正文引用了不存在于本次写作证据集的编号"})
-    if unsupported:
-        issues.append({"type": "unsupported_claim", "count": len(unsupported), "examples": unsupported[:5], "message": "存在未附证据编号的实质性句子"})
-    if weak_evidence:
-        issues.append({"type": "weak_evidence", "count": len(weak_evidence), "examples": weak_evidence[:8], "message": "部分引用证据缺少摘要、需核对原文或存在风险"})
+    if unsupported_claims:
+        issues.append({"type": "unsupported_claim", "count": len(unsupported_claims), "examples": unsupported_claims[:5], "message": "存在未附证据编号的实质性论断"})
+    if weak_claims:
+        issues.append({"type": "weak_or_unverified_support", "count": len(weak_claims), "examples": weak_claims[:8], "message": "部分论断与引用证据匹配较弱，或需核对原文"})
+    if invalid_claims:
+        issues.append({"type": "invalid_support", "count": len(invalid_claims), "examples": invalid_claims[:5], "message": "部分论断引用了无效或高风险证据"})
     if unused_usable:
         issues.append({"type": "unused_relevant_evidence", "indices": unused_usable[:12], "message": "部分高相关证据未进入正文论证，可按需补充"})
 
     score = 100
-    score -= min(len(unsupported) * 6, 36)
-    score -= min(len(weak_evidence) * 5, 30)
-    score -= min(len(invalid_indices) * 15, 30)
+    score -= min(counts.get("unsupported", 0) * 8, 32)
+    score -= min(counts.get("weak", 0) * 6, 30)
+    score -= min(counts.get("needs_fulltext_check", 0) * 5, 25)
+    score -= min(counts.get("invalid", 0) * 18, 45)
     score = max(score, 0)
-    status = "success" if score >= 80 and not invalid_indices else "warning"
+    status = "success" if score >= 80 and not invalid_claims else "warning"
     recommendations = []
-    if unsupported:
+    if unsupported_claims:
         recommendations.append("为未附编号的论断补充 [证据序号]，或删除无法由当前文献库支撑的判断。")
-    if weak_evidence:
-        recommendations.append("对缺摘要或需核对原文的文献执行 read-detail/read-detail --fulltext 后再作为强证据。")
+    if weak_claims:
+        recommendations.append("对弱匹配或缺摘要证据执行 read-detail/read-detail --fulltext，并收紧过强表述。")
+    if invalid_claims:
+        recommendations.append("移除无效编号或疑似撤稿文献，改用摘要可追溯的高相关文献。")
     if unused_usable:
         recommendations.append("检查未使用的高相关文献，必要时补充到相应段落。")
     return {
@@ -1032,6 +1138,9 @@ def _validate_writing(markdown: str, selected: List[Dict[str, Any]]) -> Dict[str
         "score": score,
         "evidence_count": len(selected),
         "cited_evidence_count": len(cited_indices),
+        "checked_claims": len(claim_results),
+        "support_counts": counts,
+        "claim_results": claim_results[:30],
         "issues": issues,
         "recommendations": recommendations,
     }
