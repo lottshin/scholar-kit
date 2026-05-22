@@ -1,5 +1,5 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.12.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.12.1)
 用法:
   python literature.py search "关键词" [--project 课题名] [--source cnki|openalex|semantic|arxiv|nssd|all] [--doc-type master] [--field 摘要] [--author] [--journal] [--download] ...
   python literature.py batch-search "词1" "词2" ... [--project 课题名] [--query-file kw.txt] [--core CSSCI] [--doc-type master] [--field 摘要] [--author] [--journal] [--append]
@@ -26,7 +26,7 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.12.0)
 
 from __future__ import annotations
 
-__version__ = "1.12.0"
+__version__ = "1.12.1"
 
 import argparse
 import json
@@ -2603,7 +2603,11 @@ def cmd_check(args):
     if not cnki_ok:
         cnki_reasons.append("知网不可达（沙盒权限阻止）" if sandbox_blocked else "知网不可达")
 
-    is_codex = (Path.cwd() / ".codex").exists() or os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED")
+    is_codex = (
+        (Path.cwd() / ".codex").exists()
+        or os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED")
+        or any(k.startswith("CODEX_") for k in os.environ)
+    )
 
     capabilities: Dict[str, Any] = {
         "cnki_feasible": cnki_feasible,
@@ -2617,6 +2621,18 @@ def cmd_check(args):
         capabilities["suggested_sources"] = ["openalex", "semantic", "arxiv", "nssd"]
 
         if sandbox_blocked or (is_codex and not driver_ok):
+            capabilities["needs_escalation"] = True
+            capabilities["reason_code"] = "browser_or_driver_requires_host_permission"
+            capabilities["agent_action"] = "rerun_same_command_with_escalated_permissions"
+            capabilities["retry_command"] = (
+                "py -3 -X utf8 scripts/literature.py check --fix"
+                if sys.platform == "win32"
+                else "python3 scripts/literature.py check --fix"
+            )
+            capabilities["recommended_env"] = {
+                "SE_CACHE_PATH": ".scholar-kit/selenium-cache",
+                "SCHOLAR_SKIP_NETWORK_CHECK": "1",
+            }
             capabilities["fix_note"] = (
                 "沙盒限制导致预检/驱动下载失败。"
                 "解决：设置 SCHOLAR_SKIP_NETWORK_CHECK=1，"
@@ -2653,6 +2669,10 @@ def _check_update():
     import re
     _SEMVER_RE = re.compile(r"^\d+\.\d+(\.\d+)?$")
 
+    def _version_key(value: str) -> tuple:
+        parts = [int(p) for p in value.split(".")]
+        return tuple((parts + [0, 0])[:3])
+
     repo = "lottshin/scholar-kit"
     urls = [
         f"https://api.github.com/repos/{repo}/releases/latest",
@@ -2682,14 +2702,18 @@ def _check_update():
         if not _SEMVER_RE.match(latest):
             return None
 
-        if latest != __version__:
+        current = __version__.removeprefix("v")
+        if not _SEMVER_RE.match(current):
+            return None
+
+        if _version_key(latest) > _version_key(current):
             return {
                 "update_available": True,
-                "current": __version__,
+                "current": current,
                 "latest": latest,
                 "message": f"新版本 {latest} 可用，在 skill 目录执行 git pull 更新",
             }
-        return {"update_available": False, "current": __version__, "latest": latest}
+        return {"update_available": False, "current": current, "latest": latest}
     except Exception:
         return None
 

@@ -1,6 +1,6 @@
 ---
 name: scholar-kit
-version: 1.12.0
+version: 1.12.1
 description: >-
   Search, download, and manage academic papers from CNKI (知网), OpenAlex,
   Semantic Scholar, arXiv, and NSSD; enriches metadata via Crossref and
@@ -51,6 +51,8 @@ compatibility:
 知网功能需要 Selenium 浏览器自动化 → 需要 msedgedriver → 首次运行需联网下载驱动（~8MB）。沙盒默认可能禁网，但**所有主流平台都支持运行时提权**。
 
 **Agent 遇到 `sandbox_blocked` 或驱动缺失时，必须以提权方式重试，不得直接放弃或回退 API 源。** 提权后平台会弹窗让用户授权。
+
+当 `check.capabilities.needs_escalation: true` 时，Agent 必须把 `agent_action` 和 `retry_command` 视为下一步指令：携带 `recommended_env` 重新以提权权限运行同一检查或知网命令。未完成一次提权重试前，不得把 CNKI 判定为不可用，也不得直接回退到 API 源。
 
 各平台提权方式：
 
@@ -117,6 +119,7 @@ python scripts/literature.py check --fix
 
 - `cnki_feasible: true` → 可使用全部命令
 - `cnki_feasible: false` → **以提权方式重试，不要放弃**：
+  0. 若存在 `needs_escalation: true` → 按 `retry_command` 重新运行，并按 `recommended_env` 设置环境变量；`agent_action: rerun_same_command_with_escalated_permissions` 表示必须请求平台提权
   1. 设置 `SCHOLAR_SKIP_NETWORK_CHECK=1`，然后**以提权方式重新运行知网命令**（平台会弹窗让用户授权网络访问）。提权后 Selenium Manager 自动下载驱动，三个卡点一步清零
   2. 提权后仍失败 → 读 `fix_note`，**区分场景**：
      - 硕士/博士/学位论文、知网全文等**只有知网能做的任务** → 告知用户"请确认已连接校园网/VPN"，**不要用 API 源替代**
@@ -336,7 +339,7 @@ Agent 的职责是从用户自然语言中提取作者/期刊名/文献类型/�
   - **Codex**：`check --fix` 会自动写入 `.codex/config.toml`（`[sandbox_workspace_write] network_access = true`），配合 `approval_policy = "on-request"` 让 Codex 在联网时弹窗授权
   - **Cursor**：所有知网命令加 `required_permissions: ["all"]`
   - **Claude Code**：`.claude/settings.json` 添加 `*.cnki.net` 到 `allowedDomains`
-  - **绝对不要**因为 `sandbox_blocked` 或 `driver_ok: false` 就放弃知网、回退 API 源。正确做法是确保网络权限配置正确后重试
+  - **绝对不要**因为 `sandbox_blocked`、`driver_ok: false` 或 `needs_escalation: true` 就放弃知网、回退 API 源。正确做法是按 `retry_command` 和平台提权机制重试
 
 ## 参考文档
 

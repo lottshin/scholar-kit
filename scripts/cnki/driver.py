@@ -129,6 +129,11 @@ _VISIBLE_POS = (100, 100)
 _DEFAULT_DEBUG_PORT = 9222
 
 
+def _is_codex_like_env() -> bool:
+    """Return true when running under Codex or a Codex-like sandbox wrapper."""
+    return any(k.startswith("CODEX_") for k in os.environ)
+
+
 def _find_browser_exe(browser: str) -> Optional[str]:
     """找到浏览器可执行文件的绝对路径。"""
     if sys.platform == "win32":
@@ -341,6 +346,16 @@ def _ensure_selenium_cache():
     """确保 Selenium 缓存目录可写。沙盒中默认路径不可写时降级到工作目录。"""
     if os.environ.get("SE_CACHE_PATH"):
         return
+
+    if _is_codex_like_env():
+        fallback = Path.cwd() / ".scholar-kit" / "selenium-cache"
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+            os.environ["SE_CACHE_PATH"] = str(fallback)
+            _log(f"[cnki] Codex 环境使用项目内 Selenium 缓存: {fallback}")
+            return
+        except Exception as e:
+            _log(f"[cnki] 项目内 Selenium 缓存不可用: {e}")
 
     if sys.platform == "win32":
         default_cache = Path(os.environ.get("LOCALAPPDATA", "")) / "selenium"

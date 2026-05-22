@@ -73,7 +73,7 @@
 | 知网下载 (batch-download) | 可用 | 需校园网/VPN + 浏览器 | 不可用 |
 | 知网全文 (read-detail / detail) | 可用 | 需校园网/VPN + 浏览器 | 不可用 |
 
-Agent 判断依据：`check` 命令返回的 `capabilities.cnki_feasible` 字段。
+Agent 判断依据：优先读取 `check` 命令返回的 `capabilities.needs_escalation`，其次读取 `capabilities.cnki_feasible`。
 
 ### 沙箱环境与知网
 
@@ -85,9 +85,9 @@ Agent 判断依据：`check` 命令返回的 `capabilities.cnki_feasible` 字段
 
 这些平台运行在用户本地机器，浏览器已安装，但沙箱可能通过网络代理拦截出站请求。
 
-`check --fix` 会自动检测沙箱环境（Codex: `.codex/` 目录；Claude Code: `.claude/` 目录）并写入对应的网络配置，然后重试知网连通性。Agent 只需运行 `check --fix` 并读取最终的 `capabilities`，无需手动处理沙箱配置。
+`check --fix` 会自动检测沙箱环境（Codex: `.codex/` 目录或 `CODEX_*` 环境变量；Claude Code: `.claude/` 目录）并写入对应的网络配置，然后重试知网连通性。Agent 只需运行 `check --fix` 并读取最终的 `capabilities`，无需手动处理沙箱配置。
 
-仍然 `cnki_feasible: false` → 说明是校园网/VPN 问题，切换 API 源继续工作。
+若返回 `needs_escalation: true`，Agent 必须按 `agent_action` 和 `retry_command` 请求平台提权重试，并携带 `recommended_env`。只有完成提权重试后仍然 `cnki_feasible: false`，才按 `fix_note` 判断是否是校园网/VPN 问题；非 CNKI 专属任务可切换 API 源继续工作。
 
 #### 云端/容器沙箱
 
