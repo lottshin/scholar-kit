@@ -156,8 +156,8 @@ def _http_get_no_proxy(url: str, headers: Optional[Dict[str, str]] = None) -> Op
 
 # ── OpenAlex ──────────────────────────────────────────
 
-def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to: int = None) -> list[dict]:
-    cache_key = _cache_key("openalex", f"{query}_{limit}_{year_from}_{year_to}")
+def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to: int = None, sort: str = "relevance") -> list[dict]:
+    cache_key = _cache_key("openalex", f"{query}_{limit}_{year_from}_{year_to}_{sort}")
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
@@ -167,6 +167,13 @@ def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to:
         "per_page": min(limit, 50),
         "mailto": _get_mailto(),
     }
+
+    # 添加排序参数
+    if sort == "citations":
+        params["sort"] = "cited_by_count:desc"
+    elif sort == "date":
+        params["sort"] = "publication_date:desc"
+    # relevance 是默认排序，不需要传参数
 
     filters = []
     if year_from is not None:
@@ -192,15 +199,22 @@ def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to:
 
         loc = w.get("primary_location") or {}
         src = loc.get("source") or {}
+        # 提高关键词质量：提升阈值到 0.5，按分数排序，限制数量
+        concepts = sorted(
+            w.get("concepts", []),
+            key=lambda x: x.get("score", 0),
+            reverse=True
+        )
         keywords = [
             c.get("display_name", "")
-            for c in w.get("concepts", [])
-            if c.get("display_name") and c.get("score", 0) > 0.3  # score 为 0-1 相关度，0.3 过滤低相关概念
-        ]
+            for c in concepts
+            if c.get("display_name") and c.get("score", 0) > 0.5
+        ][:10]
+        # fallback 到 topics
         if not keywords:
             keywords = [
                 t.get("display_name", "")
-                for t in w.get("topics", [])
+                for t in w.get("topics", [])[:5]
                 if t.get("display_name")
             ]
         results.append({
@@ -249,8 +263,8 @@ def _year_in_range(year, year_from, year_to) -> bool:
 
 # ── Semantic Scholar ──────────────────────────────────
 
-def search_semantic_scholar(query: str, limit: int = 10, year_from: int = None, year_to: int = None) -> list[dict]:
-    cache_key = _cache_key("s2", f"{query}_{limit}_{year_from}_{year_to}")
+def search_semantic_scholar(query: str, limit: int = 10, year_from: int = None, year_to: int = None, sort: str = "relevance") -> list[dict]:
+    cache_key = _cache_key("s2", f"{query}_{limit}_{year_from}_{year_to}_{sort}")
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
@@ -260,6 +274,13 @@ def search_semantic_scholar(query: str, limit: int = 10, year_from: int = None, 
         "limit": min(limit, 100),
         "fields": "title,authors,year,abstract,url,citationCount,externalIds,isOpenAccess,openAccessPdf,fieldsOfStudy",
     }
+    # 添加排序参数
+    if sort == "citations":
+        params["sort"] = "citationCount:desc"
+    elif sort == "date":
+        params["sort"] = "publicationDate:desc"
+    # relevance 是默认排序，不需要传参数
+
     if year_from is not None or year_to is not None:
         if year_from is not None and year_to is not None:
             params["year"] = f"{year_from}-{year_to}"
@@ -276,6 +297,12 @@ def search_semantic_scholar(query: str, limit: int = 10, year_from: int = None, 
         ext_ids = p.get("externalIds") or {}
         oa_pdf = p.get("openAccessPdf") or {}
         fos = p.get("fieldsOfStudy") or []
+        # 改进关键词质量：添加 fallback
+        if not fos and p.get("title"):
+            # 从标题提取关键词作为 fallback
+            title_words = set(p.get("title", "").lower().split())
+            stopwords = {"the", "a", "an", "of", "in", "on", "for", "with", "to", "and", "or", "from", "by", "at", "as"}
+            fos = [w for w in title_words if len(w) > 3 and w not in stopwords][:5]
         results.append({
             "title": p.get("title", ""),
             "authors": ", ".join(a.get("name", "") for a in p.get("authors", [])),
@@ -378,11 +405,15 @@ def search_arxiv(query: str, limit: int = 10, sort_by: str = "relevance", year_f
     if cached is not None:
         return cached
 
-    sort_map = {"relevance": "relevance", "date": "lastUpdatedDate", "citations": "relevance"}
+    # 修正排序映射：arXiv 不支持按引用数排序
+    sort_map = {"relevance": "relevance", "date": "lastUpdatedDate"}
+    # citations 排序不支持，使用 relevance 作为 fallback
+    sort_param = sort_map.get(sort_by, "relevance")
+
     params = {
         "search_query": f"all:{query}",
         "max_results": min(limit, 50),
-        "sortBy": sort_map.get(sort_by, "relevance"),
+        "sortBy": sort_param,
         "sortOrder": "descending",
     }
     url = "http://export.arxiv.org/api/query?" + urlencode(params)

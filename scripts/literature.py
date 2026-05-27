@@ -217,12 +217,14 @@ def cmd_search(args):
             results.extend(search_openalex(
                 args.query, limit=api_limit,
                 year_from=args.year_from, year_to=args.year_to,
+                sort=args.sort or "relevance",
             ))
 
         if has_keyword and source in ("semantic", "all"):
             results.extend(search_semantic_scholar(
                 args.query, limit=api_limit,
                 year_from=args.year_from, year_to=args.year_to,
+                sort=args.sort or "relevance",
             ))
 
         if has_keyword and source in ("arxiv", "all"):
