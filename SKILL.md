@@ -252,9 +252,14 @@ python scripts/literature.py check --fix
 Agent 负责将用户意图翻译为选项名，详见 [核心期刊知识](references/core-journals.md)。
 `--core` 使用规则：**仅在用户明确要求核心期刊时添加**。用户未提"核心""CSSCI""C刊"等词时不主动加，避免过滤掉有价值的非核心文献。
 
-`--cite-enrich N`：仅知网搜索可用。搜索时点击前 N 条结果的“引用”按钮，读取弹窗中的 GB/T 7714 文本，写入 `gbt7714_raw` 并快速补全 `pages`。当用户要某篇论文的引用、要求页码、或需要准确 GB/T 引用时优先使用，例如：`search "论文题名" --source cnki --limit 3 --cite-enrich 3`。它比 `--enrich` 访问详情页更快，但会多做 N 次弹窗点击。
+`--cite-enrich N`：仅知网搜索可用。搜索时点击前 N 条结果的”引用”按钮，读取弹窗中的 GB/T 7714 文本，写入 `gbt7714_raw` 并快速补全 `pages`。当用户要某篇论文的引用、要求页码、或需要准确 GB/T 引用时优先使用，例如：`search “论文题名” --source cnki --limit 3 --cite-enrich 3`。它比 `--enrich` 访问详情页更快，但会多做 N 次弹窗点击。
 
-`--sort citations` 注意：arXiv 论文的 `cited_by` 始终为 0，按被引排序时 arXiv 结果会沉底。混合数据源时建议用默认排序（relevance）。
+`--sort`：排序方式，可选 `relevance`（相关度，默认）/ `date`（时间）/ `citations`（被引次数）/ `quality`（质量评分）。
+- `citations` 和 `date` 排序在 OpenAlex 和 Semantic Scholar 中通过 API 参数实现，效率更高
+- `quality` 排序基于多维度评分（摘要完整性、DOI、被引、关键词、开放获取、数据源可靠性、年份新近性），适合快速筛选高质量论文
+- arXiv 不支持按被引排序（`cited_by` 始终为 0），混合数据源时建议用 `relevance` 或 `quality`
+
+`--source all` 时自动去重：基于 DOI 精确匹配和标题标准化匹配，保留第一个出现的版本。
 
 `--doc-type`：文献类型筛选，可选 `journal`（学术期刊）/ `master`（硕士论文）/ `doctor`（博士论文）/ `thesis`（全部学位论文）/ `conference`（会议论文）/ `newspaper`（报纸）。Agent 根据用户意图自动添加。
 
@@ -267,6 +272,22 @@ Agent 的职责是从用户自然语言中提取作者/期刊名/文献类型/�
 - "张三在北大核心上发的关于教育改革的论文" → `search "教育改革" --author 张三 --core 北大核心`
 - "搜摘要里提到内容分析的硕士论文" → `search "内容分析" --doc-type master --field 摘要`
 - "找博士论文中关于深度学习的" → `search "深度学习" --doc-type doctor`
+
+### 质量评分机制
+
+所有搜索结果自动计算 `quality_score`（0-100），评分维度：
+- **摘要完整性**（0-30）：>500 字得 30 分，>200 字得 20 分，有摘要得 10 分
+- **DOI 存在**（20）：有 DOI 得 20 分
+- **被引次数**（0-20）：对数归一化，高被引论文得分更高
+- **关键词存在**（10）：有关键词得 10 分
+- **开放获取**（10）：OA 论文得 10 分
+- **数据源可靠性**（5）：OpenAlex/Semantic Scholar 得 5 分，arXiv 得 3 分
+- **年份新近性**（0-10）：最近 5 年内，每年递减 2 分
+
+使用场景：
+- `--sort quality` 快速筛选高质量论文
+- 质量分数可作为精读优先级参考
+- 分数 ≥80 通常表示高质量论文（完整摘要 + DOI + 高引用 + 近期发表）
 
 ## 交互规范
 
