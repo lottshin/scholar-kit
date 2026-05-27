@@ -704,6 +704,117 @@ def _openalex_to_doi(openalex_url: str) -> Optional[str]:
     return None
 
 
+# ── 结果去重 ──────────────────────────────────────────
+
+def deduplicate_results(results: list[dict]) -> list[dict]:
+    """基于 DOI 和标题去重，保留第一个出现的版本。
+
+    优先级：DOI 精确匹配 > 标题相似度 > 保留
+
+    Args:
+        results: 搜索结果列表
+
+    Returns:
+        去重后的结果列表
+    """
+    seen_dois = set()
+    seen_titles = set()
+    unique = []
+
+    for r in results:
+        # DOI 去重（精确匹配）
+        doi = (r.get("doi") or "").lower().strip()
+        if doi and doi in seen_dois:
+            continue
+        if doi:
+            seen_dois.add(doi)
+
+        # 标题去重（标准化后精确匹配）
+        title = (r.get("title") or "").lower().strip()
+        # 移除多余空格和标点
+        title = re.sub(r'\s+', ' ', title)
+        title = re.sub(r'[^\w\s]', '', title)
+
+        if title and title in seen_titles:
+            continue
+        if title:
+            seen_titles.add(title)
+
+        unique.append(r)
+
+    return unique
+
+
+# ── 质量评分 ──────────────────────────────────────────
+
+def calculate_quality_score(paper: dict) -> float:
+    """计算论文质量分数（0-100）。
+
+    评分维度：
+    - 摘要完整性（0-30）
+    - DOI 存在（20）
+    - 被引次数（0-20，对数归一化）
+    - 关键词存在（10）
+    - 开放获取（10）
+    - 数据源可靠性（5）
+    - 年份新近性（0-10）
+
+    Args:
+        paper: 论文字典
+
+    Returns:
+        质量分数（0-100）
+    """
+    import math
+    from datetime import datetime
+
+    score = 0.0
+
+    # 摘要完整性
+    abstract = paper.get("abstract", "")
+    if len(abstract) > 500:
+        score += 30
+    elif len(abstract) > 200:
+        score += 20
+    elif abstract:
+        score += 10
+
+    # DOI 存在
+    if paper.get("doi"):
+        score += 20
+
+    # 被引次数（对数归一化）
+    cited_by = paper.get("cited_by", 0)
+    if cited_by > 0:
+        score += min(20, math.log10(cited_by + 1) * 5)
+
+    # 关键词存在
+    keywords = paper.get("keywords", [])
+    if keywords and len(keywords) > 0:
+        score += 10
+
+    # 开放获取
+    if paper.get("is_oa"):
+        score += 10
+
+    # 数据源可靠性
+    source = paper.get("source", "")
+    if source in ("OpenAlex", "Semantic Scholar"):
+        score += 5
+    elif source == "arXiv":
+        score += 3
+
+    # 年份新近性（最近 5 年）
+    year = paper.get("year")
+    if year:
+        current_year = datetime.now().year
+        age = current_year - year
+        if age <= 5:
+            score += max(0, 10 - (age * 2))  # 每年递减 2 分
+
+    return min(100, score)
+
+
 # ── 研究趋势分析 ──────────────────────────────────────
 
 def analyze_trends(papers: List[Dict[str, Any]]) -> Dict[str, Any]:

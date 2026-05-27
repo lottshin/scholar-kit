@@ -239,19 +239,20 @@ def cmd_search(args):
                 year_from=args.year_from, year_to=args.year_to,
             ))
 
-        seen = set()
-        deduped = []
-        for r in results:
-            # Some sources may return null titles for edge records.
-            key = (r.get("title") or "").lower().strip()
-            if key and key not in seen:
-                seen.add(key)
-                deduped.append(r)
+        # 使用改进的去重函数（基于 DOI 和标题）
+        from search import deduplicate_results, calculate_quality_score
+        deduped = deduplicate_results(results)
+
+        # 添加质量评分
+        for paper in deduped:
+            paper["quality_score"] = calculate_quality_score(paper)
 
         if args.sort == "citations":
             deduped.sort(key=lambda x: x.get("cited_by", 0), reverse=True)
         elif args.sort == "date":
             deduped.sort(key=lambda x: x.get("year") or 0, reverse=True)
+        elif args.sort == "quality":
+            deduped.sort(key=lambda x: x.get("quality_score", 0), reverse=True)
 
         if args.limit is not None:
             effective_limit = args.limit
@@ -2778,7 +2779,7 @@ def main():
     p_search.add_argument("--year-to", type=int, help="截止年份")
     p_search.add_argument("--author", help="作者")
     p_search.add_argument("--journal", help="期刊名")
-    p_search.add_argument("--sort", choices=["relevance", "date", "citations"],
+    p_search.add_argument("--sort", choices=["relevance", "date", "citations", "quality"],
                           default="relevance", help="排序方式")
     p_search.add_argument("--pages", type=int, default=1, help="知网抓取页数")
     p_search.add_argument("--export", help="直接导出: bibtex/ris/markdown/json/excel")
@@ -2872,7 +2873,7 @@ def main():
     p_batch.add_argument("--journal", help="期刊名（对每组关键词生效）")
     p_batch.add_argument("--year-from", type=int, help="起始年份")
     p_batch.add_argument("--year-to", type=int, help="截止年份")
-    p_batch.add_argument("--sort", choices=["relevance", "date", "citations"],
+    p_batch.add_argument("--sort", choices=["relevance", "date", "citations", "quality"],
                          default="relevance", help="排序方式")
     p_batch.add_argument("--pages", type=int, default=1, help="每组关键词抓取页数")
     p_batch.add_argument("--export", help="直接导出: bibtex/ris/markdown/json/excel")
