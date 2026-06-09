@@ -12,6 +12,7 @@ from .driver import (
     _detect_browser, _create_driver, _load_cookies, _save_cookies,
     _handle_captcha, check_cnki_access, _cookie_path,
     _is_cnki_security_gate, _show_browser_for_captcha,
+    authenticate_cnki,
 )
 from .search import search_cnki, batch_search_cnki
 from .detail import get_detail, batch_read_detail

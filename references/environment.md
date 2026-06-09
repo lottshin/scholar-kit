@@ -38,9 +38,26 @@
 
 ## 知网访问
 
-- 需要校园网或 VPN
-- Clash 等代理时脚本自动绕过直连知网
-- 验证码自动弹出浏览器，用户手动完成后继续
+- 需要校园网、机构 VPN，或学校支持的 CARSI/校外统一认证
+- 校外访问可先运行 `python scripts/literature.py auth-cnki` 预热会话；默认入口是 `https://fsso.cnki.net/`，也可用 `--auth-url` 传学校图书馆、VPN 或 CARSI 入口
+- `--institution` 是可选项。传入学校/机构名时脚本尝试自动选择；不传时用户在浏览器中手动选择，更适合不同学校和机构复用
+- 登录、扫码、短信、滑块等必须由用户手动完成。Agent 在运行时应明确告知用户：浏览器会打开、请不要关闭窗口、脚本会等待并保存 cookies/profile
+- 完成一次认证后，后续 CNKI 命令复用 `.scholar-kit/browser-profile` 和 `.scholar-kit/cookies.json`；同一项目/会话内通常无需反复登录，除非机构会话过期或用户使用 `auth-cnki --force`
+- 使用 Clash/Mihomo/Surge/Quantumult X/PAC/系统代理等代理时，CNKI、CARSI 和学校认证域名必须直连。脚本会给 Edge/Chrome 注入 `proxy-bypass-list`，但 TUN/全局接管模式需要用户在代理软件中配置 DIRECT 规则
+- 验证码会自动弹出浏览器，用户手动完成后继续
+
+### 校外统一认证命令示例
+
+```bash
+# 通用 CNKI FSSO：用户在浏览器中手动选择学校
+python scripts/literature.py auth-cnki --wait-seconds 240 --keep-browser
+
+# 已知学校/机构名称时尝试自动选择
+python scripts/literature.py auth-cnki --institution "示例大学" --wait-seconds 240
+
+# 学校图书馆或 VPN 提供了自己的入口
+python scripts/literature.py auth-cnki --auth-url "https://library.example.edu/cnki" --direct-domain idp.example.edu
+```
 
 ## 浏览器
 
@@ -68,16 +85,16 @@
 | OpenAlex / Semantic Scholar / arXiv 搜索 | 可用 | 可用 | 可用 |
 | 引用生成 / 导出 / cite / export | 可用 | 可用 | 可用 |
 | read-paper / write-docx / patch-docx | 可用 | 可用 | 可用 |
-| 知网搜索 (search --source cnki) | 可用 | 需校园网/VPN + 浏览器 | 不可用 |
-| 知网批量搜索 (batch-search) | 可用 | 需校园网/VPN + 浏览器 | 不可用 |
-| 知网下载 (batch-download) | 可用 | 需校园网/VPN + 浏览器 | 不可用 |
-| 知网全文 (read-detail / detail) | 可用 | 需校园网/VPN + 浏览器 | 不可用 |
+| 知网搜索 (search --source cnki) | 可用 | 需校园网/VPN/CARSI + 浏览器 | 不可用 |
+| 知网批量搜索 (batch-search) | 可用 | 需校园网/VPN/CARSI + 浏览器 | 不可用 |
+| 知网下载 (batch-download) | 可用 | 需校园网/VPN/CARSI + 浏览器 | 不可用 |
+| 知网全文 (read-detail / detail) | 可用 | 需校园网/VPN/CARSI + 浏览器 | 不可用 |
 
 Agent 判断依据：优先读取 `check` 命令返回的 `capabilities.needs_escalation`，其次读取 `capabilities.cnki_feasible`。
 
 ### 沙箱环境与知网
 
-知网功能需要桌面浏览器（Edge/Chrome）和校园网/VPN。**沙箱环境通常不具备这些条件**，`check` 会报告 `cnki_feasible: false`。
+知网功能需要桌面浏览器（Edge/Chrome）和合法机构访问权限（校园网、机构 VPN，或 CARSI/校外统一认证）。**沙箱环境通常不具备这些条件**，`check` 会报告 `cnki_feasible: false`。
 
 知网需要有头浏览器（headless 会被反爬检测拦截），因此**区分两类沙箱**：
 
@@ -87,7 +104,7 @@ Agent 判断依据：优先读取 `check` 命令返回的 `capabilities.needs_es
 
 `check --fix` 会自动检测沙箱环境（Codex: `.codex/` 目录或 `CODEX_*` 环境变量；Claude Code: `.claude/` 目录）并写入对应的网络配置，然后重试知网连通性。Agent 只需运行 `check --fix` 并读取最终的 `capabilities`，无需手动处理沙箱配置。
 
-若返回 `needs_escalation: true`，Agent 必须按 `agent_action` 和 `retry_command` 请求平台提权重试，并携带 `recommended_env`。只有完成提权重试后仍然 `cnki_feasible: false`，才按 `fix_note` 判断是否是校园网/VPN 问题；非 CNKI 专属任务可切换 API 源继续工作。
+若返回 `needs_escalation: true`，Agent 必须按 `agent_action` 和 `retry_command` 请求平台提权重试，并携带 `recommended_env`。只有完成提权重试后仍然 `cnki_feasible: false`，才按 `fix_note` 判断是否是校园网/VPN/CARSI 校外认证问题；非 CNKI 专属任务可切换 API 源继续工作。
 
 #### 云端/容器沙箱
 
@@ -106,11 +123,12 @@ skill 安装后不会自动更新。`check` 命令会对比本地版本与 GitHu
 
 ### 知网搜索失败
 
-1. 确认校园网/VPN 已连接
+1. 确认校园网/VPN 已连接；校外访问时确认已运行 `auth-cnki` 并完成统一身份认证
 2. 浏览器手动打开 https://kns.cnki.net 确认能访问
-3. 检查 Clash 是否为 TUN 模式（全局接管会绕过 proxy-bypass-list）
-4. 尝试关闭 Clash 后重试
-5. 如使用 VPN，确认知网域名走 VPN 而非代理
+3. 检查代理软件是否为 TUN/全局接管模式（会绕过浏览器 `proxy-bypass-list`）
+4. 检查代理日志，确认 `fsso.cnki.net`、`kns.cnki.net`、CARSI 域名和学校统一认证域名均命中 DIRECT
+5. 尝试关闭代理软件后重试
+6. 如使用 VPN，确认知网域名走 VPN 而非代理
 
 ### Semantic Scholar 限流
 
