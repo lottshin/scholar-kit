@@ -5,7 +5,7 @@ description: >-
   Search, download, and manage academic papers from CNKI (知网), OpenAlex,
   Semantic Scholar, arXiv, and NSSD; enriches metadata via Crossref and
   resolves OA links via Unpaywall. Generates citations
-  (GB/T 7714, BibTeX, RIS, APA), writes literature reviews, suggests
+  (GB/T 7714, APA, MLA, Chicago, BibTeX, RIS), writes literature reviews, suggests
   inline references, analyzes citation networks, and generates research trend reports.
   Use when the user asks to 搜索/检索/查找 文献/论文, 下载论文/全文, 写文献综述,
   引用建议/插入文献, 选题分析/研究选题/研究问题, 格式化参考文献, 参考文献, 引文追踪/引用网络/谁引用了,
@@ -225,15 +225,15 @@ python scripts/literature.py check --fix
 
 | 命令 | 用途 | 关键参数 |
 |------|------|----------|
-| `search "词"` | 单关键词搜索 | `--source` `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--limit` `--cite-enrich` `--export` `--output` `--download` `--download-dir` `--download-top-n` `--append` `--project` |
+| `search "词"` | 单关键词搜索 | `--source` `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--limit` `--cite-enrich` `--export` `--output` `--download` `--download-dir` `--download-top-n` `--download-file-format` `--download-fallback-format` `--download-citation-style` `--download-report-output` `--append` `--project` |
 | `batch-search "词1" "词2"` | 多关键词搜索 | `--query-file` `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--export` `--output` `--append` `--project` |
 | `read-detail` | 获取摘要/全文（CNKI 论文，含硕博论文） | `--top-n` `--indices` `--fulltext` `--project` |
 | `read-paper "file"` | 读取用户论文 | `--output` `--raw` |
 | `detail "url"` | 单篇详情 | |
 | `download [url]` | 单篇下载 | `--dir` `--doi` `--file-format` |
-| `batch-download [url1 url2 ...]` | 批量下载（推荐） | `--from-session` `--top-n` `--dir` `--file-format` `--project` |
+| `batch-download [url1 url2 ...]` | 批量下载（推荐） | `--from-session` `--top-n` `--dir` `--file-format` `--fallback-format` `--citation-style` `--report-output` `--project` |
 | `export` | 导出文献列表 | `--format` `--output` `--raw` `--project` |
-| `cite` | 生成引用 | `--style`（gbt7714/gb/footnote/apa） `--raw` `--project` |
+| `cite` | 生成引用 | `--style`（gbt7714/gb/footnote/apa/mla/chicago） `--raw` `--project` |
 | `projects` | 列出课题文献库 | |
 | `library` | 查看当前/指定课题文献库 | `--project` `--limit` |
 | `write` | 基于文献库写综述正文 | `--project` `--topic` `--limit` `--mode outline/draft/section` `--section` `--format markdown/docx` `--output` `--with-citations` `--citation-style` `--validate` `--raw` |
@@ -301,10 +301,25 @@ Agent 的职责是从用户自然语言中提取作者/期刊名/文献类型/�
 
 ### 搜索与下载联动
 
+当用户意图是"搜索并下载"或"下载文献"时，若用户未明确说明，先追问两个选项：
+- 下载文件格式：`pdf` / `caj`（默认推荐 `pdf`）
+- 下载清单引用格式：`gbt7714` / `apa` / `mla` / `chicago`（中文论文默认推荐 `gbt7714`）
+
 当用户意图是"搜索并下载"时，优先使用 `search ... --download`（一步完成），避免分两步操作：
 - "帮我搜20篇XX的论文并下载" → `search "XX" --pages 2 --download --download-top-n 20`
 - "搜几篇关于XX的核心期刊论文下载下来" → `search "XX" --core CSSCI --download`
 - 仅当用户需要先看结果再决定下载哪些时，才用两步走：`search` → `batch-download --from-session`
+
+下载格式策略：
+- 用户明确要求 PDF 时，默认先严格下载 PDF 到 `pdf/` 子目录
+- 若用户同意兜底，可加 `--fallback-format caj`；只有 PDF 按钮不存在等明确失败项才再次尝试 CAJ，并写入 `caj/` 子目录，避免不同格式混放
+- 不要静默把 CAJ 当作 PDF 返回；展示结果时必须标明实际格式、是否降级、保存目录
+
+下载完成后必须展示或引用脚本生成的下载清单：
+- `download_report.path` 是 Markdown 清单文件，包含"已下载"与"未下载"两节
+- 两节中的条目使用用户选择的引用格式，便于直接放入论文参考文献
+- 若某篇缺少完整元数据，清单会用已知题名/URL 降级生成引用；Agent 应标注"元数据待补全"，不得凭记忆补写作者、年份、DOI
+- 未下载项必须说明脚本返回的失败原因，例如无 PDF/CAJ 按钮、超时、知网不可达或权限不足
 
 ### 歧义处理
 

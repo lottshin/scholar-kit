@@ -10,7 +10,7 @@
 
 ### 论文下载
 
-知网 PDF 批量下载，支持搜索+下载一步完成（`search --download`），自动分批并设置冷却间隔避免触发风控。断点续传机制确保中途失败后可从上次位置继续。英文 OA 论文通过 DOI 获取。
+知网 PDF/CAJ 批量下载，支持搜索+下载一步完成（`search --download`），自动分批并设置冷却间隔避免触发风控。断点续传机制确保中途失败后可从上次位置继续。下载文件按格式写入 `pdf/`、`caj/` 子目录；用户明确要 PDF 时可用 `--fallback-format caj` 在 PDF 不可用时显式降级到 CAJ，不会静默混放。批量下载会生成 Markdown 清单，按 GB/T 7714、APA、MLA 或 Chicago 列出已下载和未下载文献。英文 OA 论文通过 DOI 获取。
 
 ### 全文阅读
 
@@ -18,7 +18,7 @@
 
 ### 引用生成与导出
 
-支持 GB/T 7714、BibTeX、RIS、APA、脚注五种引用格式。文献列表可导出为 BibTeX、RIS、Markdown、JSON、Excel。支持导入知网导出的 NoteExpress / Refworks / BibTeX 题录文件（含卷期页码完整解析）。搜索结果自带引用预览（`citation_preview`），cite 命令对知网论文自动补全卷期页码。
+支持 GB/T 7714、APA、MLA、Chicago、BibTeX、RIS、脚注等引用格式。文献列表可导出为 BibTeX、RIS、Markdown、JSON、Excel。支持导入知网导出的 NoteExpress / Refworks / BibTeX 题录文件（含卷期页码完整解析）。搜索结果自带引用预览（`citation_preview`），cite 命令对知网论文自动补全卷期页码。
 
 ### 引文网络分析
 

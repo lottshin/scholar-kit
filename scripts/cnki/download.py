@@ -105,8 +105,8 @@ def _get_title(driver) -> str:
     return title
 
 
-def _click_download_btn(driver, file_format: str = "pdf") -> bool:
-    """点击下载按钮，成功返回 True。
+def _click_download_btn(driver, file_format: str = "pdf") -> Optional[str]:
+    """点击下载按钮，成功返回实际触发的格式；失败返回 None。
 
     知网不同页面（期刊 vs 学位论文）的按钮 ID/结构不一致，
     因此先按 ID 找，再按链接文字找，确保都能命中。
@@ -125,7 +125,7 @@ def _click_download_btn(driver, file_format: str = "pdf") -> bool:
                 EC.element_to_be_clickable((by, selector))
             )
             btn.click()
-            return True
+            return file_format
         except (TimeoutException, NoSuchElementException):
             continue
 
@@ -135,28 +135,30 @@ def _click_download_btn(driver, file_format: str = "pdf") -> bool:
             text = (link.text or "").strip()
             if text == btn_text:
                 link.click()
-                return True
+                return file_format
             href = link.get_attribute("href") or ""
             if "download" in href and btn_text[:3] in text:
                 link.click()
-                return True
+                return file_format
     except Exception:
         pass
 
-    if file_format == "pdf":
-        try:
-            caj_btn = driver.find_element(By.ID, "cajDown")
-            if caj_btn:
-                _log("[cnki-download] PDF 按钮未找到，尝试 CAJ 兜底")
-                caj_btn.click()
-                return True
-        except (NoSuchElementException, Exception):
-            pass
-
-    return False
+    return None
 
 
-def download_cnki(url: str, save_dir: str = "./papers", file_format: str = "pdf") -> Dict[str, Any]:
+def _format_save_dir(save_dir: str, file_format: str, separate_formats: bool = True) -> str:
+    if not separate_formats:
+        return save_dir
+    return str(Path(save_dir) / file_format.lower())
+
+
+def download_cnki(
+    url: str,
+    save_dir: str = "./papers",
+    file_format: str = "pdf",
+    fallback_format: Optional[str] = None,
+    separate_formats: bool = True,
+) -> Dict[str, Any]:
     """
     从知网下载单篇论文。
 
@@ -168,8 +170,11 @@ def download_cnki(url: str, save_dir: str = "./papers", file_format: str = "pdf"
     Returns:
         下载结果信息
     """
-    os.makedirs(save_dir, exist_ok=True)
-    abs_save_dir = os.path.abspath(save_dir)
+    requested_format = (file_format or "pdf").lower()
+    fallback_format = (fallback_format or "").lower() or None
+    active_save_dir = _format_save_dir(save_dir, requested_format, separate_formats)
+    os.makedirs(active_save_dir, exist_ok=True)
+    abs_save_dir = os.path.abspath(active_save_dir)
 
     driver = None
     try:
@@ -191,31 +196,53 @@ def download_cnki(url: str, save_dir: str = "./papers", file_format: str = "pdf"
         driver = _handle_captcha(driver)
 
         title = _get_title(driver)
-        snapshot = set(os.listdir(save_dir))
+        snapshot = set(os.listdir(active_save_dir))
 
-        if not _click_download_btn(driver, file_format):
+        actual_format = _click_download_btn(driver, requested_format)
+        fallback_used = False
+        if not actual_format and fallback_format:
+            fallback_save_dir = _format_save_dir(save_dir, fallback_format, separate_formats)
+            os.makedirs(fallback_save_dir, exist_ok=True)
+            active_save_dir = fallback_save_dir
+            abs_save_dir = os.path.abspath(active_save_dir)
+            driver.execute_cdp_cmd("Browser.setDownloadBehavior", {
+                "behavior": "allow",
+                "downloadPath": abs_save_dir,
+                "eventsEnabled": True,
+            })
+            snapshot = set(os.listdir(active_save_dir))
+            actual_format = _click_download_btn(driver, fallback_format)
+            fallback_used = bool(actual_format)
+
+        if not actual_format:
             return {"status": "error", "code": "DOWNLOAD_BTN_NOT_FOUND",
-                    "message": "未找到{}下载按钮".format(file_format)}
+                    "message": "未找到{}下载按钮".format(requested_format),
+                    "requested_format": requested_format,
+                    "fallback_format": fallback_format}
 
-        downloaded = _wait_for_download(save_dir, timeout=180, before=snapshot)
+        downloaded = _wait_for_download(active_save_dir, timeout=180, before=snapshot)
 
         if downloaded:
             _log(f"[cnki-download] 下载完成: {downloaded}")
             return {
                 "status": "success",
                 "title": title,
-                "save_dir": save_dir,
+                "save_dir": active_save_dir,
                 "filename": downloaded,
-                "format": file_format,
+                "format": actual_format,
+                "requested_format": requested_format,
+                "fallback_used": fallback_used,
             }
         else:
             return {
                 "status": "warning",
                 "code": "DOWNLOAD_TIMEOUT",
                 "title": title,
-                "save_dir": save_dir,
+                "save_dir": active_save_dir,
                 "message": "下载可能仍在进行中，请检查目录",
-                "format": file_format,
+                "format": actual_format,
+                "requested_format": requested_format,
+                "fallback_used": fallback_used,
             }
 
     except Exception as e:
@@ -441,6 +468,7 @@ def batch_download_cnki(
     urls: List[str],
     save_dir: str = "./papers",
     file_format: str = "pdf",
+    separate_formats: bool = True,
     _driver=None,
 ) -> Dict[str, Any]:
     """
@@ -461,6 +489,9 @@ def batch_download_cnki(
         return {"status": "error", "code": "NO_URLS", "message": "未提供下载 URL"}
 
     urls = list(dict.fromkeys(urls))
+    requested_format = (file_format or "pdf").lower()
+    root_save_dir = save_dir
+    save_dir = _format_save_dir(root_save_dir, requested_format, separate_formats)
 
     os.makedirs(save_dir, exist_ok=True)
     abs_save_dir = os.path.abspath(save_dir)
@@ -479,7 +510,10 @@ def batch_download_cnki(
     if not remaining_urls:
         _log("[cnki-download] 所有 URL 已在之前的会话中下载完成")
         return {"status": "success", "count": len(urls), "save_dir": save_dir,
-                "results": [{"url": u, "filename": "(previously completed)"} for u in urls]}
+                "root_save_dir": root_save_dir, "requested_format": requested_format,
+                "results": [{"url": u, "filename": "(previously completed)",
+                             "format": requested_format, "requested_format": requested_format,
+                             "save_dir": save_dir} for u in urls]}
 
     if len(remaining_urls) < len(urls):
         _log(f"[cnki-download] 断点续传: 跳过 {len(urls) - len(remaining_urls)} 篇已完成，"
@@ -608,6 +642,8 @@ def batch_download_cnki(
             "status": status,
             "count": len(all_ok),
             "save_dir": save_dir,
+            "root_save_dir": root_save_dir,
+            "requested_format": requested_format,
             "results": all_ok,
             "errors": all_errors if all_errors else None,
         }

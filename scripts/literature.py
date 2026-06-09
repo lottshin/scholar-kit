@@ -57,6 +57,8 @@ from cnki import (  # noqa: E402
 )
 from formatter import export_papers, generate_reference_list, citation_preview  # noqa: E402
 
+CITATION_STYLE_CHOICES = ["gbt7714", "gb", "apa", "mla", "chicago", "footnote"]
+
 def _safe_project_name(project: str) -> str:
     cleaned = "".join(c if c.isalnum() or c in "._- 一-鿿" else "_" for c in project.strip())
     cleaned = cleaned.strip(" .")
@@ -305,7 +307,39 @@ def cmd_search(args):
             dl_papers = deduped[:dl_top_n] if dl_top_n else deduped
             dl_urls = [p.get("url") for p in dl_papers if isinstance(p, dict) and p.get("url")]
             if dl_urls:
-                dl_result = batch_download_cnki(dl_urls, save_dir=dl_dir, _driver=reuse_driver)
+                dl_format = getattr(args, "download_file_format", "pdf") or "pdf"
+                dl_result = batch_download_cnki(
+                    dl_urls,
+                    save_dir=dl_dir,
+                    file_format=dl_format,
+                    _driver=reuse_driver,
+                )
+                fallback_format = getattr(args, "download_fallback_format", None)
+                if fallback_format:
+                    failed_urls = [
+                        err.get("url") for err in (dl_result.get("errors") or [])
+                        if isinstance(err, dict)
+                        and err.get("url")
+                        and err.get("code") == "DOWNLOAD_BTN_NOT_FOUND"
+                    ]
+                    if failed_urls:
+                        fallback_result = batch_download_cnki(
+                            failed_urls,
+                            save_dir=dl_dir,
+                            file_format=fallback_format,
+                            _driver=reuse_driver,
+                        )
+                        dl_result = _merge_fallback_download(dl_result, fallback_result)
+                if not getattr(args, "download_no_report", False):
+                    dl_result = attach_download_report(
+                        dl_result,
+                        save_dir=dl_dir,
+                        session_papers=dl_papers,
+                        requested_urls=dl_urls,
+                        citation_style=getattr(args, "download_citation_style", "gbt7714") or "gbt7714",
+                        file_format=dl_format,
+                        report_output=getattr(args, "download_report_output", None),
+                    )
                 reuse_driver = None
                 search_output["download"] = dl_result
             else:
@@ -375,10 +409,177 @@ def cmd_download(args):
 
 # ── batch-download 命令 ──────────────────────────────
 
+def _download_report_path(save_dir: str, report_output: Optional[str] = None) -> str:
+    if report_output:
+        return report_output
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    return str(Path(save_dir) / f"download_report_{stamp}.md")
+
+
+def _paper_lookup_by_url(papers: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for paper in papers:
+        if isinstance(paper, dict) and paper.get("url"):
+            lookup[paper["url"]] = paper
+    return lookup
+
+
+def _download_item_to_paper(item: Dict[str, Any], lookup: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    paper = dict(lookup.get(item.get("url", ""), {}))
+    for key in ("url", "title"):
+        if item.get(key) and not paper.get(key):
+            paper[key] = item[key]
+    if not paper.get("title"):
+        paper["title"] = item.get("filename") or item.get("url") or "未获取题名"
+    return paper
+
+
+def build_download_report(
+    result: Dict[str, Any],
+    session_papers: Optional[List[Dict[str, Any]]] = None,
+    requested_urls: Optional[List[str]] = None,
+    citation_style: str = "gbt7714",
+    file_format: str = "pdf",
+) -> Dict[str, Any]:
+    lookup = _paper_lookup_by_url(session_papers or [])
+    ok_items = result.get("results") or []
+    error_items = result.get("errors") or []
+    if not error_items and result.get("status") == "error" and requested_urls:
+        ok_urls = {item.get("url") for item in ok_items if isinstance(item, dict)}
+        error_items = [
+            {
+                "url": url,
+                "code": result.get("code"),
+                "error": result.get("message") or result.get("code") or "下载失败",
+            }
+            for url in requested_urls if url not in ok_urls
+        ]
+
+    downloaded = [_download_item_to_paper(item, lookup) for item in ok_items if isinstance(item, dict)]
+    failed = [_download_item_to_paper(item, lookup) for item in error_items if isinstance(item, dict)]
+
+    downloaded_refs = generate_reference_list(downloaded, citation_style).splitlines() if downloaded else []
+    failed_refs = generate_reference_list(failed, citation_style).splitlines() if failed else []
+
+    lines = [
+        "# 文献下载清单",
+        "",
+        f"- 请求格式: {file_format.upper()}",
+        f"- 引用格式: {citation_style.upper()}",
+        f"- 已下载: {len(downloaded)}",
+        f"- 未下载: {len(failed)}",
+        "",
+        "## 已下载",
+        "",
+    ]
+    if downloaded_refs:
+        for idx, ref in enumerate(downloaded_refs):
+            item = ok_items[idx] if idx < len(ok_items) and isinstance(ok_items[idx], dict) else {}
+            actual_format = item.get("format") or file_format
+            requested = item.get("requested_format") or file_format
+            filename = item.get("filename")
+            suffix_parts = [f"格式：{actual_format.upper()}"]
+            if actual_format != requested or item.get("fallback_used"):
+                suffix_parts.append(f"由 {requested.upper()} 降级")
+            if filename:
+                suffix_parts.append(f"文件：{filename}")
+            lines.append(f"{ref}（{'；'.join(suffix_parts)}）")
+    else:
+        lines.append("无")
+
+    lines.extend(["", "## 未下载", ""])
+    if failed_refs:
+        for idx, ref in enumerate(failed_refs):
+            item = error_items[idx] if idx < len(error_items) and isinstance(error_items[idx], dict) else {}
+            reason = item.get("error") or item.get("message") or item.get("code") or "未获取失败原因"
+            lines.append(f"{ref}（原因：{reason}）")
+    else:
+        lines.append("无")
+
+    return {
+        "citation_style": citation_style,
+        "file_format": file_format,
+        "downloaded_references": downloaded_refs,
+        "failed_references": failed_refs,
+        "markdown": "\n".join(lines).rstrip() + "\n",
+    }
+
+
+def attach_download_report(
+    result: Dict[str, Any],
+    save_dir: str,
+    session_papers: Optional[List[Dict[str, Any]]] = None,
+    requested_urls: Optional[List[str]] = None,
+    citation_style: str = "gbt7714",
+    file_format: str = "pdf",
+    report_output: Optional[str] = None,
+) -> Dict[str, Any]:
+    report = build_download_report(
+        result,
+        session_papers=session_papers,
+        requested_urls=requested_urls,
+        citation_style=citation_style,
+        file_format=file_format,
+    )
+    output_path = _download_report_path(save_dir, report_output)
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(output_path).write_text(report["markdown"], encoding="utf-8")
+    enriched = dict(result)
+    enriched["download_report"] = {
+        "path": output_path,
+        "citation_style": report["citation_style"],
+        "file_format": report["file_format"],
+        "downloaded_references": report["downloaded_references"],
+        "failed_references": report["failed_references"],
+    }
+    return enriched
+
+
+def _merge_fallback_download(primary: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(primary)
+    primary_results = list(primary.get("results") or [])
+    fallback_results = list(fallback.get("results") or [])
+    fallback_urls = {item.get("url") for item in fallback_results if isinstance(item, dict)}
+    primary_requested_format = primary.get("requested_format")
+
+    for item in fallback_results:
+        if isinstance(item, dict):
+            item = dict(item)
+            if primary_requested_format:
+                item["requested_format"] = primary_requested_format
+            item["fallback_used"] = True
+            primary_results.append(item)
+
+    remaining_errors = [
+        err for err in (primary.get("errors") or [])
+        if not isinstance(err, dict) or err.get("url") not in fallback_urls
+    ]
+    remaining_errors.extend(fallback.get("errors") or [])
+
+    merged["results"] = primary_results
+    merged["errors"] = remaining_errors or None
+    merged["count"] = len(primary_results)
+    if remaining_errors and primary_results:
+        merged["status"] = "partial"
+    elif remaining_errors:
+        merged["status"] = "error"
+        merged["code"] = primary.get("code") or fallback.get("code") or "CNKI_BATCH_DOWNLOAD_FAILED"
+    else:
+        merged["status"] = "success"
+        merged.pop("code", None)
+    merged["fallback"] = {
+        "attempted": bool(fallback_results or fallback.get("errors")),
+        "status": fallback.get("status"),
+        "format": fallback.get("requested_format"),
+        "count": len(fallback_results),
+    }
+    return merged
+
 def cmd_batch_download(args):
     """批量下载：浏览器只启动一次，多标签页并行下载"""
     from config import get as cfg_get
     urls = list(args.urls) if args.urls else []
+    session_data: List[Dict[str, Any]] = []
 
     if args.from_session:
         session_data = _load_session(_session_project(args))
@@ -402,6 +603,31 @@ def cmd_batch_download(args):
         save_dir=save_dir,
         file_format=args.file_format or "pdf",
     )
+    fallback_format = getattr(args, "fallback_format", None)
+    if fallback_format:
+        failed_urls = [
+            err.get("url") for err in (result.get("errors") or [])
+            if isinstance(err, dict)
+            and err.get("url")
+            and err.get("code") == "DOWNLOAD_BTN_NOT_FOUND"
+        ]
+        if failed_urls:
+            fallback_result = batch_download_cnki(
+                urls=failed_urls,
+                save_dir=save_dir,
+                file_format=fallback_format,
+            )
+            result = _merge_fallback_download(result, fallback_result)
+    if not getattr(args, "no_report", False):
+        result = attach_download_report(
+            result,
+            save_dir=save_dir,
+            session_papers=session_data,
+            requested_urls=urls,
+            citation_style=getattr(args, "citation_style", "gbt7714") or "gbt7714",
+            file_format=args.file_format or "pdf",
+            report_output=getattr(args, "report_output", None),
+        )
     _output(result)
 
 
@@ -2790,6 +3016,16 @@ def main():
                           help="下载目录（配合 --download，默认 ./papers）")
     p_search.add_argument("--download-top-n", type=int, default=None,
                           help="下载前 N 篇（配合 --download，默认全部）")
+    p_search.add_argument("--download-file-format", choices=["pdf", "caj"], default="pdf",
+                          help="下载文件格式（配合 --download，默认 pdf）")
+    p_search.add_argument("--download-fallback-format", choices=["caj"], default=None,
+                          help="主格式失败时的兜底格式；例如 PDF 按钮不存在时尝试 CAJ")
+    p_search.add_argument("--download-citation-style", choices=CITATION_STYLE_CHOICES,
+                          default="gbt7714", help="下载清单引用格式（配合 --download）")
+    p_search.add_argument("--download-report-output",
+                          help="下载清单输出路径（配合 --download，默认写入下载目录）")
+    p_search.add_argument("--download-no-report", action="store_true",
+                          help="不生成下载清单（配合 --download）")
     p_search.add_argument("--enrich", type=int, default=0, metavar="N",
                           help="自动补全前 N 篇知网论文的卷期页码（需访问详情页）")
     p_search.add_argument("--cite-enrich", type=int, default=0, metavar="N",
@@ -2815,7 +3051,8 @@ def main():
     # export
     p_export = sub.add_parser("export", help="导出上次搜索结果")
     p_export.add_argument("--format", dest="export_format", required=True,
-                          choices=["bibtex", "ris", "markdown", "json", "excel", "gbt7714", "footnote", "apa"])
+                          choices=["bibtex", "ris", "markdown", "json", "excel",
+                                   "gbt7714", "footnote", "apa", "mla", "chicago"])
     p_export.add_argument("--output", help="输出文件路径")
     p_export.add_argument("--raw", action="store_true", help="输出纯文本而非 JSON")
     p_export.add_argument("--project", help="课题文献库名称")
@@ -2834,7 +3071,7 @@ def main():
     # cite
     p_cite = sub.add_parser("cite", help="生成引用格式")
     p_cite.add_argument("--style", default="gbt7714",
-                        choices=["gbt7714", "gb", "footnote", "apa"])
+                        choices=CITATION_STYLE_CHOICES)
     p_cite.add_argument("--raw", action="store_true", help="输出纯文本而非 JSON")
     p_cite.add_argument("--project", help="课题文献库名称")
     p_cite.set_defaults(func=cmd_cite)
@@ -2902,6 +3139,12 @@ def main():
     p_bdl.add_argument("--top-n", type=int, help="配合 --from-session，只下载前 N 篇")
     p_bdl.add_argument("--dir", default="./papers", help="保存目录")
     p_bdl.add_argument("--file-format", choices=["pdf", "caj"], default="pdf")
+    p_bdl.add_argument("--fallback-format", choices=["caj"], default=None,
+                       help="主格式失败时的兜底格式；例如 PDF 按钮不存在时尝试 CAJ")
+    p_bdl.add_argument("--citation-style", choices=CITATION_STYLE_CHOICES,
+                       default="gbt7714", help="下载清单引用格式")
+    p_bdl.add_argument("--report-output", help="下载清单输出路径（默认写入下载目录）")
+    p_bdl.add_argument("--no-report", action="store_true", help="不生成下载清单")
     p_bdl.add_argument("--project", help="课题文献库名称；配合 --from-session 使用")
     p_bdl.set_defaults(func=cmd_batch_download)
 
@@ -2963,7 +3206,7 @@ def main():
     p_write.add_argument("--section", help="只生成指定章节，如 研究背景、研究不足、某个主题聚类名称")
     p_write.add_argument("--output", help="输出文件路径")
     p_write.add_argument("--with-citations", action="store_true", help="附加参考文献列表")
-    p_write.add_argument("--citation-style", default="gbt7714", choices=["gbt7714", "gb", "footnote", "apa"])
+    p_write.add_argument("--citation-style", default="gbt7714", choices=CITATION_STYLE_CHOICES)
     p_write.add_argument("--validate", action="store_true", help="同时输出写作证据质量校验报告")
     p_write.add_argument("--raw", action="store_true", help="直接输出 Markdown 文本")
     p_write.set_defaults(func=cmd_write)
