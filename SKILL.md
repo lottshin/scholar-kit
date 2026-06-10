@@ -1,9 +1,9 @@
 ---
 name: scholar-kit
-version: 1.12.2
+version: 1.13.0
 description: >-
   Search, download, and manage academic papers from CNKI (知网), OpenAlex,
-  Semantic Scholar, arXiv, and NSSD; enriches metadata via Crossref and
+  Semantic Scholar, arXiv, NSSD, DBLP, and BASE; enriches metadata via Crossref and
   resolves OA links via Unpaywall. Generates citations
   (GB/T 7714, BibTeX, RIS, APA), writes literature reviews, suggests
   inline references, analyzes citation networks, and generates research trend reports.
@@ -73,7 +73,7 @@ network_access = true
 
 `check --fix` 会自动将此配置写入 `.codex/config.toml` 和 `~/.codex/config.toml`。
 
-仅使用 API 源（OpenAlex/S2/arXiv/NSSD）时不需要提权，直接 `--source openalex` 即可。
+仅使用 API 源（OpenAlex/S2/arXiv/NSSD/DBLP/BASE）时不需要提权，直接 `--source openalex` 即可。
 
 ## 前置条件
 
@@ -129,7 +129,7 @@ python scripts/literature.py check --fix
 
 - `python-docx` / `openpyxl` 失败只影响 Word/Excel 功能，不影响搜索、引用、下载；需要时降级输出 Markdown/JSON。
 - `selenium`、浏览器、驱动、知网连通性失败只影响 CNKI 自动化；若用户任务不是 CNKI 专属，可用 API 源继续。
-- `api_sources: true` 时，OpenAlex/Semantic Scholar/arXiv/NSSD 相关搜索不应因 CNKI 检查失败而中止。
+- `api_sources: true` 时，OpenAlex/Semantic Scholar/arXiv/NSSD/DBLP/BASE 相关搜索不应因 CNKI 检查失败而中止。
 
 - `update.update_available: true` → 提示用户"有新版本可用，在 skill 目录执行 `git pull` 更新"（该字段仅在版本检测成功时存在，缺失时忽略）
 
@@ -168,7 +168,7 @@ python scripts/literature.py check --fix
 |----------|--------------------|--------------------|
 | 搜索（单关键词） | `search "词"` | `search "词" --source openalex` |
 | 搜索（多关键词） | `batch-search "词1" "词2"` | 逐组 `search --source openalex --append` |
-| 按作者/期刊搜 | `search --author / --journal` | 同上加 `--source` |
+| 按作者/期刊搜 | `search --author / --journal` | 同上加 `--source`（DBLP 适合计算机领域作者搜索） |
 | 核心期刊 | 加 `--core`（读 [core-journals.md](references/core-journals.md)） | API 源无核心期刊筛选 |
 | 写综述 / 引用建议 | 读 [工作流](references/workflows.md#写文献综述) | 同左，搜索用 API 源 |
 | 改写 / 插引用 | 读 [工作流](references/workflows.md#改写论文并生成-word内容大改) | 同左 |
@@ -225,7 +225,7 @@ python scripts/literature.py check --fix
 
 | 命令 | 用途 | 关键参数 |
 |------|------|----------|
-| `search "词"` | 单关键词搜索 | `--source` `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--limit` `--cite-enrich` `--export` `--output` `--download` `--download-dir` `--download-top-n` `--append` `--project` |
+| `search "词"` | 单关键词搜索 | `--source` (cnki/openalex/semantic/arxiv/nssd/dblp/base/all) `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--limit` `--cite-enrich` `--export` `--output` `--download` `--download-dir` `--download-top-n` `--append` `--project` `--author-filter` `--journal-filter` `--field-of-study` `--page` `--enable-fallback` `--async-search` |
 | `batch-search "词1" "词2"` | 多关键词搜索 | `--query-file` `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--export` `--output` `--append` `--project` |
 | `read-detail` | 获取摘要/全文（CNKI 论文，含硕博论文） | `--top-n` `--indices` `--fulltext` `--project` |
 | `read-paper "file"` | 读取用户论文 | `--output` `--raw` |
@@ -246,6 +246,7 @@ python scripts/literature.py check --fix
 | `citations "DOI/URL"` | 引文网络分析 | `--direction citing/cited/both` `--limit` |
 | `trends` | 研究趋势分析（基于会话） | `--project` |
 | `review` | 生成可追溯综述材料 | `--project` `--topic` `--limit` `--output` `--auto-detail` `--detail-top-n` `--cluster` `--gaps` `--raw` |
+| `workflows` | 列出或执行预定义工作流 | `--list` `--execute` `--variables` `--dry-run` |
 | `check` | 环境自检 | `--fix`（自动修复） |
 | `clean-cache` | 清理过期缓存 | `--all` `--dry-run` |
 
@@ -258,6 +259,14 @@ Agent 负责将用户意图翻译为选项名，详见 [核心期刊知识](refe
 `--sort`：排序方式，可选 `relevance`（相关度，默认）/ `date`（时间）/ `citations`（被引次数）/ `quality`（质量评分）。
 - `citations` 和 `date` 排序在 OpenAlex 和 Semantic Scholar 中通过 API 参数实现，效率更高
 - `quality` 排序基于多维度评分（摘要完整性、DOI、被引、关键词、开放获取、数据源可靠性、年份新近性），适合快速筛选高质量论文
+
+`--author-filter`：作者过滤（仅 API 源），例如 `--author-filter "Hinton"`。OpenAlex 使用 API 级别过滤，Semantic Scholar 使用客户端过滤。
+
+`--journal-filter`：期刊过滤（仅 API 源），例如 `--journal-filter "Nature"`。所有 API 源使用客户端过滤（大小写不敏感的子串匹配）。
+
+`--field-of-study`：学科领域过滤（仅 API 源），例如 `--field-of-study "Computer Vision"`。OpenAlex 使用 API 级别过滤，Semantic Scholar 使用客户端过滤。
+
+`--page`：分页参数（仅 API 源），默认第 1 页。支持 OpenAlex、Semantic Scholar、arXiv。每页结果单独缓存，适合浏览大量结果。
 - arXiv 不支持按被引排序（`cited_by` 始终为 0），混合数据源时建议用 `relevance` 或 `quality`
 
 `--source all` 时自动去重：基于 DOI 精确匹配和标题标准化匹配，保留第一个出现的版本。
@@ -384,6 +393,7 @@ Agent 的职责是从用户自然语言中提取作者/期刊名/文献类型/�
 按需读取，不要预加载：
 
 - [工作流详解](references/workflows.md) — 执行具体任务（综述、引用、优化等）时读取对应章节
+- [API 源检索最佳实践](references/api-search-best-practices.md) — 使用 API 源高级过滤、分页和质量排序时读取
 - [核心期刊知识](references/core-journals.md) — Agent 决策 `--core` 参数时读取
 - [错误码对照表](references/error-codes.md) — 脚本报错时读取
 - [Windows/中文环境约束与故障排查](references/environment.md) — 遇到编码/超时/连接问题时读取
