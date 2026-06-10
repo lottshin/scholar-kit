@@ -1,6 +1,5 @@
 ---
 name: scholar-kit
-version: 1.13.0
 description: >-
   Search, download, and manage academic papers from CNKI (知网), OpenAlex,
   Semantic Scholar, arXiv, NSSD, DBLP, and BASE; enriches metadata via Crossref and
@@ -13,10 +12,12 @@ description: >-
   学术表达优化/论文改写/提升原创性, 查重/降重/降低重复率/重复率,
   知网/CNKI, 批量导出/计量分析, or 导出BibTeX/RIS.
   DO NOT USE for general web search, non-academic content, or code documentation lookup.
-compatibility:
-  platform: any
-  python: ">=3.9"
-  os: windows, macos, linux
+metadata:
+  version: 1.13.0
+  compatibility:
+    platform: any
+    python: ">=3.9"
+    os: windows, macos, linux
 ---
 
 # Scholar Kit
@@ -46,7 +47,7 @@ compatibility:
 **使用**：用户要搜论文、下论文、写综述、加引用、选题分析、格式化参考文献、优化论文表达、引文追踪、研究趋势分析、文献对比、阅读笔记
 **不使用**：通用网页搜索、非学术内容、代码文档查找、翻译（无文献检索需求时）
 
-## ⚠ 沙盒环境（Codex / Cursor / Claude Code）
+## ⚠ 沙盒环境（Codex / Cursor / Claude Code / Gemini CLI / 本地 Agent）
 
 知网功能需要 Selenium 浏览器自动化 → 需要 msedgedriver → 首次运行需联网下载驱动（~8MB）。沙盒默认可能禁网，但**所有主流平台都支持运行时提权**。
 
@@ -60,7 +61,10 @@ compatibility:
 |------|---------|
 | **Codex** | 在 `~/.codex/config.toml` 或项目本地未跟踪的 `.codex/config.toml` 中配置 `network_access = true`；也可运行 `check --fix` 生成本地配置。Codex 会在联网时弹窗让用户确认；不要将 `.codex/` 提交到仓库 |
 | **Cursor** | Shell 工具加 `required_permissions: ["all"]` |
-| **Claude Code (子 agent)** | Bash/PowerShell 工具调用时添加 `dangerouslyDisableSandbox: true`（需要网络的命令：`check`、`search --source cnki`、`batch-search`、`download`、`batch-download`、`read-detail`）。**遇到 Exit code 49 表示权限被拒绝，必须添加此参数** |
+| **Claude Code（交互式）** | 用 `/permissions`、`permissions.allow/ask/deny` 或合适的 permission mode 批准 Bash/PowerShell、WebFetch、浏览器/网络相关命令；启用 Bash sandbox 时可用 `/sandbox` 配置允许域名、路径和是否允许失败后转普通权限流 |
+| **Claude Code（子 agent/SDK）** | Bash/PowerShell 工具调用时添加 `dangerouslyDisableSandbox: true`（需要网络的命令：`check`、`search --source cnki`、`batch-search`、`download`、`batch-download`、`read-detail`）。**遇到 Exit code 49 表示权限被拒绝，必须添加此参数** |
+| **Gemini CLI** | 若启用 `--sandbox` / `-s`、`GEMINI_SANDBOX` 或 `settings.json` 的 sandbox 配置，遇到网络/路径限制时批准 Sandbox Expansion Request，或调整 sandbox profile、`SANDBOX_MOUNTS`、代理、`security.toolSandboxing` 后重启 Gemini CLI；浏览器自动化在容器/系统沙箱中可能不可用，需改用有 GUI 和网络权限的本机会话 |
+| **其他本地 Agent** | 按该平台的 allowlist、approval、sandbox expansion、unsandboxed retry 或提权参数重跑 `retry_command`，并携带 `recommended_env`；没有提权机制时，明确要求用户在有网络和浏览器权限的本地终端执行，不要静默回退 API 源 |
 
 Codex 本地配置示例（不要提交到仓库）：
 ```toml
@@ -395,12 +399,16 @@ Agent 的职责是从用户自然语言中提取作者/期刊名/文献类型/�
   - 根本解法是**启用网络权限 + 提权运行**：
   - **Codex**：`check --fix` 会自动写入项目本地未跟踪的 `.codex/config.toml` 或用户级 `~/.codex/config.toml`（`[sandbox_workspace_write] network_access = true`），配合 `approval_policy = "on-request"` 让 Codex 在联网时弹窗授权；不要将 `.codex/` 提交到仓库
   - **Cursor**：所有知网命令加 `required_permissions: ["all"]`
-  - **Claude Code (子 agent)**：所有知网命令的 Bash/PowerShell 工具调用必须加 `dangerouslyDisableSandbox: true`
+  - **Claude Code（交互式）**：用 `/permissions` 或 `/sandbox` 批准 Bash/PowerShell、WebFetch、网络域名和必要路径；命令因 sandbox 限制失败时，允许其走普通权限流或按平台提示批准 unsandboxed retry
+  - **Claude Code（子 agent/SDK）**：所有知网命令的 Bash/PowerShell 工具调用必须加 `dangerouslyDisableSandbox: true`
+  - **Gemini CLI**：批准 Sandbox Expansion Request，或调整 `GEMINI_SANDBOX`、sandbox 配置、`SANDBOX_MOUNTS`、代理、`security.toolSandboxing` 后重启；若 GUI 浏览器无法在沙箱内启动，改用有 GUI 和网络权限的本机会话
+  - **其他本地 Agent**：用本平台的 allowlist、approval、sandbox expansion、unsandboxed retry 或提权参数重跑 `retry_command`
   - **绝对不要**因为 `sandbox_blocked`、`driver_ok: false` 或 `needs_escalation: true` 就放弃知网、回退 API 源。正确做法是按 `retry_command` 和平台提权机制重试
 
 ### 常见错误码
 
 - **Exit code 49**：Claude Code 子 agent 权限拒绝，需在 Bash/PowerShell 工具调用时添加 `dangerouslyDisableSandbox: true`
+- **Gemini CLI sandbox denial / Operation not permitted**：批准 Sandbox Expansion Request，或调整 sandbox profile、挂载、代理、tool sandboxing 后重试；浏览器自动化失败时切换到有 GUI 权限的本机会话
 - **Exit code 127**：命令未找到，需按 [Python 解释器发现](#python-解释器发现) 流程重新解析 Python 命令（Windows 优先用 `py -3`）
 
 ## 参考文档
