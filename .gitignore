@@ -15,6 +15,8 @@ build/
 # IDE
 .vscode/
 .idea/
+.codex/
+.claude/
 *.swp
 *.swo
 
@@ -28,7 +30,9 @@ scripts/_batch_urls.txt
 scripts/_parse_search.py
 
 # Test artifacts
+.pytest_cache/
 _test_*.py
+cc-option-smoke.txt
 scripts/test_papers/
 *.tmp
 *.bak

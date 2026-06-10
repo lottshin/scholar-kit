@@ -1,12 +1,12 @@
 # Scholar Kit
 
-学术文献检索与科研辅助 AI Skill。支持知网（CNKI）、OpenAlex、Semantic Scholar、arXiv、NSSD 五个检索源，通过 Crossref 补全元数据、Unpaywall 解析 OA 下载链接。
+学术文献检索与科研辅助 AI Skill。支持知网（CNKI）、OpenAlex、Semantic Scholar、arXiv、NSSD、DBLP、BASE 七个检索源，通过 Crossref 补全元数据、Unpaywall 解析 OA 下载链接。
 
 ## Features
 
 ### 文献检索
 
-支持知网、OpenAlex、Semantic Scholar、arXiv、NSSD 五个数据源。知网侧支持核心期刊筛选（北大核心、CSSCI、CSCD 等）、文献类型筛选（硕士/博士/期刊/会议/报纸）、搜索字段指定（主题/篇名/关键词/摘要/全文/作者/来源）、按作者/期刊/年份的高级搜索、多关键词批量搜索。`--enrich N` 参数可在搜索后自动补全前 N 篇论文的卷期页码。搜索结果 30 分钟内缓存复用，避免重复启动浏览器。API 数据源基于标准库 urllib 即可运行，不依赖知网环境。
+支持知网、OpenAlex、Semantic Scholar、arXiv、NSSD、DBLP、BASE 七个数据源。知网侧支持核心期刊筛选（北大核心、CSSCI、CSCD 等）、文献类型筛选（硕士/博士/期刊/会议/报纸）、搜索字段指定（主题/篇名/关键词/摘要/全文/作者/来源）、按作者/期刊/年份的高级搜索、多关键词批量搜索。API 源支持作者、期刊、学科、分页过滤，`--enable-fallback` 可在单一 API 源无结果时自动切换备用源，`--async-search --source all` 可并发检索多源。`--enrich N` 参数可在搜索后自动补全前 N 篇论文的卷期页码。搜索结果缓存复用，避免重复启动浏览器或重复请求 API。API 数据源基于标准库 urllib 即可运行，不依赖知网环境。
 
 ### 论文下载
 
@@ -161,6 +161,7 @@ scholar-kit/
 │   ├── core-journals.md
 │   ├── error-codes.md
 │   ├── environment.md
+│   ├── api-search-best-practices.md
 │   └── workflows.md
 └── scripts/              ← Python 脚本
     ├── literature.py     ← 统一 CLI 入口
@@ -168,6 +169,8 @@ scholar-kit/
     ├── config.py
     ├── formatter.py
     ├── search.py
+    ├── search_async.py
+    ├── workflows.py
     └── cnki/             ← 知网模块
 ```
 

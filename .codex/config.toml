@@ -1,9 +1,0 @@
-# Scholar Kit - Codex 沙盒配置
-# 知网检索需要 Selenium 浏览器自动化，需联网下载驱动并访问 cnki.net。
-# 此配置启用网络访问，Codex 会在首次联网时弹窗让用户确认。
-
-approval_policy = "on-request"
-sandbox_mode = "workspace-write"
-
-[sandbox_workspace_write]
-network_access = true
