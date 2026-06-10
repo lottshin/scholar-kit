@@ -114,7 +114,7 @@ Agent 应自动识别 Scholar Kit 并执行。
 |------|------|
 | Python | 3.9+ |
 | 浏览器 | Edge 或 Chrome（知网功能需要） |
-| 网络 | 知网需校园网或 VPN |
+| 网络 | 知网需校园网、机构 VPN，或学校支持的 CARSI/校外统一认证 |
 | Selenium | 4.10+（自动管理 WebDriver，无需手动下载） |
 | httpx | 可选（未安装时 HTTP 请求走标准库 urllib 兜底） |
 
@@ -141,7 +141,9 @@ Agent 应自动识别 Scholar Kit 并执行。
 
 ## Platform Notes
 
-- **知网功能**需要本地桌面浏览器（Edge/Chrome）+ 校园网/VPN，沙箱环境中需具备这两个条件才可用
+- **知网功能**需要本地桌面浏览器（Edge/Chrome）+ 合法机构访问权限（校园网、机构 VPN，或学校支持的 CARSI/校外统一认证），沙箱环境中需具备这些条件才可用
+- **校外访问知网**可运行 `auth-cnki` 预热会话：默认打开 CNKI FSSO，也可用 `--auth-url` 传学校图书馆、VPN 或 CARSI 入口；`--institution` 可选，不传时由用户在浏览器中手动选择机构。登录成功后会复用 `.scholar-kit/browser-profile` 和 cookies，通常同一项目/会话无需反复登录。
+- **代理/梯子软件**（Clash、Mihomo、Surge、Quantumult X、系统 PAC 等）需要让 CNKI、CARSI 和学校认证域名直连。脚本会给浏览器注入 `proxy-bypass-list`，但 TUN/全局接管模式仍需在代理软件中配置 DIRECT 规则；可用 `--direct-domain` 或 `SCHOLAR_CNKI_DIRECT_DOMAINS` 追加学校认证域名。
 - **其他功能**（API 搜索、引用生成、Word 文档处理、引文网络、趋势分析）在所有平台均可用
 - `check` 命令返回 `capabilities` 字段，Agent 据此自动选择可用的数据源
 

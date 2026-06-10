@@ -54,7 +54,7 @@ from search import (  # noqa: E402
 from cnki import (  # noqa: E402
     search_cnki, batch_search_cnki, batch_read_detail,
     get_detail, download_cnki, batch_download_cnki,
-    parse_cnki_export, check_cnki_access,
+    parse_cnki_export, check_cnki_access, authenticate_cnki,
 )
 from formatter import export_papers, generate_reference_list, citation_preview  # noqa: E402
 
@@ -604,6 +604,23 @@ def cmd_detail(args):
         _output({"status": "error", "code": "NO_URL", "message": "请提供知网论文详情页 URL"})
         return
     result = get_detail(args.url)
+    _output(result)
+
+
+# ── auth-cnki 命令 ────────────────────────────────────
+
+def cmd_auth_cnki(args):
+    result = authenticate_cnki(
+        auth_url=args.auth_url,
+        verify_url=args.verify_url,
+        institution=args.institution,
+        wait_seconds=args.wait_seconds,
+        captcha_timeout=args.captcha_timeout,
+        direct_domains=args.direct_domain,
+        debug_snapshot=args.debug_snapshot,
+        keep_browser=args.keep_browser,
+        force=args.force,
+    )
     _output(result)
 
 
@@ -3265,6 +3282,28 @@ def main():
     p_detail = sub.add_parser("detail", help="获取知网论文详情")
     p_detail.add_argument("url", help="知网论文详情页 URL")
     p_detail.set_defaults(func=cmd_detail)
+
+    # auth-cnki
+    p_auth = sub.add_parser("auth-cnki", help="打开知网校外认证入口并保存浏览器会话")
+    p_auth.add_argument("--auth-url", default="https://fsso.cnki.net/",
+                        help="校外认证入口 URL，默认 CNKI FSSO；也可传学校图书馆/VPN/CARSI 入口")
+    p_auth.add_argument("--verify-url", default="https://kns.cnki.net/",
+                        help="登录后用于确认访问的知网页面，默认 https://kns.cnki.net/")
+    p_auth.add_argument("--institution",
+                        help="学校/机构名称；传入后尝试在 FSSO 页面自动选择，不传则由用户手动选择")
+    p_auth.add_argument("--wait-seconds", type=int, default=180,
+                        help="等待用户完成登录/扫码/短信/滑块验证的秒数，默认 180")
+    p_auth.add_argument("--captcha-timeout", type=int, default=180,
+                        help="等待知网安全验证完成的秒数，设为 0 可跳过等待")
+    p_auth.add_argument("--direct-domain", action="append", default=[],
+                        help="追加需要直连的学校认证/VPN 域名，可重复传入，如 --direct-domain idp.xxx.edu.cn")
+    p_auth.add_argument("--debug-snapshot", nargs="?", const=".scholar-kit/cnki-auth-snapshot.html",
+                        help="保存认证后页面 HTML 快照；可选指定输出路径")
+    p_auth.add_argument("--keep-browser", action="store_true",
+                        help="完成后保留浏览器窗口，便于用户继续登录或手动检查")
+    p_auth.add_argument("--force", action="store_true",
+                        help="即使检测到已有机构会话，也重新打开认证入口")
+    p_auth.set_defaults(func=cmd_auth_cnki)
 
     # export
     p_export = sub.add_parser("export", help="导出上次搜索结果")

@@ -230,6 +230,7 @@ python scripts/literature.py check --fix
 | `read-detail` | 获取摘要/全文（CNKI 论文，含硕博论文） | `--top-n` `--indices` `--fulltext` `--project` |
 | `read-paper "file"` | 读取用户论文 | `--output` `--raw` |
 | `detail "url"` | 单篇详情 | |
+| `auth-cnki` | 校外认证/会话预热 | `--auth-url` `--verify-url` `--institution` `--wait-seconds` `--captcha-timeout` `--direct-domain` `--keep-browser` `--force` |
 | `download [url]` | 单篇下载 | `--dir` `--doi` `--file-format` |
 | `batch-download [url1 url2 ...]` | 批量下载（推荐） | `--from-session` `--top-n` `--dir` `--file-format` `--project` |
 | `export` | 导出文献列表 | `--format` `--output` `--raw` `--project` |
@@ -314,6 +315,15 @@ Agent 的职责是从用户自然语言中提取作者/期刊名/文献类型/�
 - "帮我搜20篇XX的论文并下载" → `search "XX" --pages 2 --download --download-top-n 20`
 - "搜几篇关于XX的核心期刊论文下载下来" → `search "XX" --core CSSCI --download`
 - 仅当用户需要先看结果再决定下载哪些时，才用两步走：`search` → `batch-download --from-session`
+
+### 校外访问知网
+
+用户在校外、VPN/CARSI/学校统一认证环境下要使用知网时，优先运行 `auth-cnki` 预热会话，而不是让用户自己猜浏览器状态：
+- 不绑定具体学校。`--auth-url` 可传 CNKI FSSO、学校图书馆入口、VPN 入口或 CARSI 入口；`--institution` 可选，用于在 FSSO 页面自动选择机构，不传则让用户手动选择
+- 运行前向用户明示：浏览器会打开；需要手动登录、扫码、短信、滑块等验证；不要关闭浏览器窗口；脚本会等待并自动保存 cookies/profile
+- 如果用户使用 Clash/Mihomo/Surge/Quantumult X/PAC/系统代理等，询问或识别需要直连的学校认证域名，用 `--direct-domain` 传入；脚本会追加 CNKI/CARSI 直连域名，但 TUN/全局接管仍需要用户在代理软件里配置 DIRECT 规则
+- 如果 `auth-cnki` 返回 `already_authenticated: true` 或 `access_confirmed: true`，同一项目后续 `search` / `read-detail` / `download` 直接复用 `.scholar-kit/browser-profile` 和 cookies，非必要不要重复要求用户登录
+- 如果返回 `warning` 且 `access_confirmed: false`，展示 `diagnostics.page.url/title`，提示用户浏览器可能还停在学校登录页或验证页；可用 `--keep-browser` 保留窗口继续手动处理
 
 ### 歧义处理
 

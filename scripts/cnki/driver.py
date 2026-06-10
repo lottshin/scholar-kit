@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -128,6 +129,60 @@ _VISIBLE_POS = (100, 100)
 
 _DEFAULT_DEBUG_PORT = 9222
 
+_DEFAULT_CNKI_DIRECT_DOMAINS = [
+    "*.cnki.net",
+    "*.cnki.com.cn",
+    "*.cnki.com",
+    "*.carsi.edu.cn",
+    "fsso.cnki.net",
+]
+
+
+def _split_domains(value: str) -> list[str]:
+    if not value:
+        return []
+    return [part.strip() for part in re.split(r"[;,]", value) if part.strip()]
+
+
+def _cnki_proxy_bypass_domains(extra_domains: Optional[list[str]] = None) -> list[str]:
+    """Return CNKI/CARSI domains that should bypass browser-level proxies.
+
+    Users can extend this list with `SCHOLAR_CNKI_DIRECT_DOMAINS`, for example
+    school SSO domains or VPN portal domains. The browser flag helps with
+    system proxy / PAC / Clash rule mode. TUN/global proxy modes may still need
+    native proxy rules outside Scholar Kit.
+    """
+    domains = list(_DEFAULT_CNKI_DIRECT_DOMAINS)
+    domains.extend(_split_domains(os.environ.get("SCHOLAR_CNKI_DIRECT_DOMAINS", "")))
+    for item in extra_domains or []:
+        domains.extend(_split_domains(item))
+
+    seen = set()
+    unique = []
+    for domain in domains:
+        cleaned = domain.strip()
+        if cleaned and cleaned not in seen:
+            unique.append(cleaned)
+            seen.add(cleaned)
+    return unique
+
+
+def _merge_direct_domains(extra_domains: Optional[list[str]]) -> Tuple[Optional[str], list[str]]:
+    previous = os.environ.get("SCHOLAR_CNKI_DIRECT_DOMAINS")
+    merged = _split_domains(previous or "")
+    for domain in extra_domains or []:
+        merged.extend(_split_domains(domain))
+    if merged:
+        os.environ["SCHOLAR_CNKI_DIRECT_DOMAINS"] = ";".join(merged)
+    return previous, _cnki_proxy_bypass_domains()
+
+
+def _restore_direct_domains(previous: Optional[str]) -> None:
+    if previous is None:
+        os.environ.pop("SCHOLAR_CNKI_DIRECT_DOMAINS", None)
+    else:
+        os.environ["SCHOLAR_CNKI_DIRECT_DOMAINS"] = previous
+
 
 def _is_codex_like_env() -> bool:
     """Return true when running under Codex or a Codex-like sandbox wrapper."""
@@ -152,9 +207,33 @@ def _find_browser_exe(browser: str) -> Optional[str]:
         for p in candidates:
             if os.path.isfile(p):
                 return p
-    which_name = "msedge" if browser == "edge" else ("google-chrome" if sys.platform != "win32" else "chrome")
-    found = shutil.which(which_name)
-    return found
+    elif sys.platform == "darwin":
+        candidates = (
+            [
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                str(Path.home() / "Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+            ]
+            if browser == "edge"
+            else [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                str(Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            ]
+        )
+        for p in candidates:
+            if os.path.isfile(p):
+                return p
+
+    names = (
+        ["microsoft-edge", "microsoft-edge-stable", "msedge"]
+        if browser == "edge"
+        else ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"]
+    )
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
 
 
 def _launch_browser_outside_sandbox(browser: str, port: int = _DEFAULT_DEBUG_PORT) -> bool:
@@ -178,6 +257,7 @@ def _launch_browser_outside_sandbox(browser: str, port: int = _DEFAULT_DEBUG_POR
     args = [
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile_dir}",
+        f"--proxy-bypass-list={';'.join(_cnki_proxy_bypass_domains())}",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-blink-features=AutomationControlled",
@@ -217,6 +297,21 @@ def _launch_browser_outside_sandbox(browser: str, port: int = _DEFAULT_DEBUG_POR
                 _log(f"[cnki] ShellExecuteW 返回错误码: {ret}")
         except Exception as e:
             _log(f"[cnki] ShellExecuteW 失败: {e}")
+
+    else:
+        import subprocess
+        try:
+            subprocess.Popen(
+                [exe] + args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+            )
+            _log(f"[cnki] 已在独立会话启动 {browser}，等待调试端口连接")
+            return True
+        except OSError as e:
+            _log(f"[cnki] 独立会话启动 {browser} 失败: {e}")
 
     return False
 
@@ -481,7 +576,7 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
     if headless:
         options.add_argument("--headless=new")
     startup_args = [
-        "--proxy-bypass-list=*.cnki.net;*.cnki.com.cn;*.cnki.com",
+        f"--proxy-bypass-list={';'.join(_cnki_proxy_bypass_domains())}",
         "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
         "--disable-dev-shm-usage",
@@ -614,6 +709,299 @@ def check_cnki_access() -> Tuple[bool, str]:
         return False, f"知网不可访问: {e}"
     except Exception as e:
         return False, f"知网不可访问: {e}"
+
+
+# ── 校外认证 / 会话预热 ────────────────────────────────
+
+def _page_text(driver: "webdriver.Remote") -> str:
+    try:
+        return driver.execute_script(
+            "return (document.body && document.body.innerText || '').substring(0, 5000);"
+        ) or ""
+    except Exception:
+        return ""
+
+
+def _has_cnki_institution_access(driver: "webdriver.Remote", institution: Optional[str] = None) -> bool:
+    text = _page_text(driver)
+    try:
+        title = driver.title or ""
+    except Exception:
+        title = ""
+    try:
+        current_url = driver.current_url or ""
+    except Exception:
+        current_url = ""
+    haystack = text + "\n" + title
+    is_cnki_url = "cnki.net" in current_url.lower()
+    markers = ("机构馆", "机构用户", "机构账号", "机构登录", "IP登录", "IP 登录")
+    if is_cnki_url and any(marker in haystack for marker in markers):
+        return True
+    if institution and institution in haystack and is_cnki_url:
+        return True
+    return False
+
+
+def _auth_diagnostics(driver: "webdriver.Remote") -> dict:
+    text = _page_text(driver)
+    try:
+        current_url = driver.current_url or ""
+    except Exception:
+        current_url = ""
+    try:
+        title = driver.title or ""
+    except Exception:
+        title = ""
+    try:
+        cookies = driver.get_cookies()
+    except Exception:
+        cookies = []
+    return {
+        "page": {
+            "url": current_url,
+            "title": title,
+            "text_preview": text[:500],
+        },
+        "markers": {
+            "institution": _has_cnki_institution_access(driver),
+            "login": any(k in text or k in title for k in ("登录", "统一身份认证", "用户名", "密码", "选择高校")),
+            "security_gate": _is_cnki_security_gate(driver),
+        },
+        "cookies": {
+            "count": len(cookies),
+            "domains": sorted({c.get("domain", "") for c in cookies if c.get("domain")}),
+            "names": sorted({c.get("name", "") for c in cookies if c.get("name")}),
+        },
+    }
+
+
+def _write_debug_snapshot(driver: "webdriver.Remote", output_path: Optional[str]) -> Optional[str]:
+    if not output_path:
+        return None
+    path = Path(output_path)
+    if path.is_dir():
+        path = path / "cnki-auth-snapshot.html"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        html = driver.page_source
+    except Exception:
+        html = ""
+    path.write_text(html, encoding="utf-8")
+    return str(path)
+
+
+def _select_cnki_institution(driver: "webdriver.Remote", institution: Optional[str]) -> bool:
+    """Select a school/institution on CNKI FSSO pages when a name is provided."""
+    if not institution:
+        return False
+    target = institution.strip()
+    if not target:
+        return False
+
+    try:
+        link_snapshot = driver.execute_script("""
+            return Array.from(document.querySelectorAll('a')).map(function(a) {
+                return {text: (a.innerText || a.textContent || '').trim(), href: a.href || ''};
+            });
+        """)
+    except Exception:
+        link_snapshot = []
+
+    candidates = []
+    for link in link_snapshot or []:
+        text = (link.get("text", "") or "").strip()
+        href = link.get("href", "") or ""
+        if not href:
+            continue
+        if text == target:
+            candidates.insert(0, (href, text))
+        elif target in text or (text and text in target):
+            candidates.append((href, text))
+
+    if not candidates:
+        _log(f"[cnki-auth] 未找到机构: {target}。请在浏览器中手动搜索/选择你的学校或机构。")
+        return False
+
+    href, text = candidates[0]
+    _log(f"[cnki-auth] 选择机构: {text} -> {href}")
+    driver.get(href)
+    return True
+
+
+def _wait_for_cnki_auth(
+    driver: "webdriver.Remote",
+    verify_url: str,
+    institution: Optional[str],
+    wait_seconds: int,
+    poll_interval: int = 5,
+) -> bool:
+    """Wait for the user to complete off-campus SSO/CARSI login."""
+    deadline = time.time() + max(wait_seconds, 0)
+    _log("")
+    _log("[cnki-auth] 浏览器已打开，请完成校外认证。")
+    _log("[cnki-auth] 可手动选择学校/机构、输入账号密码、完成短信/扫码/滑块等验证。")
+    _log("[cnki-auth] 请不要关闭浏览器窗口；登录成功后脚本会自动保存会话并继续。")
+    _log(f"[cnki-auth] 最长等待 {wait_seconds} 秒。")
+
+    while time.time() < deadline:
+        try:
+            if _is_cnki_security_gate(driver) or _has_captcha_elements(driver):
+                driver = _show_browser_for_captcha(
+                    driver,
+                    "知网安全验证（如滑块），请在浏览器中完成；完成前请不要关闭窗口。",
+                    poll_timeout=max(30, int(deadline - time.time())),
+                )
+            if _has_cnki_institution_access(driver, institution=institution):
+                _log("[cnki-auth] 已检测到机构权限，保存会话。")
+                return True
+            if verify_url:
+                current_url = driver.current_url or ""
+                if "cnki.net" not in current_url:
+                    # Stay on the user's SSO page until it redirects back.
+                    pass
+        except Exception as e:
+            _log(f"[cnki-auth] 等待认证时浏览器状态异常: {e}")
+            return False
+
+        remaining = int(deadline - time.time())
+        if remaining > 0:
+            _log(f"[cnki-auth] 等待登录完成... 剩余约 {remaining} 秒")
+            time.sleep(min(poll_interval, max(1, remaining)))
+
+    _log("[cnki-auth] 等待超时，将尝试访问验证页并保存当前诊断信息。")
+    try:
+        driver.get(verify_url)
+        time.sleep(1)
+    except Exception:
+        pass
+    return _has_cnki_institution_access(driver, institution=institution)
+
+
+def authenticate_cnki(
+    auth_url: str = "https://fsso.cnki.net/",
+    verify_url: str = "https://kns.cnki.net/",
+    institution: Optional[str] = None,
+    wait_seconds: int = 180,
+    captcha_timeout: int = 180,
+    direct_domains: Optional[list[str]] = None,
+    debug_snapshot: Optional[str] = None,
+    keep_browser: bool = False,
+    force: bool = False,
+) -> dict:
+    """Open CNKI off-campus authentication and persist the browser session.
+
+    The function is intentionally account-agnostic. Users can pass a school name
+    for CNKI FSSO auto-selection, or omit it and complete their institution's
+    portal manually. Cookies and the Chrome/Edge profile are reused by later CNKI
+    commands, so one successful login is normally enough for the current project
+    and at least one agent conversation until the institution session expires.
+    """
+    driver = None
+    previous_direct_domains = None
+    direct_domain_list: list[str] = []
+    try:
+        previous_direct_domains, direct_domain_list = _merge_direct_domains(direct_domains)
+        browser = _detect_browser()
+        driver = _create_driver(browser=browser)
+
+        driver.get("https://kns.cnki.net/")
+        time.sleep(1)
+        _load_cookies(driver)
+        driver.get(verify_url)
+        time.sleep(1)
+        if not force and _has_cnki_institution_access(driver, institution=institution):
+            cookies_saved = bool(_save_cookies(driver) or _cookie_path().exists())
+            return {
+                "status": "success",
+                "auth_url": auth_url,
+                "verify_url": verify_url,
+                "institution": institution,
+                "already_authenticated": True,
+                "access_confirmed": True,
+                "cookies_saved": cookies_saved,
+                "cookie_file": str(_cookie_path()),
+                "profile_dir": str(Path.cwd() / ".scholar-kit" / "browser-profile"),
+                "direct_domains": direct_domain_list,
+                "diagnostics": _auth_diagnostics(driver),
+                "message": "检测到已有知网机构会话，已复用，无需再次登录。",
+            }
+
+        _log(f"[cnki-auth] 打开认证入口: {auth_url}")
+        driver.get(auth_url)
+        selected_institution = _select_cnki_institution(driver, institution)
+        _show_browser(driver)
+
+        access_confirmed = _wait_for_cnki_auth(
+            driver,
+            verify_url=verify_url,
+            institution=institution,
+            wait_seconds=max(int(wait_seconds or 0), 0),
+        )
+
+        _log(f"[cnki-auth] 验证知网访问: {verify_url}")
+        driver.get(verify_url)
+        time.sleep(1)
+        if captcha_timeout > 0 and (_is_cnki_security_gate(driver) or _has_captcha_elements(driver)):
+            driver = _show_browser_for_captcha(
+                driver,
+                "知网安全验证（如滑块），请在浏览器中完成；完成前请不要关闭窗口。",
+                poll_timeout=captcha_timeout,
+            )
+        elif captcha_timeout <= 0:
+            _log("[cnki-auth] 跳过安全验证等待（captcha_timeout=0）")
+
+        access_confirmed = access_confirmed or _has_cnki_institution_access(driver, institution=institution)
+        diagnostics = _auth_diagnostics(driver)
+        cookies_saved = bool(_save_cookies(driver) or _cookie_path().exists())
+        snapshot_file = _write_debug_snapshot(driver, debug_snapshot)
+
+        if not keep_browser and access_confirmed:
+            _hide_browser(driver)
+
+        status = "success" if access_confirmed else "warning"
+        return {
+            "status": status,
+            "auth_url": auth_url,
+            "verify_url": verify_url,
+            "institution": institution,
+            "institution_selected": selected_institution,
+            "already_authenticated": False,
+            "access_confirmed": access_confirmed,
+            "cookies_saved": cookies_saved,
+            "cookie_file": str(_cookie_path()),
+            "profile_dir": str(Path.cwd() / ".scholar-kit" / "browser-profile"),
+            "direct_domains": direct_domain_list,
+            "diagnostics": diagnostics,
+            "debug_snapshot": snapshot_file,
+            "message": (
+                "已保存知网浏览器会话；后续 CNKI 命令会复用该 profile/cookies。"
+                if access_confirmed else
+                "已保存当前浏览器状态，但未确认机构权限；请检查浏览器是否仍停留在学校登录或验证页。"
+            ),
+            "next_step": (
+                "运行 search --source cnki 或 batch-search。"
+                if access_confirmed else
+                "保留浏览器完成登录后重试 auth-cnki，或增加 --wait-seconds / --direct-domain。"
+            ),
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "code": "CNKI_AUTH_FAILED",
+            "message": str(e),
+            "auth_url": auth_url,
+            "verify_url": verify_url,
+            "institution": institution,
+            "captcha_timeout": captcha_timeout,
+            "direct_domains": direct_domain_list,
+        }
+    finally:
+        _restore_direct_domains(previous_direct_domains)
+        if driver is not None and not keep_browser:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 # ── 验证码 / 安全验证页 ─────────────────────────────────

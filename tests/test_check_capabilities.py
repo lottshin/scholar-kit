@@ -55,7 +55,7 @@ def test_project_local_selenium_cache_is_preferred_in_codex(monkeypatch, tmp_pat
 
 
 def test_local_development_version_newer_than_remote_is_not_update(monkeypatch):
-    monkeypatch.setattr(literature, "__version__", "1.12.1")
+    monkeypatch.setattr(literature, "__version__", "1.13.0")
     monkeypatch.setattr(
         literature,
         "_fetch_json",
@@ -66,6 +66,6 @@ def test_local_development_version_newer_than_remote_is_not_update(monkeypatch):
 
     assert update == {
         "update_available": False,
-        "current": "1.12.1",
+        "current": "1.13.0",
         "latest": "1.12.0",
     }
