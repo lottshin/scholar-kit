@@ -58,11 +58,11 @@ compatibility:
 
 | 平台 | 提权方法 |
 |------|---------|
-| **Codex** | 在 `~/.codex/config.toml` 或项目 `.codex/config.toml` 中配置 `network_access = true`（本 skill 已自带正确模板），Codex 会在联网时弹窗让用户确认 |
+| **Codex** | 在 `~/.codex/config.toml` 或项目本地未跟踪的 `.codex/config.toml` 中配置 `network_access = true`；也可运行 `check --fix` 生成本地配置。Codex 会在联网时弹窗让用户确认；不要将 `.codex/` 提交到仓库 |
 | **Cursor** | Shell 工具加 `required_permissions: ["all"]` |
 | **Claude Code (子 agent)** | Bash/PowerShell 工具调用时添加 `dangerouslyDisableSandbox: true`（需要网络的命令：`check`、`search --source cnki`、`batch-search`、`download`、`batch-download`、`read-detail`）。**遇到 Exit code 49 表示权限被拒绝，必须添加此参数** |
 
-Codex 配置模板（本 skill 的 `.codex/config.toml` 已包含）：
+Codex 本地配置示例（不要提交到仓库）：
 ```toml
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"
@@ -71,7 +71,7 @@ sandbox_mode = "workspace-write"
 network_access = true
 ```
 
-`check --fix` 会自动将此配置写入 `.codex/config.toml` 和 `~/.codex/config.toml`。
+`check --fix` 会自动将此配置写入项目本地 `.codex/config.toml` 和用户级 `~/.codex/config.toml`；`.codex/` 应保持未跟踪。
 
 仅使用 API 源（OpenAlex/S2/arXiv/NSSD/DBLP/BASE）时不需要提权，直接 `--source openalex` 即可。
 
@@ -393,7 +393,7 @@ Agent 的职责是从用户自然语言中提取作者/期刊名/文献类型/�
   3. **驱动无法下载** → 提权后 Selenium Manager 自动下载
   4. **浏览器进程崩溃**（`0x80000003 STATUS_BREAKPOINT`）→ 脚本自动在沙盒外启动浏览器（`CREATE_BREAKAWAY_FROM_JOB` / `ShellExecuteW`），再通过远程调试端口连接，用户无需手动操作
   - 根本解法是**启用网络权限 + 提权运行**：
-  - **Codex**：`check --fix` 会自动写入 `.codex/config.toml`（`[sandbox_workspace_write] network_access = true`），配合 `approval_policy = "on-request"` 让 Codex 在联网时弹窗授权
+  - **Codex**：`check --fix` 会自动写入项目本地未跟踪的 `.codex/config.toml` 或用户级 `~/.codex/config.toml`（`[sandbox_workspace_write] network_access = true`），配合 `approval_policy = "on-request"` 让 Codex 在联网时弹窗授权；不要将 `.codex/` 提交到仓库
   - **Cursor**：所有知网命令加 `required_permissions: ["all"]`
   - **Claude Code (子 agent)**：所有知网命令的 Bash/PowerShell 工具调用必须加 `dangerouslyDisableSandbox: true`
   - **绝对不要**因为 `sandbox_blocked`、`driver_ok: false` 或 `needs_escalation: true` 就放弃知网、回退 API 源。正确做法是按 `retry_command` 和平台提权机制重试
