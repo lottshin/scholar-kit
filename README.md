@@ -10,7 +10,7 @@
 
 ### 论文下载
 
-知网 PDF/CAJ 批量下载，支持搜索+下载一步完成（`search --download`），自动分批并设置冷却间隔避免触发风控。断点续传机制确保中途失败后可从上次位置继续。下载文件按格式写入 `pdf/`、`caj/` 子目录；用户明确要 PDF 时可用 `--fallback-format caj` 在 PDF 不可用时显式降级到 CAJ，不会静默混放。批量下载会生成 Markdown 清单，按 GB/T 7714、APA、MLA 或 Chicago 列出已下载和未下载文献。英文 OA 论文通过 DOI 获取。
+知网 PDF/CAJ 批量下载，支持搜索+下载一步完成（`search --download`），自动分批并设置冷却间隔避免触发风控。断点续传机制确保中途失败后可从上次位置继续。下载文件按格式写入 `pdf/`、`caj/` 子目录；用户明确要 PDF 时，`search --download` 可用 `--download-fallback-format caj`（也兼容 `--fallback-format caj` 别名），`batch-download` 可用 `--fallback-format caj`，在 PDF 不可用时显式降级到 CAJ，不会静默混放。批量下载会生成 Markdown 清单，按 GB/T 7714、APA、MLA 或 Chicago 列出已下载和未下载文献。英文 OA 论文通过 DOI 获取。
 
 ### 全文阅读
 

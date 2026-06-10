@@ -35,6 +35,34 @@ def _first_value(paper: dict, *keys: str) -> str:
     return ""
 
 
+def _bibliographic_container(paper: dict) -> str:
+    """Return a publication/container title, never the data-source marker."""
+    return _first_value(
+        paper,
+        "journal",
+        "journal_title",
+        "venue",
+        "publication",
+        "publication_title",
+        "source_title",
+        "periodical",
+        "container_title",
+    )
+
+
+def _analytic_container(paper: dict) -> str:
+    return _first_value(
+        paper,
+        "booktitle",
+        "book_title",
+        "conference",
+        "conference_name",
+        "proceedings",
+        "proceedings_title",
+        "container_title",
+    )
+
+
 def _has_cjk(text: str) -> bool:
     return any('\u4e00' <= c <= '\u9fff' for c in text)
 
@@ -204,7 +232,11 @@ def _detect_doc_type(paper: dict) -> str:
     ).lower()
     combined = " ".join(
         _first_value(paper, key).lower()
-        for key in ("doc_type", "document_type", "type", "source", "journal", "title", "url")
+        for key in (
+            "doc_type", "document_type", "type", "literature_type",
+            "category", "journal", "venue", "publication", "source_title",
+            "title", "url"
+        )
     )
 
     aliases = {
@@ -234,9 +266,9 @@ def _detect_doc_type(paper: dict) -> str:
         return "patent"
     if _first_value(paper, "standard_no", "standard_number"):
         return "standard"
-    if _first_value(paper, "booktitle", "container_title") and not _first_value(paper, "journal"):
+    if _first_value(paper, "booktitle", "book_title", "proceedings_title"):
         return "chapter"
-    if _first_value(paper, "journal"):
+    if _bibliographic_container(paper):
         return "journal"
     if _first_value(paper, "publisher"):
         return "book"
@@ -283,8 +315,8 @@ def format_gbt7714(paper: dict, index: int = 1) -> str:
 
     authors = _format_authors_gbt(paper.get("authors"))
     title = _first_value(paper, "title")
-    journal = _first_value(paper, "journal", "source")
-    container = _first_value(paper, "booktitle", "container_title", "conference")
+    journal = _bibliographic_container(paper)
+    container = _analytic_container(paper)
     year = _get_year(paper)
     date = _first_value(paper, "date", "published", "publication_date")
     volume = _first_value(paper, "volume")
@@ -381,7 +413,7 @@ def format_footnote(paper: dict, index: int = 1) -> str:
     """
     authors = paper.get("authors", "佚名")
     title = paper.get("title", "")
-    journal = paper.get("journal", "")
+    journal = _bibliographic_container(paper)
     year = paper.get("year", "")
     volume = paper.get("volume", "")
     issue = paper.get("issue", "")
@@ -419,8 +451,8 @@ def format_apa(paper: dict, index: int = 1) -> str:
     authors = _format_authors_apa(paper.get("authors"))
     year = _get_year(paper, "n.d.")
     title = _first_value(paper, "title")
-    journal = _first_value(paper, "journal", "source")
-    container = _first_value(paper, "booktitle", "container_title")
+    journal = _bibliographic_container(paper)
+    container = _analytic_container(paper)
     volume = _first_value(paper, "volume")
     issue = _first_value(paper, "issue", "number")
     pages = _clean_pages(_first_value(paper, "pages"))
@@ -494,8 +526,8 @@ def format_mla(paper: dict, index: int = 1) -> str:
     doc_type = _detect_doc_type(paper)
     authors = _format_authors_mla(paper.get("authors"))
     title = _first_value(paper, "title")
-    journal = _first_value(paper, "journal", "source")
-    container = _first_value(paper, "booktitle", "container_title")
+    journal = _bibliographic_container(paper)
+    container = _analytic_container(paper)
     year = _get_year(paper)
     date = _first_value(paper, "date", "published", "publication_date")
     volume = _first_value(paper, "volume")
@@ -505,7 +537,9 @@ def format_mla(paper: dict, index: int = 1) -> str:
     patent_no = _first_value(paper, "patent_no", "patent_number", "publication_number")
 
     if doc_type == "journal":
-        ref = f'{authors}. "{title}." {journal}'
+        ref = f'{authors}. "{title}."'
+        if journal:
+            ref += f" {journal}"
         if volume:
             ref += f", vol. {volume}"
         if issue:
@@ -562,8 +596,8 @@ def format_chicago(paper: dict, index: int = 1) -> str:
     doc_type = _detect_doc_type(paper)
     authors = _format_authors_chicago(paper.get("authors"))
     title = _first_value(paper, "title")
-    journal = _first_value(paper, "journal", "source")
-    container = _first_value(paper, "booktitle", "container_title")
+    journal = _bibliographic_container(paper)
+    container = _analytic_container(paper)
     year = _get_year(paper)
     date = _first_value(paper, "date", "published", "publication_date")
     volume = _first_value(paper, "volume")
@@ -574,7 +608,9 @@ def format_chicago(paper: dict, index: int = 1) -> str:
     patent_no = _first_value(paper, "patent_no", "patent_number", "publication_number")
 
     if doc_type == "journal":
-        ref = f'{authors}. "{title}." *{journal}*'
+        ref = f'{authors}. "{title}."'
+        if journal:
+            ref += f" *{journal}*"
         if volume:
             ref += f" {volume}"
         if issue:
@@ -780,7 +816,7 @@ def to_markdown_table(papers: List[Dict[str, Any]]) -> str:
     for i, p in enumerate(papers, 1):
         title = _md_escape(p.get("title", "")[:50])
         authors = _md_escape(p.get("authors", "")[:30])
-        journal = _md_escape(p.get("journal", "")[:20])
+        journal = _md_escape(_bibliographic_container(p)[:20])
         year = p.get("year", "")
         cited = p.get("cited_by", "")
         source = p.get("source", "")
@@ -822,7 +858,7 @@ def to_excel(papers: List[Dict[str, Any]], filepath: str):
             i,
             p.get("title", ""),
             p.get("authors", ""),
-            p.get("journal", ""),
+            _bibliographic_container(p),
             p.get("year", ""),
             p.get("cited_by", ""),
             p.get("doi", ""),
@@ -870,7 +906,7 @@ def citation_preview(paper: dict) -> str:
             authors = "; ".join(p.strip() for p in parts)
 
     title = paper.get("title", "")
-    journal = paper.get("journal", "")
+    journal = _bibliographic_container(paper)
     year = paper.get("year", "")
     volume = paper.get("volume", "")
     issue = paper.get("issue", "")

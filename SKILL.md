@@ -1,6 +1,6 @@
 ---
 name: scholar-kit
-version: 1.12.1
+version: 1.12.2
 description: >-
   Search, download, and manage academic papers from CNKI (知网), OpenAlex,
   Semantic Scholar, arXiv, and NSSD; enriches metadata via Crossref and
@@ -225,7 +225,7 @@ python scripts/literature.py check --fix
 
 | 命令 | 用途 | 关键参数 |
 |------|------|----------|
-| `search "词"` | 单关键词搜索 | `--source` `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--limit` `--cite-enrich` `--export` `--output` `--download` `--download-dir` `--download-top-n` `--download-file-format` `--download-fallback-format` `--download-citation-style` `--download-report-output` `--append` `--project` |
+| `search "词"` | 单关键词搜索 | `--source` `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--limit` `--cite-enrich` `--export` `--output` `--download` `--download-dir` `--download-top-n` `--download-file-format` `--download-fallback-format`（别名 `--fallback-format`）`--download-citation-style` `--download-report-output` `--append` `--project` |
 | `batch-search "词1" "词2"` | 多关键词搜索 | `--query-file` `--core` `--doc-type` `--field` `--author` `--journal` `--year-from` `--year-to` `--sort` `--pages` `--export` `--output` `--append` `--project` |
 | `read-detail` | 获取摘要/全文（CNKI 论文，含硕博论文） | `--top-n` `--indices` `--fulltext` `--project` |
 | `read-paper "file"` | 读取用户论文 | `--output` `--raw` |
@@ -312,7 +312,7 @@ Agent 的职责是从用户自然语言中提取作者/期刊名/文献类型/�
 
 下载格式策略：
 - 用户明确要求 PDF 时，默认先严格下载 PDF 到 `pdf/` 子目录
-- 若用户同意兜底，可加 `--fallback-format caj`；只有 PDF 按钮不存在等明确失败项才再次尝试 CAJ，并写入 `caj/` 子目录，避免不同格式混放
+- 若用户同意兜底：`search --download` 使用 `--download-fallback-format caj`（也可用别名 `--fallback-format caj`），`batch-download` 使用 `--fallback-format caj`；只有 PDF 按钮不存在等明确失败项才再次尝试 CAJ，并写入 `caj/` 子目录，避免不同格式混放
 - 不要静默把 CAJ 当作 PDF 返回；展示结果时必须标明实际格式、是否降级、保存目录
 
 下载完成后必须展示或引用脚本生成的下载清单：

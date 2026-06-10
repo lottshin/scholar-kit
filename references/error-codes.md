@@ -29,7 +29,7 @@ Agent 根据此表决定如何回应用户。
 | `IMPORT_PARSE_FAILED` | 题录文件解析失败 | 检查文件格式是否为 NoteExpress/Refworks/BibTeX |
 | `NO_SESSION_DATA` | 无会话数据 | 提示先执行 search、batch-search 或 import。注意：`read-detail` 在会话仅含 API 源论文（无知网论文）时也返回此码（status=warning），此时应提示用户 read-detail 仅支持知网论文 |
 | `NO_URL` | 未提供 URL 参数 | Agent 应从搜索结果中获取 URL |
-| `UNSUPPORTED_EXPORT_FORMAT` | 不支持的导出格式 | 支持 bibtex/ris/markdown/json/excel/gbt7714/footnote/apa |
+| `UNSUPPORTED_EXPORT_FORMAT` | 不支持的导出格式 | 支持 bibtex/ris/markdown/json/excel/gbt7714/footnote/apa/mla/chicago |
 | `MISSING_DEPENDENCY` | 缺少依赖包 | 提示用户 `pip install` |
 | `IO_ERROR` | 文件保存失败（磁盘满、只读等） | 检查磁盘空间和写入权限 |
 | `PATCH_PARSE_FAILED` | 补丁 JSON 解析失败 | 检查 JSON 格式是否正确 |

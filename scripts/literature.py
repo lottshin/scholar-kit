@@ -1,5 +1,5 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.12.1)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.12.2)
 用法:
   python literature.py search "关键词" [--project 课题名] [--source cnki|openalex|semantic|arxiv|nssd|all] [--doc-type master] [--field 摘要] [--author] [--journal] [--download] ...
   python literature.py batch-search "词1" "词2" ... [--project 课题名] [--query-file kw.txt] [--core CSSCI] [--doc-type master] [--field 摘要] [--author] [--journal] [--append]
@@ -9,8 +9,8 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.12.1)
   python literature.py batch-download --from-session [--top-n 20] [--dir ./papers]
   python literature.py batch-download url1 url2 ... [--dir ./papers]
   python literature.py detail <cnki_url>
-  python literature.py export --format bibtex|ris|markdown|json|excel|gbt7714|footnote|apa [--output file]
-  python literature.py cite --style gbt7714|gb|footnote|apa
+  python literature.py export --format bibtex|ris|markdown|json|excel|gbt7714|footnote|apa|mla|chicago [--output file]
+  python literature.py cite --style gbt7714|gb|footnote|apa|mla|chicago
   python literature.py import <filepath>
   python literature.py write-docx <draft.md> [--output 论文.docx]
   python literature.py patch-docx <原论文.docx> --patch patch.json [--output 修改后.docx]
@@ -26,7 +26,7 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.12.1)
 
 from __future__ import annotations
 
-__version__ = "1.12.1"
+__version__ = "1.12.2"
 
 import argparse
 import json
@@ -3018,7 +3018,8 @@ def main():
                           help="下载前 N 篇（配合 --download，默认全部）")
     p_search.add_argument("--download-file-format", choices=["pdf", "caj"], default="pdf",
                           help="下载文件格式（配合 --download，默认 pdf）")
-    p_search.add_argument("--download-fallback-format", choices=["caj"], default=None,
+    p_search.add_argument("--download-fallback-format", "--fallback-format",
+                          dest="download_fallback_format", choices=["caj"], default=None,
                           help="主格式失败时的兜底格式；例如 PDF 按钮不存在时尝试 CAJ")
     p_search.add_argument("--download-citation-style", choices=CITATION_STYLE_CHOICES,
                           default="gbt7714", help="下载清单引用格式（配合 --download）")

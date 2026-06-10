@@ -66,6 +66,36 @@ class FormatterAndDownloadReportTests(unittest.TestCase):
         self.assertTrue(format_chicago(paper).startswith('Smith, Jane, and John Doe. "AI for Academic Search."'))
         self.assertIn("https://doi.org/10.1000/example", generate_reference_list([paper], "mla"))
 
+    def test_data_source_is_not_used_as_journal_container(self):
+        paper = {
+            "authors": "Jane Smith",
+            "title": "Container Missing",
+            "year": 2025,
+            "source": "OpenAlex",
+            "doc_type": "journal",
+        }
+
+        self.assertNotIn("OpenAlex", format_gbt7714(paper))
+        self.assertNotIn("OpenAlex", format_apa(paper))
+        self.assertNotIn("OpenAlex", format_mla(paper))
+        self.assertNotIn("OpenAlex", format_chicago(paper))
+        self.assertIn("刊名不详", format_gbt7714(paper))
+
+    def test_bibliographic_container_uses_venue_fields(self):
+        paper = {
+            "authors": "Jane Smith",
+            "title": "Venue Supported",
+            "venue": "Journal of Useful Metadata",
+            "year": 2025,
+            "source": "OpenAlex",
+            "doc_type": "journal",
+        }
+
+        self.assertIn("Journal of Useful Metadata", format_gbt7714(paper))
+        self.assertIn("Journal of Useful Metadata", format_apa(paper))
+        self.assertIn("Journal of Useful Metadata", format_mla(paper))
+        self.assertIn("Journal of Useful Metadata", format_chicago(paper))
+
     def test_download_report_marks_fallback_format(self):
         result = {
             "status": "success",
