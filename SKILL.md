@@ -1,6 +1,6 @@
 ---
 name: scholar-kit
-version: 1.12.1
+version: 1.12.2
 description: >-
   Search, download, and manage academic papers from CNKI (知网), OpenAlex,
   Semantic Scholar, arXiv, and NSSD; enriches metadata via Crossref and

@@ -1,5 +1,5 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.12.1)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.12.2)
 用法:
   python literature.py search "关键词" [--project 课题名] [--source cnki|openalex|semantic|arxiv|nssd|all] [--doc-type master] [--field 摘要] [--author] [--journal] [--download] ...
   python literature.py batch-search "词1" "词2" ... [--project 课题名] [--query-file kw.txt] [--core CSSCI] [--doc-type master] [--field 摘要] [--author] [--journal] [--append]
@@ -26,7 +26,7 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.12.1)
 
 from __future__ import annotations
 
-__version__ = "1.12.1"
+__version__ = "1.12.2"
 
 import argparse
 import json

@@ -733,10 +733,11 @@ def _has_cnki_institution_access(driver: "webdriver.Remote", institution: Option
     except Exception:
         current_url = ""
     haystack = text + "\n" + title
-    markers = ("机构馆", "机构用户", "个人中心", "我的知网", "退出")
-    if any(marker in haystack for marker in markers):
+    is_cnki_url = "cnki.net" in current_url.lower()
+    markers = ("机构馆", "机构用户", "机构账号", "机构登录", "IP登录", "IP 登录")
+    if is_cnki_url and any(marker in haystack for marker in markers):
         return True
-    if institution and institution in haystack and "cnki.net" in current_url:
+    if institution and institution in haystack and is_cnki_url:
         return True
     return False
 
@@ -762,7 +763,7 @@ def _auth_diagnostics(driver: "webdriver.Remote") -> dict:
             "text_preview": text[:500],
         },
         "markers": {
-            "institution": any(k in text or k in title for k in ("机构馆", "机构用户", "个人中心", "我的知网")),
+            "institution": _has_cnki_institution_access(driver),
             "login": any(k in text or k in title for k in ("登录", "统一身份认证", "用户名", "密码", "选择高校")),
             "security_gate": _is_cnki_security_gate(driver),
         },

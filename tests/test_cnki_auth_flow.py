@@ -100,6 +100,19 @@ class CnkiAuthFlowTests(unittest.TestCase):
         self.assertEqual(fake.visited, ["https://kns.cnki.net/", "https://kns.cnki.net/"])
         self.assertTrue(fake.closed)
 
+    def test_common_cnki_navigation_text_is_not_institution_access(self):
+        fake = FakeDriver(text="个人中心 我的知网 退出")
+
+        self.assertFalse(driver._has_cnki_institution_access(fake))
+
+    def test_institution_name_confirms_access_only_on_cnki_url(self):
+        fake = FakeDriver(text="Example University")
+        fake.current_url = "https://idp.example.edu/login"
+        self.assertFalse(driver._has_cnki_institution_access(fake, institution="Example University"))
+
+        fake.current_url = "https://kns.cnki.net/"
+        self.assertTrue(driver._has_cnki_institution_access(fake, institution="Example University"))
+
     def test_cmd_auth_cnki_outputs_json_and_passes_generic_options(self):
         with patch.object(
             literature,
