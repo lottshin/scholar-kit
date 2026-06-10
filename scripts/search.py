@@ -55,33 +55,102 @@ def _get_mailto() -> str:
 
 # ── 缓存 ──────────────────────────────────────────────
 
+# 智能缓存 TTL（小时）- 根据数据源特性调整
+CACHE_TTL_BY_SOURCE = {
+    "openalex": 24 * 7,      # 7 天（更新较慢）
+    "semantic_scholar": 24 * 3,  # 3 天
+    "arxiv": 24,             # 1 天（更新快）
+    "cnki": 24 * 7,          # 7 天
+    "nssd": 24 * 7,          # 7 天
+    "crossref": 24 * 30,     # 30 天（元数据稳定）
+    "unpaywall": 24 * 7,     # 7 天
+    "dblp": 24 * 14,         # 14 天（DBLP 更新较慢）
+    "base": 24 * 7,          # 7 天
+}
+
+# 查询热度追踪（内存中）
+_query_heat_tracker: Dict[str, int] = {}
+
+
+def _get_query_heat(query: str) -> int:
+    """获取查询热度（访问次数）"""
+    return _query_heat_tracker.get(query, 0)
+
+
+def _increment_query_heat(query: str):
+    """增加查询热度"""
+    _query_heat_tracker[query] = _query_heat_tracker.get(query, 0) + 1
+
+
+def _get_smart_ttl(source: str, query: str) -> int:
+    """根据数据源和查询热度返回智能 TTL（小时）"""
+    base_ttl = CACHE_TTL_BY_SOURCE.get(source, CACHE_TTL_HOURS)
+
+    # 检查查询热度
+    heat = _get_query_heat(query)
+
+    if heat > 10:  # 热门查询
+        return base_ttl * 2  # 延长缓存时间
+    elif heat < 2:  # 冷门查询
+        return max(base_ttl // 2, 24)  # 缩短缓存时间，最少 24 小时
+    else:
+        return base_ttl
+
+
 def _cache_key(prefix: str, query: str) -> str:
     h = hashlib.md5(query.encode()).hexdigest()[:12]
     return f"{prefix}_{h}"
 
 
-def _cache_get(key: str):
+def _cache_get(key: str, source: str = "default", query: str = ""):
+    """获取缓存，支持智能 TTL"""
     path = _cache_dir() / f"{key}.json"
     if not path.exists():
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         cached_at = datetime.fromisoformat(data["_cached_at"])
-        if datetime.now() - cached_at > timedelta(hours=CACHE_TTL_HOURS):
+
+        # 使用智能 TTL
+        ttl_hours = _get_smart_ttl(source, query) if query else CACHE_TTL_HOURS
+
+        if datetime.now() - cached_at > timedelta(hours=ttl_hours):
             path.unlink(missing_ok=True)
             return None
+
+        # 增加查询热度
+        if query:
+            _increment_query_heat(query)
+
         return data["results"]
     except Exception:
         return None
 
 
-def _cache_set(key: str, results):
+def _cache_set(key: str, results, source: str = "default"):
+    """设置缓存，记录数据源"""
     path = _cache_dir() / f"{key}.json"
-    data = {"_cached_at": datetime.now().isoformat(), "results": results}
+    data = {
+        "_cached_at": datetime.now().isoformat(),
+        "_source": source,
+        "results": results
+    }
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ── HTTP 工具 ─────────────────────────────────────────
+
+# API 降级链：主数据源失败时的备用数据源
+API_FALLBACK_CHAIN = {
+    "openalex": ["semantic_scholar", "arxiv"],
+    "semantic": ["openalex", "arxiv"],
+    "semantic_scholar": ["openalex", "arxiv"],
+    "arxiv": ["openalex", "semantic_scholar"],
+    "nssd": ["openalex"],
+    "dblp": ["openalex", "semantic_scholar"],
+    "base": ["openalex"],
+}
+
 
 def _get_client():
     if httpx is not None:
@@ -156,17 +225,31 @@ def _http_get_no_proxy(url: str, headers: Optional[Dict[str, str]] = None) -> Op
 
 # ── OpenAlex ──────────────────────────────────────────
 
-def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to: int = None, sort: str = "relevance") -> list[dict]:
-    cache_key = _cache_key("openalex", f"{query}_{limit}_{year_from}_{year_to}_{sort}")
-    cached = _cache_get(cache_key)
+def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to: int = None,
+                    sort: str = "relevance", field: str = "default", journal: str = None,
+                    author: str = None, field_of_study: str = None, page: int = 1) -> list[dict]:
+    cache_key = _cache_key("openalex", f"{query}_{limit}_{year_from}_{year_to}_{sort}_{field}_{journal}_{author}_{field_of_study}_{page}")
+    cached = _cache_get(cache_key, source="openalex", query=query)
     if cached is not None:
         return cached
 
     params = {
-        "search": query,
         "per_page": min(limit, 50),
+        "page": page,
         "mailto": _get_mailto(),
     }
+
+    # 根据 field 参数调整搜索方式
+    filters = []
+    if field == "title":
+        # 标题搜索使用 display_name.search filter
+        filters.append(f"display_name.search:{query}")
+    elif field == "abstract":
+        # 摘要搜索使用 abstract.search filter
+        filters.append(f"abstract.search:{query}")
+    else:
+        # 默认全文搜索使用 search 参数
+        params["search"] = query
 
     # 添加排序参数
     if sort == "citations":
@@ -175,11 +258,20 @@ def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to:
         params["sort"] = "publication_date:desc"
     # relevance 是默认排序，不需要传参数
 
-    filters = []
+    # 年份过滤
     if year_from is not None:
         filters.append(f"from_publication_date:{year_from}-01-01")
     if year_to is not None:
         filters.append(f"to_publication_date:{year_to}-12-31")
+
+    # 高级过滤：作者（API 支持）
+    if author:
+        filters.append(f"authorships.author.display_name.search:{author}")
+
+    # 高级过滤：学科领域（API 支持）
+    if field_of_study:
+        filters.append(f"concepts.display_name.search:{field_of_study}")
+
     if filters:
         params["filter"] = ",".join(filters)
 
@@ -217,6 +309,20 @@ def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to:
                 for t in w.get("topics", [])[:5]
                 if t.get("display_name")
             ]
+        abstract = _invert_abstract(w.get("abstract_inverted_index"))
+
+        # 摘要质量增强：如果摘要为空且有 DOI，尝试从 Crossref 获取
+        if not abstract and doi:
+            try:
+                crossref_data = resolve_crossref(doi)
+                if crossref_data and crossref_data.get("abstract"):
+                    abstract = crossref_data["abstract"]
+            except Exception:
+                pass  # 静默失败，不影响主流程
+
+        # 添加摘要质量标记
+        abstract_quality = "full" if len(abstract) > 200 else "partial" if abstract else "none"
+
         results.append({
             "title": w.get("title", ""),
             "authors": authors,
@@ -225,14 +331,20 @@ def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to:
             "doi": doi,
             "cited_by": w.get("cited_by_count", 0),
             "url": w.get("id", ""),
-            "abstract": _invert_abstract(w.get("abstract_inverted_index")),
+            "abstract": abstract,
+            "abstract_quality": abstract_quality,
             "is_oa": w.get("open_access", {}).get("is_oa", False),
             "oa_url": w.get("open_access", {}).get("oa_url", ""),
             "keywords": keywords,
             "source": "OpenAlex",
         })
 
-    _cache_set(cache_key, results)
+    # 高级过滤：期刊（客户端过滤，因为 API 过滤不可靠）
+    if journal:
+        journal_lower = journal.lower()
+        results = [r for r in results if journal_lower in r.get("journal", "").lower()]
+
+    _cache_set(cache_key, results, source="openalex")
     return results
 
 
@@ -263,16 +375,22 @@ def _year_in_range(year, year_from, year_to) -> bool:
 
 # ── Semantic Scholar ──────────────────────────────────
 
-def search_semantic_scholar(query: str, limit: int = 10, year_from: int = None, year_to: int = None, sort: str = "relevance") -> list[dict]:
-    cache_key = _cache_key("s2", f"{query}_{limit}_{year_from}_{year_to}_{sort}")
+def search_semantic_scholar(query: str, limit: int = 10, year_from: int = None, year_to: int = None,
+                           sort: str = "relevance", field: str = "default", journal: str = None,
+                           author: str = None, field_of_study: str = None, page: int = 1) -> list[dict]:
+    cache_key = _cache_key("s2", f"{query}_{limit}_{year_from}_{year_to}_{sort}_{field}_{journal}_{author}_{field_of_study}_{page}")
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
+    # Semantic Scholar 使用 offset 而不是 page
+    offset = (page - 1) * limit
+
     params = {
         "query": query,
         "limit": min(limit, 100),
-        "fields": "title,authors,year,abstract,url,citationCount,externalIds,isOpenAccess,openAccessPdf,fieldsOfStudy",
+        "offset": offset,
+        "fields": "title,authors,year,abstract,url,citationCount,externalIds,isOpenAccess,openAccessPdf,fieldsOfStudy,venue",
     }
     # 添加排序参数
     if sort == "citations":
@@ -303,11 +421,14 @@ def search_semantic_scholar(query: str, limit: int = 10, year_from: int = None, 
             title_words = set(p.get("title", "").lower().split())
             stopwords = {"the", "a", "an", "of", "in", "on", "for", "with", "to", "and", "or", "from", "by", "at", "as"}
             fos = [w for w in title_words if len(w) > 3 and w not in stopwords][:5]
+
+        venue = p.get("venue", "") or ""
+
         results.append({
             "title": p.get("title", ""),
             "authors": ", ".join(a.get("name", "") for a in p.get("authors", [])),
             "year": p.get("year"),
-            "journal": "",
+            "journal": venue,
             "doi": ext_ids.get("DOI", ""),
             "arxiv_id": ext_ids.get("ArXiv", ""),
             "cited_by": p.get("citationCount", 0),
@@ -319,7 +440,31 @@ def search_semantic_scholar(query: str, limit: int = 10, year_from: int = None, 
             "source": "Semantic Scholar",
         })
 
-    _cache_set(cache_key, results)
+    # Semantic Scholar API 不支持字段搜索和高级过滤，客户端过滤
+    if field == "title":
+        query_lower = query.lower()
+        results = [r for r in results if query_lower in r.get("title", "").lower()]
+    elif field == "abstract":
+        query_lower = query.lower()
+        results = [r for r in results if query_lower in r.get("abstract", "").lower()]
+
+    # 高级过滤：期刊（客户端过滤）
+    if journal:
+        journal_lower = journal.lower()
+        results = [r for r in results if journal_lower in r.get("journal", "").lower()]
+
+    # 高级过滤：作者（客户端过滤）
+    if author:
+        author_lower = author.lower()
+        results = [r for r in results if author_lower in r.get("authors", "").lower()]
+
+    # 高级过滤：学科领域（客户端过滤）
+    if field_of_study:
+        fos_lower = field_of_study.lower()
+        results = [r for r in results
+                  if any(fos_lower in kw.lower() for kw in r.get("keywords", []))]
+
+    _cache_set(cache_key, results, source="semantic_scholar")
     return results
 
 
@@ -360,10 +505,11 @@ def resolve_crossref(doi: str) -> dict | None:
         "issn": (msg.get("ISSN") or [""])[0],
         "publisher": msg.get("publisher", ""),
         "type": msg.get("type", ""),
+        "abstract": msg.get("abstract", ""),
         "source": "Crossref",
     }
 
-    _cache_set(cache_key, result)
+    _cache_set(cache_key, result, source="crossref")
     return result
 
 
@@ -393,14 +539,14 @@ def resolve_unpaywall(doi: str, email: str = None) -> dict | None:
         "source": "Unpaywall",
     }
 
-    _cache_set(cache_key, result)
+    _cache_set(cache_key, result, source="unpaywall")
     return result
 
 
 # ── arXiv ─────────────────────────────────────────────
 
-def search_arxiv(query: str, limit: int = 10, sort_by: str = "relevance", year_from: int = None, year_to: int = None) -> list[dict]:
-    cache_key = _cache_key("arxiv", f"{query}_{limit}_{sort_by}_{year_from}_{year_to}")
+def search_arxiv(query: str, limit: int = 10, sort_by: str = "relevance", year_from: int = None, year_to: int = None, page: int = 1) -> list[dict]:
+    cache_key = _cache_key("arxiv", f"{query}_{limit}_{sort_by}_{year_from}_{year_to}_{page}")
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
@@ -410,8 +556,12 @@ def search_arxiv(query: str, limit: int = 10, sort_by: str = "relevance", year_f
     # citations 排序不支持，使用 relevance 作为 fallback
     sort_param = sort_map.get(sort_by, "relevance")
 
+    # arXiv 使用 start 参数进行分页
+    start = (page - 1) * limit
+
     params = {
         "search_query": f"all:{query}",
+        "start": start,
         "max_results": min(limit, 50),
         "sortBy": sort_param,
         "sortOrder": "descending",
@@ -480,7 +630,7 @@ def search_arxiv(query: str, limit: int = 10, sort_by: str = "relevance", year_f
     if year_from is not None or year_to is not None:
         results = [r for r in results if _year_in_range(r.get("year"), year_from, year_to)]
 
-    _cache_set(cache_key, results)
+    _cache_set(cache_key, results, source="arxiv")
     return results
 
 
@@ -543,11 +693,318 @@ def search_nssd(query: str, limit: int = 10, year_from: int = None, year_to: int
     if year_from is not None or year_to is not None:
         results = [r for r in results if _year_in_range(r.get("year"), year_from, year_to)]
 
-    _cache_set(cache_key, results)
+    _cache_set(cache_key, results, source="nssd")
+    return results
+
+
+# ── DBLP ──────────────────────────────────────────────
+
+def search_dblp(query: str, limit: int = 10, year_from: int = None, year_to: int = None) -> list[dict]:
+    """
+    搜索 DBLP（计算机科学文献数据库）
+
+    DBLP 是计算机科学领域最权威的文献索引，覆盖所有主要会议和期刊。
+    API 文档: https://dblp.org/faq/How+to+use+the+dblp+search+API.html
+    """
+    cache_key = _cache_key("dblp", f"{query}_{limit}_{year_from}_{year_to}")
+    cached = _cache_get(cache_key, source="dblp", query=query)
+    if cached is not None:
+        return cached
+
+    params = {
+        "q": query,
+        "h": min(limit, 100),  # DBLP 最多返回 100 条
+        "format": "json",
+    }
+
+    data = _http_get("https://dblp.org/search/publ/api", params=params)
+    if not data or "result" not in data:
+        return []
+
+    hits = data.get("result", {}).get("hits", {}).get("hit", [])
+    if not hits:
+        return []
+
+    results = []
+    for hit in hits:
+        info = hit.get("info", {})
+
+        # 解析作者
+        authors_data = info.get("authors", {}).get("author", [])
+        if isinstance(authors_data, dict):
+            authors_data = [authors_data]
+        authors = ", ".join(a.get("text", "") if isinstance(a, dict) else str(a) for a in authors_data)
+
+        # 解析年份
+        year = info.get("year")
+        if year:
+            try:
+                year = int(year)
+            except (ValueError, TypeError):
+                year = None
+
+        # 年份过滤
+        if year_from and year and year < year_from:
+            continue
+        if year_to and year and year > year_to:
+            continue
+
+        # 解析 venue（会议或期刊）
+        venue = info.get("venue", "")
+
+        # 解析 DOI
+        doi = info.get("doi", "")
+
+        # 解析 URL
+        url = info.get("url", "")
+        ee = info.get("ee", "")  # 电子版链接
+
+        # 解析类型
+        doc_type = info.get("type", "")
+
+        results.append({
+            "title": info.get("title", ""),
+            "authors": authors,
+            "year": year,
+            "journal": venue,
+            "doi": doi,
+            "cited_by": 0,  # DBLP 不提供引用数
+            "url": url,
+            "abstract": "",  # DBLP 不提供摘要
+            "keywords": [doc_type] if doc_type else [],
+            "is_oa": bool(ee),  # 有电子版链接视为开放获取
+            "oa_url": ee if isinstance(ee, str) else "",
+            "source": "DBLP",
+            "doc_type": doc_type,  # Conference Paper, Journal Article, etc.
+        })
+
+    _cache_set(cache_key, results, source="dblp")
+    return results
+
+
+# ── BASE ──────────────────────────────────────────────
+
+def search_base(query: str, limit: int = 10, year_from: int = None, year_to: int = None) -> list[dict]:
+    """
+    搜索 BASE（Bielefeld Academic Search Engine）
+
+    BASE 是欧洲最大的开放获取学术搜索引擎，索引超过 3.5 亿份文档。
+    API 文档: https://www.base-search.net/about/en/about_develop.php
+
+    注意：BASE API 可能会限制某些 IP 地址或 User-Agent，如遇到访问限制，建议使用其他数据源。
+    """
+    cache_key = _cache_key("base", f"{query}_{limit}_{year_from}_{year_to}")
+    cached = _cache_get(cache_key, source="base", query=query)
+    if cached is not None:
+        return cached
+
+    params = {
+        "func": "PerformSearch",
+        "query": query,
+        "hits": min(limit, 50),  # BASE 建议最多 50 条
+        "format": "json",
+    }
+
+    # BASE API 对 User-Agent 有限制，使用标准浏览器 UA
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    data = _http_get("https://api.base-search.net/cgi-bin/BaseHttpSearchInterface.fcgi",
+                     params=params, headers=headers)
+
+    # 检查是否被拒绝访问
+    if isinstance(data, dict) and "error" in data:
+        import sys
+        print(f"[BASE] API 访问受限: {data.get('error')}", file=sys.stderr)
+        return []
+
+    if not data or "response" not in data:
+        return []
+
+    docs = data.get("response", {}).get("docs", [])
+    if not docs:
+        return []
+
+    results = []
+    for doc in docs:
+        # 解析作者
+        authors_data = doc.get("dcauthor", [])
+        if isinstance(authors_data, str):
+            authors_data = [authors_data]
+        authors = ", ".join(authors_data)
+
+        # 解析年份
+        year = None
+        year_data = doc.get("dcyear")
+        if year_data:
+            try:
+                year = int(year_data[0]) if isinstance(year_data, list) else int(year_data)
+            except (ValueError, TypeError, IndexError):
+                pass
+
+        # 年份过滤
+        if year_from and year and year < year_from:
+            continue
+        if year_to and year and year > year_to:
+            continue
+
+        # 解析标题
+        title_data = doc.get("dctitle", [])
+        title = title_data[0] if isinstance(title_data, list) and title_data else str(title_data) if title_data else ""
+
+        # 解析摘要
+        abstract_data = doc.get("dcdescription", [])
+        abstract = abstract_data[0] if isinstance(abstract_data, list) and abstract_data else str(abstract_data) if abstract_data else ""
+
+        # 解析来源
+        source_data = doc.get("dcsource", [])
+        journal = source_data[0] if isinstance(source_data, list) and source_data else str(source_data) if source_data else ""
+
+        # 解析 DOI
+        doi_data = doc.get("dcdoi", [])
+        doi = doi_data[0] if isinstance(doi_data, list) and doi_data else str(doi_data) if doi_data else ""
+
+        # 解析链接
+        link_data = doc.get("dclink", [])
+        url = link_data[0] if isinstance(link_data, list) and link_data else str(link_data) if link_data else ""
+
+        # 解析主题
+        subject_data = doc.get("dcsubject", [])
+        if isinstance(subject_data, str):
+            subject_data = [subject_data]
+        keywords = subject_data[:10] if subject_data else []
+
+        results.append({
+            "title": title,
+            "authors": authors,
+            "year": year,
+            "journal": journal,
+            "doi": doi,
+            "cited_by": 0,  # BASE 不提供引用数
+            "url": url,
+            "abstract": abstract,
+            "keywords": keywords,
+            "is_oa": True,  # BASE 主要索引开放获取资源
+            "oa_url": url,
+            "source": "BASE",
+        })
+
+    _cache_set(cache_key, results, source="base")
     return results
 
 
 # ── 聚合搜索 ─────────────────────────────────────────
+
+def search_with_fallback(query: str, primary_source: str, limit: int = 10,
+                         year_from: int = None, year_to: int = None,
+                         sort: str = "relevance", **kwargs) -> Dict[str, Any]:
+    """
+    带降级的搜索：主数据源失败时自动切换到备用数据源
+
+    Args:
+        query: 搜索关键词
+        primary_source: 主数据源（openalex/semantic_scholar/arxiv/nssd）
+        limit: 结果数量
+        year_from: 起始年份
+        year_to: 截止年份
+        sort: 排序方式
+        **kwargs: 其他参数（field、journal、author 等）
+
+    Returns:
+        {
+            "source": 实际使用的数据源,
+            "results": 搜索结果列表,
+            "fallback": 是否使用了降级,
+            "original_source": 原始请求的数据源（仅在降级时存在）,
+            "error": 错误信息（仅在所有数据源都失败时存在）
+        }
+    """
+    # 数据源映射
+    source_functions = {
+        "openalex": search_openalex,
+        "semantic_scholar": search_semantic_scholar,
+        "semantic": search_semantic_scholar,
+        "arxiv": search_arxiv,
+        "nssd": search_nssd,
+        "dblp": search_dblp,
+        "base": search_base,
+    }
+
+    def call_source(source_name: str, source_func):
+        common = {
+            "limit": limit,
+            "year_from": year_from,
+            "year_to": year_to,
+        }
+        if source_name == "arxiv":
+            return source_func(
+                query,
+                sort_by=sort,
+                page=kwargs.get("page", 1),
+                **common,
+            )
+        if source_name in ("openalex", "semantic", "semantic_scholar"):
+            api_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key in ("field", "journal", "author", "field_of_study", "page")
+            }
+            return source_func(query, sort=sort, **common, **api_kwargs)
+        return source_func(query, **common)
+
+    # 尝试主数据源
+    primary_func = source_functions.get(primary_source)
+    if not primary_func:
+        return {
+            "source": None,
+            "results": [],
+            "error": f"未知数据源: {primary_source}"
+        }
+
+    try:
+        results = call_source(primary_source, primary_func)
+        if results and len(results) > 0:
+            return {
+                "source": primary_source,
+                "results": results,
+                "fallback": False
+            }
+    except Exception as e:
+        import sys
+        print(f"[fallback] {primary_source} 失败: {e}", file=sys.stderr)
+
+    # 尝试备用数据源
+    fallback_sources = API_FALLBACK_CHAIN.get(primary_source, [])
+    for fallback_source in fallback_sources:
+        try:
+            fallback_func = source_functions.get(fallback_source)
+            if not fallback_func:
+                continue
+
+            print(f"[fallback] 尝试备用数据源: {fallback_source}", file=__import__('sys').stderr)
+
+            results = call_source(fallback_source, fallback_func)
+            if results and len(results) > 0:
+                return {
+                    "source": fallback_source,
+                    "results": results,
+                    "fallback": True,
+                    "original_source": primary_source
+                }
+        except Exception as e:
+            print(f"[fallback] {fallback_source} 也失败: {e}", file=__import__('sys').stderr)
+            continue
+
+    # 所有数据源都失败
+    return {
+        "source": None,
+        "results": [],
+        "fallback": True,
+        "original_source": primary_source,
+        "error": f"所有数据源均失败（尝试了 {primary_source} 和 {', '.join(fallback_sources)}）"
+    }
+
 
 def search_all(query: str, limit: int = 10, year_from: int = None, year_to: int = None) -> list[dict]:
     """多源聚合搜索（不含知网，知网由 cnki 包单独处理）"""
@@ -560,6 +1017,10 @@ def search_all(query: str, limit: int = 10, year_from: int = None, year_to: int 
     all_results.extend(search_arxiv(query, limit=min(limit, 10), year_from=year_from, year_to=year_to))
     time.sleep(0.5)
     all_results.extend(search_nssd(query, limit=min(limit, 10), year_from=year_from, year_to=year_to))
+    time.sleep(0.5)
+    all_results.extend(search_dblp(query, limit=limit, year_from=year_from, year_to=year_to))
+    time.sleep(0.5)
+    all_results.extend(search_base(query, limit=limit, year_from=year_from, year_to=year_to))
 
     seen_titles = set()
     deduped = []
@@ -660,7 +1121,7 @@ def get_citations(paper_id: str, direction: str = "both",
                 })
 
     if result["paper"]:
-        _cache_set(cache_key, result)
+        _cache_set(cache_key, result, source="semantic_scholar")
     return result
 
 

@@ -6,11 +6,88 @@ Agent 执行具体任务时按需读取本文档。决策入口见 [SKILL.md 决
 
 1. 提取关键词（中文 + 英文）
    - 中文关键词适用于 CNKI、NSSD
-   - 英文关键词适用于 OpenAlex、Semantic Scholar、arXiv
+   - 英文关键词适用于 OpenAlex、Semantic Scholar、arXiv、DBLP、BASE
    - `cnki_feasible: false` 时若用户给中文主题，Agent 应翻译为英文再查 API 源
 2. 用户要求核心期刊时 → 判断学科 → 决定 `--core`（读 [核心期刊知识](core-journals.md)）
 3. `cnki_feasible: true` → 单词用 `search`，多词用 `batch-search`；`cnki_feasible: false` → 用 `search --source openalex` 等 API 源
 4. 展示结果，注明筛选了哪些来源类别
+
+### API 源高级检索技巧
+
+**排序策略**：
+- 按被引数排序：`--sort citations` - 找经典高引论文
+- 按时间排序：`--sort date` - 找最新研究进展
+- 按质量排序：`--sort quality` - 综合评分筛选高质量论文
+
+**精确过滤**：
+- 期刊过滤：`--journal-filter "Nature"` - 限定特定期刊
+- 作者过滤：`--author-filter "Hinton"` - 查找特定作者的论文
+- 学科过滤：`--field-of-study "Computer Vision"` - 限定学科领域
+- 组合过滤：可同时使用多个过滤条件，例如 `--year-from 2020 --journal-filter "Nature" --author-filter "LeCun"`
+
+**字段搜索**：
+- 标题搜索：`--field 篇名` - 只在标题中搜索，减少噪音
+- 摘要搜索：`--field 摘要` - 只在摘要中搜索
+
+**分页浏览**：
+- 大量结果时使用 `--page 2` 浏览后续页面
+- 每页结果单独缓存，重复访问速度快
+
+**降级与并发**：
+- 单一 API 源偶发无结果或请求失败时，加 `--enable-fallback` 自动尝试备用源
+- 多源检索需要更快返回时，用 `--source all --async-search` 并发检索 OpenAlex、Semantic Scholar、arXiv、NSSD、DBLP、BASE
+
+**示例**：
+```bash
+# 查找 2020 年后 Nature 上关于深度学习的高引论文
+search "deep learning" --source openalex --year-from 2020 --journal-filter "Nature" --sort citations --limit 20
+
+# 查找 Hinton 关于神经网络的最新论文
+search "neural networks" --source openalex --author-filter "Hinton" --sort date --limit 10
+
+# 按质量筛选计算机视觉领域的论文
+search "object detection" --source openalex --field-of-study "Computer Vision" --sort quality --limit 15
+
+# 使用 DBLP 搜索计算机科学领域的论文（适合查找会议论文和技术报告）
+search "transformer architecture" --source dblp --year-from 2020 --limit 15
+
+# 使用 BASE 搜索欧洲开放获取资源
+search "climate change" --source base --year-from 2021 --limit 20
+
+# 分页浏览大量结果
+search "machine learning" --source openalex --limit 20 --page 1
+search "machine learning" --source openalex --limit 20 --page 2
+
+# 主源无结果时自动降级
+search "graph neural networks" --source semantic --enable-fallback --limit 20
+
+# 并发多源检索
+search "AI in education" --source all --async-search --limit 30
+```
+
+更多 API 源过滤、排序和分页策略见 [API 源检索最佳实践](api-search-best-practices.md)。
+
+**数据源选择建议**：
+- **计算机科学**：优先使用 DBLP（会议论文和技术报告覆盖全面）+ OpenAlex
+- **欧洲研究/开放获取**：优先使用 BASE（欧洲学术资源，350M+ 文档）
+- **综合学科**：OpenAlex（覆盖最广）或 Semantic Scholar（引文网络强）
+- **预印本/最新研究**：arXiv（物理、数学、计算机）
+- **中文文献**：CNKI（核心期刊）或 NSSD（哲学社会科学）
+
+**数据源特点**：
+- **DBLP**：计算机科学专业数据库，会议论文质量高，但无摘要和被引数据
+- **BASE**：欧洲开放获取资源，文档量大，但可能有 IP 访问限制
+- **OpenAlex**：综合性最强，摘要和引用数据完整
+- **Semantic Scholar**：AI 驱动，引文网络分析能力强
+- **arXiv**：预印本为主，更新快但未经同行评议
+
+### 预定义工作流
+
+可用 `workflows --list` 查看模板，用 `workflows --execute <id> --variables <json>` 预览或执行。Windows PowerShell 调用原生命令时，JSON 内部双引号需要写成 `""`：
+
+```powershell
+python scripts\literature.py workflows --execute literature_review_classic --variables '{""topic"":""deep learning""}' --dry-run
+```
 
 ## 写文献综述
 
