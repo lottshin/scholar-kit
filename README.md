@@ -40,7 +40,7 @@ Markdown 转学术格式 .docx（自动生成脚注和参考文献节）。支�
 - **引用建议** — 识别论文中需要引用的句子，匹配文献并区分"必须引用"和"建议引用"
 - **文献对比矩阵** — 多篇论文按研究问题、方法、发现、局限性等维度结构化对比
 - **阅读笔记** — 按模板提取每篇论文的核心信息，多篇时附综合评述
-- **学术表达优化** — 逐段诊断论文表达质量，改善措辞、重构句式、增强原创论述
+- **学术表达优化** — 按三段式（审计 → 改写 → 报告）逐段诊断论文：先标出原创性薄弱段、中文 AI 腔与证据缺口，再逐条改写并留变更日志。判据见 [references/style-audit.md](references/style-audit.md)，不改变任何数字与引文
 
 ## Usage
 
@@ -164,6 +164,7 @@ scholar-kit/
 │   ├── error-codes.md
 │   ├── environment.md
 │   ├── api-search-best-practices.md
+│   ├── style-audit.md    ← 学术表达审计规则
 │   └── workflows.md
 └── scripts/              ← Python 脚本
     ├── literature.py     ← 统一 CLI 入口
@@ -195,6 +196,12 @@ pip install -r scripts/requirements.txt
 - 使用知网功能需遵守 CNKI 服务条款，需具备合法访问权限（校园网/机构 VPN）
 - 下载的论文版权归原作者和出版方所有
 - 本项目不提供任何绕过付费墙的功能
+
+## Acknowledgments
+
+学术表达优化（`references/style-audit.md`）的方法框架改编自 [AIScientists-Dev/academic-humanizer](https://github.com/AIScientists-Dev/academic-humanizer)（MIT）；其通用 AI 痕迹目录源自 [blader/humanizer](https://github.com/blader/humanizer)（MIT）。中文语料、学科语域与查重边界按本项目的写作场景重写。
+
+本项目仅做表达与论证质量的改进，不针对任何查重或 AI 检测系统做规避；使用 AI 辅助写作时请遵守投稿或学位授予单位的相关规定。
 
 ## License
 

@@ -13,7 +13,7 @@ description: >-
   知网/CNKI, 批量导出/计量分析, or 导出BibTeX/RIS.
   DO NOT USE for general web search, non-academic content, or code documentation lookup.
 metadata:
-  version: 1.13.0
+  version: 1.14.0
   compatibility:
     platform: any
     python: ">=3.9"
@@ -177,7 +177,7 @@ python scripts/literature.py check --fix
 | 写综述 / 引用建议 | 读 [工作流](references/workflows.md#写文献综述) | 同左，搜索用 API 源 |
 | 改写 / 插引用 | 读 [工作流](references/workflows.md#改写论文并生成-word内容大改) | 同左 |
 | 下载论文 | `search --download` 或 `batch-download` | 仅 `download --doi`（OA） |
-| 学术表达优化 | 读 [工作流](references/workflows.md#学术表达优化) | 同左（不依赖知网） |
+| 学术表达优化 | 读 [工作流](references/workflows.md#学术表达优化)，判据用 [style-audit](references/style-audit.md) | 同左（不依赖知网） |
 | 引文网络 | `citations <DOI>` | 同左（不依赖知网） |
 | 趋势分析 | `trends`（基于 session） | 同左 |
 | 选题分析 / 研究问题 | `topics`（基于 session/project） | 同左 |
@@ -214,7 +214,7 @@ python scripts/literature.py check --fix
 - [改写论文并生成 Word](references/workflows.md#改写论文并生成-word内容大改) — read-paper → 改写 → write-docx
 - [基于用户提供的 PDF 文献库](references/workflows.md#基于用户提供的-pdf-文献库) — Glob 扫描 → 读取 → 筛选
 - [在原论文中插入引用](references/workflows.md#在原论文中插入引用保留格式) — read-paper → 搜索 → patch JSON → patch-docx
-- [学术表达优化](references/workflows.md#学术表达优化) — 诊断 → 逐段优化 → patch-docx 写回
+- [学术表达优化](references/workflows.md#学术表达优化) — 审计 → 改写 → patch-docx 写回；改写前读 [表达审计规则](references/style-audit.md)
 - [引文网络分析](references/workflows.md#引文网络分析) — citations 命令，不依赖知网
 - [研究趋势分析](references/workflows.md#研究趋势分析) — trends 命令，基于会话数据
 - `write --project <课题名> --topic <主题> --mode outline/draft/section --section <章节名> --format markdown/docx --with-citations --validate` — 基于课题文献库直接生成综述大纲、正文或指定章节；docx 只是输出格式，不再作为单独写作目标。`review` 用于分析材料，`write` 用于生成正文，`validate` 用于检查证据支撑质量。
@@ -416,6 +416,7 @@ Agent 的职责是从用户自然语言中提取作者/期刊名/文献类型/�
 按需读取，不要预加载：
 
 - [工作流详解](references/workflows.md) — 执行具体任务（综述、引用、优化等）时读取对应章节
+- [表达审计规则](references/style-audit.md) — 做学术表达优化、改写、去 AI 腔时读取（问题清单、保留清单、证据纪律）
 - [API 源检索最佳实践](references/api-search-best-practices.md) — 使用 API 源高级过滤、分页和质量排序时读取
 - [核心期刊知识](references/core-journals.md) — Agent 决策 `--core` 参数时读取
 - [错误码对照表](references/error-codes.md) — 脚本报错时读取
