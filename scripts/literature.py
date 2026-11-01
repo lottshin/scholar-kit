@@ -34,8 +34,13 @@ import os
 import re
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# macOS 系统 Python 链接 LibreSSL 时，urllib3 会向 stderr 打印 NotOpenSSLWarning，
+# 污染 CLI 的 JSON 输出；该警告不影响功能，这里统一静默。
+warnings.filterwarnings("ignore", message=r".*OpenSSL.*")
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout = open(sys.stdout.fileno(), mode="w", encoding="utf-8", errors="replace", buffering=1)
@@ -2782,33 +2787,21 @@ def cmd_trends(args):
 
 def _check_browser(subprocess_mod) -> tuple:
     """检测可用浏览器，返回 (ok: bool, detail: str)"""
-    import shutil as _shutil
-    if sys.platform == "win32":
-        import os as _os
-        for p in [
-            _os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
-            _os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
-            _os.path.expandvars(r"%LocalAppData%\Microsoft\Edge\Application\msedge.exe"),
-        ]:
-            if _os.path.exists(p):
-                try:
-                    r = subprocess_mod.run([p, "--version"], capture_output=True, text=True, timeout=5)
-                    return True, r.stdout.strip() if r.returncode == 0 else f"Edge ({p})"
-                except Exception:
-                    return True, f"Edge ({p})"
-        _chrome = _shutil.which("chrome") or _shutil.which("google-chrome")
-        if _chrome:
-            return True, f"Chrome ({_chrome})"
-    else:
-        for cmd in ["microsoft-edge", "microsoft-edge-stable", "google-chrome", "chromium", "chromium-browser"]:
-            found = _shutil.which(cmd)
-            if found:
-                try:
-                    r = subprocess_mod.run([found, "--version"], capture_output=True, text=True, timeout=5)
-                    return True, r.stdout.strip() if r.returncode == 0 else cmd
-                except Exception:
-                    return True, cmd
-    return False, "未检测到 Edge/Chrome"
+    try:
+        from cnki.driver import _detect_browser, _find_browser_exe
+
+        browser = _detect_browser()
+        exe = _find_browser_exe(browser)
+    except Exception as e:
+        return False, f"未检测到 Edge/Chrome: {e}"
+    if not exe:
+        return False, f"已识别 {browser}，但未找到可执行文件"
+    try:
+        r = subprocess_mod.run([exe, "--version"], capture_output=True, text=True, timeout=5)
+        detail = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else f"{browser} ({exe})"
+    except Exception:
+        detail = f"{browser} ({exe})"
+    return True, detail
 
 
 def _check_driver() -> tuple:

@@ -113,6 +113,29 @@ class CnkiAuthFlowTests(unittest.TestCase):
         fake.current_url = "https://kns.cnki.net/"
         self.assertTrue(driver._has_cnki_institution_access(fake, institution="Example University"))
 
+    def test_institution_header_name_confirms_access_without_param(self):
+        fake = FakeDriver(
+            text="总库 检索 CNKI AI 出版来源 我的CNKI 充值 会员 湖南师范大学 个人登录"
+        )
+
+        self.assertTrue(driver._has_cnki_institution_access(fake))
+
+    def test_institution_header_name_is_ignored_off_cnki(self):
+        fake = FakeDriver(text="湖南师范大学 个人登录")
+        fake.current_url = "https://idp.example.edu/login"
+
+        self.assertFalse(driver._has_cnki_institution_access(fake))
+
+    def test_macos_browser_detection_finds_app_bundle(self):
+        chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+        with patch.object(driver.sys, "platform", "darwin"), \
+             patch.dict("os.environ", {"SCHOLAR_BROWSER": "auto"}, clear=False), \
+             patch("config.get", return_value="auto"), \
+             patch.object(driver.os.path, "isfile", side_effect=lambda p: str(p) == chrome), \
+             patch.object(driver.shutil, "which", return_value=None):
+            self.assertEqual(driver._detect_browser(), "chrome")
+
     def test_cmd_auth_cnki_outputs_json_and_passes_generic_options(self):
         with patch.object(
             literature,

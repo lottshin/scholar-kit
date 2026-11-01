@@ -45,6 +45,26 @@ def _detect_browser() -> str:
                 return "edge"
         if shutil.which("chrome") or shutil.which("google-chrome"):
             return "chrome"
+    elif sys.platform == "darwin":
+        app_bundles = {
+            "edge": [
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                str(Path.home() / "Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+            ],
+            "chrome": [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                str(Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            ],
+        }
+        for browser_name in ("edge", "chrome"):
+            for p in app_bundles[browser_name]:
+                if os.path.isfile(p):
+                    return browser_name
+        if shutil.which("microsoft-edge") or shutil.which("microsoft-edge-stable"):
+            return "edge"
+        if shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser"):
+            return "chrome"
     else:
         if shutil.which("microsoft-edge") or shutil.which("microsoft-edge-stable"):
             return "edge"
@@ -722,6 +742,13 @@ def _page_text(driver: "webdriver.Remote") -> str:
         return ""
 
 
+_CNKI_INSTITUTION_HEADER_RE = re.compile(
+    r"[\u4e00-\u9fa5]{2,30}"
+    r"(?:大学|学院|研究院|研究所|图书馆|博物馆|党校|社科院|干部学院)"
+    r"[\s\u3000]*(?:个人登录|退出登录|退出)"
+)
+
+
 def _has_cnki_institution_access(driver: "webdriver.Remote", institution: Optional[str] = None) -> bool:
     text = _page_text(driver)
     try:
@@ -736,6 +763,9 @@ def _has_cnki_institution_access(driver: "webdriver.Remote", institution: Option
     is_cnki_url = "cnki.net" in current_url.lower()
     markers = ("机构馆", "机构用户", "机构账号", "机构登录", "IP登录", "IP 登录")
     if is_cnki_url and any(marker in haystack for marker in markers):
+        return True
+    # 校内 IP 已识别但未登录个人账号时，知网头部显示“机构名 + 个人登录/退出”
+    if is_cnki_url and _CNKI_INSTITUTION_HEADER_RE.search(haystack):
         return True
     if institution and institution in haystack and is_cnki_url:
         return True
@@ -764,7 +794,10 @@ def _auth_diagnostics(driver: "webdriver.Remote") -> dict:
         },
         "markers": {
             "institution": _has_cnki_institution_access(driver),
-            "login": any(k in text or k in title for k in ("登录", "统一身份认证", "用户名", "密码", "选择高校")),
+            "login": any(
+                k in text or k in title
+                for k in ("统一身份认证", "用户名", "密码", "选择高校", "扫码登录", "验证码")
+            ),
             "security_gate": _is_cnki_security_gate(driver),
         },
         "cookies": {
