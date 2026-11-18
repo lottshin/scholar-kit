@@ -56,7 +56,7 @@ def cmd_read_paper(args, output_fn: Callable[[Any], None] = _default_output) -> 
             output_fn({"status": "error", "code": "DOCX_PARSE_FAILED", "message": f"docx 解析失败: {e}"})
             return
 
-    elif suffix in (".txt", ".md", ".markdown"):
+    elif suffix in (".txt", ".md", ".markdown", ".tex"):
         decoded = False
         for enc in ("utf-8", "utf-8-sig", "gbk", "gb2312", "gb18030"):
             try:
@@ -68,6 +68,9 @@ def cmd_read_paper(args, output_fn: Callable[[Any], None] = _default_output) -> 
         if not decoded:
             output_fn({"status": "error", "code": "ENCODING_ERROR", "message": "无法识别文件编码"})
             return
+        if suffix == ".tex":
+            # 过滤纯注释行以提取干净的正文段落结构
+            text = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("%"))
         if numbered and text:
             blocks = [b for b in re.split(r"\n\s*\n", text) if b.strip()]
             parts = []

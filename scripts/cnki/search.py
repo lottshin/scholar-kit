@@ -1001,48 +1001,183 @@ def _advanced_search(
 
 # ── 主搜索入口 (`search_cnki` / `batch_search_cnki`) ────────────────────
 
+_CNKI_TITLE_BADGE_SUFFIX_RE = re.compile(
+    r"(?:\s*(?:网络首发|增强出版|优先出版|在线发表|OA|撤回|撤稿|勘误|\[[A-Z/]+\]))+\s*$",
+    re.IGNORECASE,
+)
+
+
+def _clean_scraped_cnki_title(raw_title: str) -> str:
+    """剔除知网列表/详情页 DOM 中混入标题末尾的『网络首发』『增强出版』等徽标噪词与零宽字符。"""
+    s = re.sub(r"[\u200b\u200c\u200d\ufeff]+", "", str(raw_title or "")).strip()
+    s = re.sub(r"\s+", " ", s)
+    s = _CNKI_TITLE_BADGE_SUFFIX_RE.sub("", s).strip()
+    return s
+
+
+def _title_similarity(t1: str, t2: str) -> float:
+    """计算两篇中英文论文题名的相似度（融合二元字符组 Dice 与字集覆盖度，专门识别预印本改名/回译偏差）。"""
+    s1 = re.sub(r"\W+", "", _clean_scraped_cnki_title(t1).lower())
+    s2 = re.sub(r"\W+", "", _clean_scraped_cnki_title(t2).lower())
+    if not s1 or not s2:
+        return 0.0
+    if s1 == s2:
+        return 1.0
+    shorter, longer = (s1, s2) if len(s1) <= len(s2) else (s2, s1)
+    if len(shorter) >= 6 and shorter in longer:
+        return max(0.82, (2.0 * len(shorter)) / (len(s1) + len(s2)))
+    if len(s1) < 2 or len(s2) < 2:
+        return 1.0 if s1 == s2 else 0.0
+    bi1 = {s1[i:i + 2] for i in range(len(s1) - 1)}
+    bi2 = {s2[i:i + 2] for i in range(len(s2) - 1)}
+    dice = (2.0 * len(bi1 & bi2)) / (len(bi1) + len(bi2))
+    set1, set2 = set(s1), set(s2)
+    uni_cov = len(set1 & set2) / max(1, min(len(set1), len(set2)))
+    return round(0.7 * dice + 0.3 * uni_cov, 4)
+
+
+def _extract_first_author_clean(author: str) -> str:
+    if not author:
+        return ""
+    first = re.split(r"[;；,，、\s]+", author.strip())[0].strip()
+    first = re.sub(r"(?:等|et\s*al\.?)$", "", first, flags=re.IGNORECASE).strip()
+    first = re.sub(r"\d+$", "", first).strip()
+    return first
+
+
+def reconcile_cnki_paper(
+    title: str,
+    author: str = "",
+    journal: str = "",
+    year: Optional[int] = None,
+    *,
+    _driver=None,
+) -> Dict[str, Any]:
+    """二级知网真伪与改名核验（专治『作者是对的，但题名被改名/回译偏差导致知网搜不到』）：
+    1. 第一级：按清洗后的精确篇名 `TI='...'` 检索；
+    2. 第二级：若精确篇名 0 命中且已知作者，自动回退按 `AU='<第一作者>'`（叠加题名核心词锚点或全量作者成果）
+       在知网检索该作者真实发表列表，计算题名相似度，精准找回真实发表题名与最新链接。
+    """
+    clean_title, _ = _clean_cnki_value(_clean_scraped_cnki_title(title))
+    first_au, _ = _clean_cnki_value(_extract_first_author_clean(author))
+    clean_j, _ = _clean_cnki_value(journal, strip_book_marks=True)
+
+    if not clean_title and not first_au:
+        return {"matched": False, "reason": "empty_title_and_author"}
+
+    owns_driver = _driver is None
+    driver = _driver
+    try:
+        if owns_driver:
+            browser = _detect_browser()
+            driver = _create_driver(browser=browser)
+            _safe_get(driver, "https://kns.cnki.net/")
+            time.sleep(0.6)
+            _load_cookies(driver)
+
+        def _run_expr_once(expr_str: str, use_50: bool = False) -> List[Dict[str, Any]]:
+            _safe_get(driver, CNKI_ADV_SEARCH_URL)
+            time.sleep(max(1.0, REQUEST_INTERVAL - 1))
+            nonlocal_drv = _handle_captcha(driver)
+            sub = _submit_major_search(nonlocal_drv, expr_str)
+            if not sub.get("ok"):
+                return []
+            _wait_for_results_refresh(nonlocal_drv, prev_snapshot=None, timeout=12.0)
+            if use_50:
+                _set_per_page(nonlocal_drv, 50)
+            return _parse_search_results(nonlocal_drv, cite_enrich=0)
+
+        norm_want = re.sub(r"\W+", "", clean_title).lower()
+
+        # 第一级：精确或模糊篇名直查
+        if clean_title:
+            rows = _run_expr_once(f"TI='{clean_title}'")
+            if not rows and ("—" in clean_title or ":" in clean_title or "：" in clean_title):
+                main_title = re.split(r"[—:：]+", clean_title)[0].strip()
+                if len(main_title) >= 5:
+                    rows = _run_expr_once(f"TI % '{main_title}'")
+            for row in rows:
+                sim = _title_similarity(clean_title, row.get("title", ""))
+                if sim >= 0.85:
+                    return {
+                        "matched": True,
+                        "method": "exact_title",
+                        "title_changed": re.sub(r"\W+", "", row.get("title", "")).lower() != norm_want,
+                        "similarity": sim,
+                        "original_title": title,
+                        "paper": row,
+                    }
+
+        # 第二级：作者锚定 + 题名相似度纠偏（解决工作论文正式发表改名、英文回译词差、大模型记忆微偏）
+        if first_au:
+            candidate_rows: List[Dict[str, Any]] = []
+            cjk_chunks = re.findall(r"[\u4e00-\u9fff]{2,}", clean_title)
+            anchor_term = cjk_chunks[0][:4] if cjk_chunks else ""
+
+            if anchor_term and len(anchor_term) >= 2:
+                candidate_rows.extend(_run_expr_once(f"AU='{first_au}' AND TKA % '{anchor_term}'", use_50=False))
+            if not candidate_rows and clean_j:
+                candidate_rows.extend(_run_expr_once(f"AU='{first_au}' AND LY % '{clean_j}'", use_50=False))
+            if not candidate_rows:
+                candidate_rows.extend(_run_expr_once(f"AU='{first_au}'", use_50=True))
+
+            best_row = None
+            best_score = 0.0
+            for row in candidate_rows:
+                if not row.get("title"):
+                    continue
+                sim = _title_similarity(clean_title, row["title"]) if clean_title else 0.5
+                bonus = 0.0
+                if year and row.get("year"):
+                    try:
+                        if abs(int(row["year"]) - int(year)) <= 2:
+                            bonus += 0.05
+                    except (TypeError, ValueError):
+                        pass
+                if clean_j and row.get("journal") and (clean_j in row["journal"] or row["journal"] in clean_j):
+                    bonus += 0.05
+                total_sc = min(1.0, sim + bonus)
+                if total_sc > best_score:
+                    best_score = total_sc
+                    best_row = row
+
+            if best_row and best_score >= 0.42:
+                got_norm = re.sub(r"\W+", "", best_row.get("title", "")).lower()
+                return {
+                    "matched": True,
+                    "method": "author_reconciled",
+                    "title_changed": got_norm != norm_want,
+                    "similarity": round(best_score, 3),
+                    "original_title": title,
+                    "paper": best_row,
+                }
+
+        return {
+            "matched": False,
+            "reason": "not_found_on_cnki",
+            "original_title": title,
+            "searched_author": first_au,
+        }
+    except Exception as e:
+        return {"matched": False, "reason": str(e), "original_title": title}
+    finally:
+        if driver is not None and owns_driver:
+            _release_driver(driver)
+
+
 def refresh_cnki_url(
     driver,
     title: str,
     author: str = "",
     journal: str = "",
 ) -> Optional[str]:
-    """当历史会话中的知网加密详情链接 (`kcms2?v=...`) 过期返回 404 时，通过精确题名重定位最新 URL。"""
-    clean_title, _ = _clean_cnki_value(title)
-    if not clean_title:
-        return None
-    try:
-        expr = build_cnki_expression(
-            keyword=clean_title,
-            field="篇名",
-            author=author or None,
-            journal=f"《{journal}》" if journal and not journal.startswith("《") else (journal or None),
-        )
-        _safe_get(driver, CNKI_ADV_SEARCH_URL)
-        time.sleep(max(1.2, REQUEST_INTERVAL - 1))
-        driver = _handle_captcha(driver)
-        res = _submit_major_search(driver, expr)
-        if not res.get("ok") and journal:
-            # 放宽期刊限定仅按精确题名重试
-            expr = build_cnki_expression(keyword=clean_title, field="篇名")
-            res = _submit_major_search(driver, expr)
-        if not res.get("ok"):
-            return None
-        _wait_for_results_refresh(driver, prev_snapshot=None, timeout=12.0)
-        page_rows = _parse_search_results(driver, cite_enrich=0)
-        norm_want = re.sub(r"\W+", "", clean_title).lower()
-        for row in page_rows:
-            u = row.get("url", "")
-            if not u:
-                continue
-            norm_got = re.sub(r"\W+", "", row.get("title", "")).lower()
-            if norm_got == norm_want or norm_want in norm_got or norm_got in norm_want:
-                _log(f"[cnki] 已重定位最新详情链接: {clean_title[:30]} -> {u[:80]}")
-                return u
-        if page_rows and page_rows[0].get("url"):
-            return page_rows[0]["url"]
-    except Exception as e:
-        _log(f"[cnki] 重定位过期详情链接失败: {e}")
+    """当历史会话中的知网加密详情链接 (`kcms2?v=...`) 过期返回 404 或题名存在轻微偏差时，自动重定位最新 URL。"""
+    rec = reconcile_cnki_paper(title=title, author=author, journal=journal, _driver=driver)
+    if rec.get("matched") and isinstance(rec.get("paper"), dict):
+        u = rec["paper"].get("url", "")
+        if u:
+            _log(f"[cnki] 已重定位详情链接 ({rec.get('method')}): {rec['paper'].get('title', '')[:30]} -> {u[:80]}")
+            return u
     return None
 
 
@@ -2089,7 +2224,17 @@ def _parse_single_row(row) -> dict:
 
     try:
         title_el = row.find_element(By.CSS_SELECTOR, "td.name a, .fz14")
-        result["title"] = title_el.text.strip()
+        raw_t = ""
+        try:
+            # 克隆节点剥离内部 marktip/icon（如『网络首发』『增强出版』角标），保证题名纯净可复搜
+            raw_t = title_el.parent.execute_script(r"""
+                var a = arguments[0].cloneNode(true);
+                a.querySelectorAll('.marktip, .online-mark, span[class*="icon"], i, sup').forEach(function(n){ n.remove(); });
+                return (a.textContent || '').trim();
+            """, title_el) or ""
+        except Exception:
+            raw_t = ""
+        result["title"] = _clean_scraped_cnki_title(raw_t or title_el.text)
         result["url"] = title_el.get_attribute("href") or ""
     except NoSuchElementException:
         return result

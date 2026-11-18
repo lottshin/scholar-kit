@@ -15,6 +15,9 @@ from .driver import (
     authenticate_cnki, _release_driver, _safe_get, close_shared_browser,
 )
 from .selectors import CNKI_SELECTORS, probe_cnki_dom_contracts, save_adv_dom_diagnosis
-from .search import search_cnki, batch_search_cnki, build_cnki_expression, refresh_cnki_url
+from .search import (
+    search_cnki, batch_search_cnki, build_cnki_expression,
+    refresh_cnki_url, reconcile_cnki_paper,
+)
 from .detail import get_detail, batch_read_detail, get_cnki_citations, parse_cnki_citation_item
 from .download import download_cnki, batch_download_cnki, parse_cnki_export

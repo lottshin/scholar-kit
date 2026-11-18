@@ -139,6 +139,31 @@ async def search_base_async(
     )
 
 
+async def search_pubmed_async(
+    query: str,
+    limit: int = 10,
+    year_from: Optional[int] = None,
+    year_to: Optional[int] = None,
+    sort: str = "relevance",
+    field: str = "default",
+    journal: Optional[str] = None,
+    author: Optional[str] = None,
+    page: int = 1,
+) -> List[Dict[str, Any]]:
+    return await asyncio.to_thread(
+        _sync_search.search_pubmed,
+        query,
+        limit=limit,
+        year_from=year_from,
+        year_to=year_to,
+        sort=sort,
+        field=field,
+        journal=journal,
+        author=author,
+        page=page,
+    )
+
+
 async def search_all_async(
     query: str,
     limit: int = 10,
@@ -192,6 +217,14 @@ async def search_all_async(
         elif normalized == "base":
             tasks.append(search_base_async(query, limit, year_from, year_to))
             source_names.append("base")
+        elif normalized == "pubmed":
+            tasks.append(
+                search_pubmed_async(
+                    query, limit, year_from, year_to, sort,
+                    field=field, journal=journal, author=author, page=page,
+                )
+            )
+            source_names.append("pubmed")
 
     results_list = await asyncio.gather(*tasks, return_exceptions=True)
 

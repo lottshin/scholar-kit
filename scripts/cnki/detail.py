@@ -108,21 +108,41 @@ def _parse_detail_page(driver) -> Dict[str, Any]:
     """从已加载的知网详情页 DOM 中提取元数据（标题、摘要、关键词等）。
     调用者负责导航到详情页并处理验证码，本函数只做解析。
     """
+    from .search import _clean_scraped_cnki_title, _extract_pages_from_gbt7714
     from .selectors import CNKI_SELECTORS
 
     d_sel = CNKI_SELECTORS["detail"]
     detail: Dict[str, Any] = {}
 
     try:
-        title_el = driver.find_element(By.CSS_SELECTOR, d_sel["title"])
-        detail["title"] = title_el.text.strip()
-    except NoSuchElementException:
+        pure_title = driver.execute_script(r"""
+            var cands = ['.wx-tit h1', '.brief h1', '.doc-top h1', 'h1.title'];
+            for (var i = 0; i < cands.length; i++) {
+                var el = document.querySelector(cands[i]);
+                if (!el) continue;
+                var h = el.cloneNode(true);
+                h.querySelectorAll('span, a, sup, i, em').forEach(function(n){
+                    var t = (n.textContent || '').trim();
+                    if (t === '网络首发' || t === '增强出版' || t === '优先出版' || t === 'OA' || t.indexOf('附录') >= 0 || /^\[\w+\]$/.test(t) || n.tagName === 'SUP') {
+                        n.remove();
+                    }
+                });
+                var txt = (h.textContent || '').trim();
+                if (txt && txt !== '自动登录' && txt !== '会员登录' && txt !== '个人登录') {
+                    return txt;
+                }
+            }
+            var metaT = document.querySelector('meta[name="citation_title"], meta[property="og:title"]');
+            return metaT ? (metaT.content || '').trim() : '';
+        """) or ""
+        detail["title"] = _clean_scraped_cnki_title(pure_title)
+    except Exception:
         detail["title"] = ""
 
     if not detail["title"]:
         try:
             page_title = driver.title or ""
-            detail["title"] = page_title.split("-")[0].split("_")[0].strip()
+            detail["title"] = _clean_scraped_cnki_title(page_title.split("-")[0].split("_")[0])
         except Exception:
             pass
 
@@ -189,39 +209,48 @@ def _extract_pub_info(driver, detail: Dict[str, Any]):
     except (NoSuchElementException, Exception):
         pass
 
-    # 2) 年/卷/期/页码 — 从出版信息文本中正则提取
+    # 2) 年/卷/期/页码 — 聚合 .top-tip 与 .total-inform（很多知网期刊页码写在 .total-inform 的「页码：65-76」而非 .top-tip）
     pub_text = ""
     try:
-        tip_el = driver.find_element(
-            By.CSS_SELECTOR, ".top-tip, .list-identify, .doc-top .info"
-        )
-        pub_text = tip_el.text
-    except (NoSuchElementException, Exception):
-        pass
+        pub_text = driver.execute_script(r"""
+            var parts = [];
+            document.querySelectorAll('.top-tip, .list-identify, .doc-top .info, .total-inform, .brief').forEach(function(el){
+                var t = (el.innerText || el.textContent || '').trim();
+                if (t) parts.push(t);
+            });
+            return parts.join(' \n ');
+        """) or ""
+    except Exception:
+        try:
+            tip_el = driver.find_element(By.CSS_SELECTOR, ".top-tip, .list-identify, .doc-top .info")
+            pub_text = tip_el.text
+        except (NoSuchElementException, Exception):
+            pass
 
     if pub_text:
-        # 年份: "2023," 或 "2023年" 或 "2019 (02)"（年份后跟逗号/年/空格+括号）
         year_m = re.search(r'((?:19|20)\d{2})\s*[,，年\s(（]', pub_text)
         if year_m and not detail.get("year"):
             detail["year"] = int(year_m.group(1))
 
-        # 卷号: "39" in "2023,39(03)" or "第39卷"
         vol_m = re.search(r'(?:,|，)\s*(\d+)\s*\(', pub_text) or \
                 re.search(r'第\s*(\d+)\s*卷', pub_text)
         if vol_m and not detail.get("volume"):
             detail["volume"] = vol_m.group(1)
 
-        # 期号: "(03)" or "第3期" or "No.3"
-        issue_m = re.search(r'\((\d+)\)', pub_text) or \
-                  re.search(r'第\s*(\d+)\s*期', pub_text) or \
+        issue_m = re.search(r'\((\w+)\)', pub_text) or \
+                  re.search(r'第\s*(\w+)\s*期', pub_text) or \
                   re.search(r'No\.?\s*(\d+)', pub_text)
         if issue_m and not detail.get("issue"):
-            detail["issue"] = issue_m.group(1).lstrip("0") or "0"
+            raw_iss = issue_m.group(1)
+            detail["issue"] = (raw_iss.lstrip("0") or "0") if raw_iss.isdigit() else raw_iss
 
-        # 页码: ":45-58" or "45-58页" or "P.45-58"
-        pages_m = re.search(r'[:：]\s*(\d+[-–—]\d+)', pub_text) or \
-                  re.search(r'(\d+[-–—]\d+)\s*页', pub_text) or \
-                  re.search(r'[Pp]\.?\s*(\d+[-–—]\d+)', pub_text)
+        # 页码：支持区间页 `45-58`、转页 `65-76+188` 及单页短文 `页码：45`
+        pages_m = (
+            re.search(r'页码\s*[:：]\s*(\d+(?:[-–—]\d+(?:\+\d+(?:[-–—]\d+)?)?)?)', pub_text)
+            or re.search(r'\)\s*[:：]\s*(\d+(?:[-–—]\d+(?:\+\d+(?:[-–—]\d+)?)?)?)', pub_text)
+            or re.search(r'(\d+[-–—]\d+(?:\+\d+(?:[-–—]\d+)?)?)\s*页', pub_text)
+            or re.search(r'[Pp]\.?\s*(\d+[-–—]\d+)', pub_text)
+        )
         if pages_m and not detail.get("pages"):
             detail["pages"] = pages_m.group(1).replace('–', '-').replace('—', '-')
 
@@ -336,6 +365,36 @@ def _extract_pub_info(driver, detail: Dict[str, Any]):
                 detail["is_online_first"] = True
     except Exception:
         pass
+
+    # 5) 终极兜底：若仍缺少页码且非网络首发，触发详情页自身的『引用』弹窗读取知网官方 GB/T 7714 文本提取页码
+    if not detail.get("pages") and not detail.get("is_online_first"):
+        try:
+            from .search import _extract_pages_from_gbt7714
+            clicked_q = driver.execute_script(r"""
+                var btn = document.querySelector('li.btn-quote a, a.icon-quote, a[onclick*="getQuotes"]');
+                if (btn && btn.offsetParent !== null) { btn.click(); return true; }
+                return false;
+            """)
+            if clicked_q:
+                time.sleep(0.8)
+                gbt_txt = driver.execute_script(r"""
+                    var rows = document.querySelectorAll('.quote-pop tr');
+                    for (var i = 0; i < rows.length; i++) {
+                        var l = rows[i].querySelector('.quote-l'), r = rows[i].querySelector('.quote-r');
+                        if (l && r && l.textContent.indexOf('GB/T') >= 0) return r.textContent.trim();
+                    }
+                    var first = document.querySelector('.quote-pop .quote-r');
+                    return first ? first.textContent.trim() : '';
+                """) or ""
+                driver.execute_script("document.querySelectorAll('.quote-pop, .layui-layer-shade').forEach(function(e){e.remove();});")
+                if gbt_txt:
+                    pg = _extract_pages_from_gbt7714(gbt_txt)
+                    if pg:
+                        detail["pages"] = pg
+                    if not detail.get("gbt7714_raw"):
+                        detail["gbt7714_raw"] = gbt_txt
+        except Exception:
+            pass
 
 
 # ── HTML 全文阅读与稳定键缓存 ──────────────────────────
@@ -1151,7 +1210,11 @@ def _extract_visible_citnet_items(driver, tab_kind: str = "", limit: int = 20) -
     collected: List[Dict[str, Any]] = []
     seen_titles: set[str] = set()
     max_pages = max(1, (limit + 9) // 10)
-    prefix = f"nxgp-kcms-data-ref-{tab_kind}-" if tab_kind in ("citations", "references") else ""
+    prefix = (
+        f"nxgp-kcms-data-ref-{tab_kind}-"
+        if tab_kind in ("citations", "references", "coreferences", "cocitations")
+        else ""
+    )
 
     for _page in range(max_pages):
         raw_items = driver.execute_script(r"""
@@ -1349,14 +1412,20 @@ def get_cnki_citations(
             var txt = mapEl ? (mapEl.innerText || mapEl.textContent || '') : '';
             var mCit = txt.match(/(?:^|[^级])引证文献\s*\(\s*(\d+)\s*\)/);
             var mRef = txt.match(/(?:^|[^级])参考文献\s*\(\s*(\d+)\s*\)/);
+            var mCoref = txt.match(/共引文献\s*\(\s*(\d+)\s*\)/);
+            var mCocit = txt.match(/同被引文献\s*\(\s*(\d+)\s*\)/);
             return {
                 citing_total: mCit ? parseInt(mCit[1], 10) : null,
-                references_total: mRef ? parseInt(mRef[1], 10) : null
+                references_total: mRef ? parseInt(mRef[1], 10) : null,
+                coreferences_total: mCoref ? parseInt(mCoref[1], 10) : null,
+                cocitations_total: mCocit ? parseInt(mCocit[1], 10) : null
             };
         """) or {}
 
         citing_list: List[Dict[str, Any]] = []
         references_list: List[Dict[str, Any]] = []
+        coref_list: List[Dict[str, Any]] = []
+        cocited_list: List[Dict[str, Any]] = []
 
         if direction in ("citing", "both"):
             _activate_and_wait_citnet_tab(driver, "citations", timeout=6.0)
@@ -1365,6 +1434,14 @@ def get_cnki_citations(
         if direction in ("cited", "both"):
             _activate_and_wait_citnet_tab(driver, "references", timeout=6.0)
             references_list = _extract_visible_citnet_items(driver, tab_kind="references", limit=limit)
+
+        if direction == "coref":
+            _activate_and_wait_citnet_tab(driver, "coreferences", timeout=6.0)
+            coref_list = _extract_visible_citnet_items(driver, tab_kind="coreferences", limit=limit)
+
+        if direction == "cocited":
+            _activate_and_wait_citnet_tab(driver, "cocitations", timeout=6.0)
+            cocited_list = _extract_visible_citnet_items(driver, tab_kind="cocitations", limit=limit)
 
         result = {
             "status": "success" if paper_meta.get("title") else "partial",
@@ -1379,12 +1456,20 @@ def get_cnki_citations(
                 "url": detail_url,
                 "cited_by_count": tab_totals.get("citing_total") or len(citing_list),
                 "references_total": tab_totals.get("references_total") or len(references_list),
+                "coreferences_total": tab_totals.get("coreferences_total"),
+                "cocitations_total": tab_totals.get("cocitations_total"),
             },
             "citing_count": len(citing_list),
             "references_count": len(references_list),
             "citing": citing_list,
             "references": references_list,
         }
+        if direction == "coref":
+            result["coreferences_count"] = len(coref_list)
+            result["coreferences"] = coref_list
+        elif direction == "cocited":
+            result["cocitations_count"] = len(cocited_list)
+            result["cocitations"] = cocited_list
 
         if cache_file and result["status"] == "success":
             try:

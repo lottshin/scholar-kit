@@ -2,18 +2,18 @@
 name: scholar-kit
 description: >-
   Search, download, and manage academic papers from CNKI (知网), OpenAlex,
-  Semantic Scholar, arXiv, NSSD, DBLP, and BASE; enriches metadata via Crossref and
-  resolves OA links via Unpaywall. Generates citations
-  (GB/T 7714, APA, MLA, Chicago, BibTeX, RIS), writes literature reviews, suggests
-  inline references, analyzes citation networks, and generates research trend reports.
+  Semantic Scholar, arXiv, PubMed (Europe PMC), NSSD, DBLP, BASE, and local Zotero libraries;
+  enriches metadata via Crossref and resolves OA links via Unpaywall. Generates citations
+  (GB/T 7714, APA, MLA, Chicago, pure-ASCII BibTeX, RIS), verifies & reconciles drifted titles,
+  writes literature reviews, suggests inline references, analyzes citation networks, and generates research trend reports.
   Use when the user asks to 搜索/检索/查找 文献/论文, 下载论文/全文, 写文献综述,
-  引用建议/插入文献, 选题分析/研究选题/研究问题, 格式化参考文献, 参考文献, 引文追踪/引用网络/谁引用了,
-  研究趋势/热点分析, 文献对比/对比矩阵, 阅读笔记,
+  引用建议/插入文献, 选题分析/研究选题/研究问题, 格式化参考文献, 参考文献/核验引用/题名核对, 引文追踪/引用网络/共引/同被引,
+  研究趋势/热点分析, 文献对比/对比矩阵, 阅读笔记, Zotero/LaTeX/BibTeX,
   学术表达优化/论文改写/提升原创性, 查重/降重/降低重复率/重复率,
-  知网/CNKI, 批量导出/计量分析, or 导出BibTeX/RIS.
+  知网/CNKI/PubMed, 批量导出/计量分析, or 导出BibTeX/RIS.
   DO NOT USE for general web search, non-academic content, or code documentation lookup.
 metadata:
-  version: 1.17.0
+  version: 1.18.0
   compatibility:
     platform: any
     python: ">=3.9"
@@ -88,20 +88,22 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
 
 | 命令 | 用途 | 常用参数 |
 |------|------|----------|
-| `search [词]` | 单次/专业检索 | `--source` (cnki/openalex/semantic/arxiv/nssd/dblp/base/all) `--expr`（知网专业检索布尔式） `--field` (主题/篇关摘/篇名/关键词/摘要/全文/...) `--author` `--first-author` `--affiliation` `--journal` `--fund` `--fuzzy` `--core` `--doc-type` `--year-from` `--year-to` `--sort` (relevance/date/citations/downloads/quality) `--pages` `--per-page 50` `--limit` `--bulk-abstract` `--cite-enrich N` `--enrich N` `--author-filter` `--journal-filter` `--field-of-study` `--page` `--enable-fallback` `--async-search` `--download` `--download-fallback-format caj` `--append` `--project` |
+| `search [词]` | 单次/专业检索 | `--source` (cnki/openalex/semantic/arxiv/pubmed/nssd/dblp/base/all) `--expr`（知网专业检索布尔式） `--field` (主题/篇关摘/篇名/关键词/摘要/全文/...) `--author` `--first-author` `--affiliation` `--journal` `--fund` `--fuzzy` `--core` `--doc-type` `--year-from` `--year-to` `--sort` (relevance/date/citations/downloads/quality) `--pages` `--per-page 50` `--limit` `--bulk-abstract` `--cite-enrich N` `--enrich N` `--author-filter` `--journal-filter` `--field-of-study` `--page` `--enable-fallback` `--async-search` `--download` `--download-fallback-format caj` `--append` `--project` |
 | `batch-search` | 多词知网检索 | `词1 词2` 或 `--query-file`（中文多词推荐） `--core` `--doc-type` `--field` `--year-from` `--year-to` `--sort` `--pages` `--append` `--project` |
-| `read-detail` | 知网摘要/全文 | `--indices 1,3,9`（优先，已下载本地 PDF 时秒级提取免滑块） `--top-n` `--fulltext` `--project` |
+| `read-detail` | 知网/PDF/Zotero 全文 | `--indices 1,3,9`（优先，已下载本地或 Zotero PDF 时秒级提取免滑块） `--top-n` `--fulltext` `--project` |
 | `detail "url"` | 单篇知网详情 | |
 | `auth-cnki` / `close-browser` | 认证预热 / 关闭常驻浏览器 | `auth-cnki --auth-url --institution --wait-seconds --direct-domain`；`close-browser` 释放后台热复用浏览器 |
 | `download` / `batch-download` | 单篇 / 批量下载 | `--from-session` `--top-n` `--dir` `--doi` `--file-format pdf/caj` `--fallback-format caj` `--citation-style` `--project` |
-| `cite` / `export` | 引用 / 导出 | `cite --style` (gbt7714/footnote/apa/mla/chicago) `--indices 9,2,5`（按正文引用顺序生成 `[1][2][3]`，仅补全所选文献页码） `--keep-numbers`；`export --format` (bibtex/ris/markdown/json/excel/...) `--indices` `--output` `--raw` `--project` |
+| `cite` / `export` | 引用 / 导出（自动补齐页码） | `cite --style` (gbt7714/footnote/apa/mla/chicago) `--indices 9,2,5` `--keep-numbers`；`export --format` (bibtex[纯ASCII键]/ris/markdown/json/excel/...) `--indices` `--output` `--raw` `--project` |
+| `verify-refs` | 题名纠偏与真伪/页码核验 | `verify-refs [--indices 1,3] [--fix-session] [--project <名>]`（专治"作者对但题名曾改名/回译偏差搜不到"及漏页码） |
+| `zotero [词]` | 本机 Zotero 文献库直连 | `zotero [query] [--collection <集合>] [--list-collections] [--save --append --project <名>]` |
 | `import "path"` | 导入题录或 PDF 库 | 支持 NoteExpress / Refworks / BibTeX 及**本地 PDF 文件或文件夹**，`--append` `--project` |
 | `projects` / `library` | 课题库整理与批注 | `library --project <名> [--keep 1,3,5-8] [--remove 4,9] [--dedupe] [--indices 1,3 --tag "核心实证" --note "批注"]` |
 | `review` | 生成综述证据包 | `--project` `--topic` `--limit` `--auto-detail` `--detail-top-n` `--cluster` `--gaps` `--output` `--raw` |
 | `write` | 生成综述证据骨架 | `--project` `--topic` `--mode outline/draft/section` `--section` `--format markdown/docx` `--with-citations` `--validate` |
 | `validate` | 校验正文证据支撑 | `--project` `--topic` `--file draft.md` |
-| `topics` / `trends` / `citations` | 选题 / 趋势 / 滚雪球引文 | `citations <知网URL/中文题名/DOI> --direction citing/cited/both --limit 20 [--save both --append --project <名>]` |
-| `read-paper` / `pdf-meta` | 读用户文稿 / PDF 元数据 | `read-paper <docx/txt/md> [--numbered] [--output] [--raw]`；`pdf-meta <file.pdf>` |
+| `topics` / `trends` / `citations` | 选题 / 趋势 / 深度引文 | `citations <知网URL/中文题名/DOI> --direction citing/cited/both/coref/cocited --limit 20 [--save both --append --project <名>]` |
+| `read-paper` / `pdf-meta` | 读用户文稿 / PDF 元数据 | `read-paper <docx/txt/md/tex> [--numbered] [--output] [--raw]`；`pdf-meta <file.pdf>` |
 | `write-docx` / `patch-docx` | 生成 / 修补 Word | `write-docx <md> [--output]`；`patch-docx <docx> --patch patch.json [--dry-run] [--output]` |
 | `workflows` / `check` / `clean-cache` | 模板 / 自检 / 清缓存 | `check [--fix] [--cnki-dom]`（`--cnki-dom` 巡检知网页面改版契约）；`clean-cache [--all] [--dry-run]` |
 
@@ -118,7 +120,7 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
 
 ## 硬性规则
 
-1. **禁止编造文献与元数据**：API/检索失败如实报错；题名、作者、年份、卷期页码、DOI 只来自工具返回，缺失标"未获取"或用 `--cite-enrich` 补全。
+1. **禁止编造文献、改译中文题名与漏填页码**：API/检索失败如实报错；**严禁把英文源（OpenAlex/Crossref）的英文标题自行意译成中文当作知网文献引用**（这会导致作者对但知网搜不到该题名），不确定真实中文题名时必须运行 `verify-refs --fix-session` 按作者锚定找回知网真实发表题名；引用输出统一调用 `cite` 或 `export`（切勿直接复制缺页码的 `citation_preview`）。
 2. **"研究空白"须附检索证据**：必须标明数据库、关键词、时间范围与命中篇数，不得把单次漏检断言为学界空白。
 3. **核心期刊标明体系与来源**：`--core` 仅在用户明确要求核心期刊时添加；展示时标明体系名称，未匹配答"未匹配"。
 4. **概括观点须可追溯**：严格基于摘要或 `read-detail` 全文，仅题录条目必须标注"待核对原文"；预印本（arXiv 等）须标注版本号与"非同行评议终稿"。

@@ -1,17 +1,18 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.17.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.18.0)
 
 模块职责分层:
-  - literature.py : CLI 参数解析、搜索/下载/引文/导出路由编排
+  - literature.py : CLI 参数解析、搜索/下载/引文/核验/导出路由编排
   - config.py     : 全局 (~/.scholar-kit) 与工作区 (./.scholar-kit) 状态及配置加载
   - evidence.py   : 会话/课题库（含筛选/去重/批注）、学科中立聚类、研究空白信号、证据骨架与论断核查
-  - docx_tools.py : .docx/.txt/.md 论文读取（含段落锚点）、本地 PDF 题录导入、Word 排版与补丁预检
+  - docx_tools.py : .docx/.txt/.md/.tex 论文读取（含段落锚点）、本地 PDF 题录导入、Word 排版与补丁预检
+  - zotero.py     : 本机 Zotero SQLite / 本地 HTTP 零依赖直连与 PDF 附件映射
   - doctor.py     : 环境自检 (`check`)、PEP 668 隔离虚拟环境引导与缓存清理 (`clean-cache`)
 """
 
 from __future__ import annotations
 
-__version__ = "1.17.0"
+__version__ = "1.18.0"
 
 import argparse
 import hashlib
@@ -47,6 +48,7 @@ from cnki import (  # noqa: E402
     get_cnki_citations,
     get_detail,
     parse_cnki_export,
+    reconcile_cnki_paper,
     search_cnki,
 )
 from config import allowed_fulltext_dirs, cache_dir, get as cfg_get, workspace_state_dir  # noqa: E402
@@ -94,9 +96,11 @@ from search import (  # noqa: E402
     search_dblp,
     search_nssd,
     search_openalex,
+    search_pubmed,
     search_semantic_scholar,
     search_with_fallback,
 )
+from zotero import query_local_zotero  # noqa: E402
 
 CITATION_STYLE_CHOICES = ["gbt7714", "gb", "apa", "mla", "chicago", "footnote"]
 
@@ -240,7 +244,7 @@ def _cnki_cache_set(args, results: list) -> None:
 
 def cmd_search(args) -> None:
     source = args.source or "cnki"
-    if source not in ("cnki", "openalex", "semantic", "arxiv", "nssd", "dblp", "base", "all"):
+    if source not in ("cnki", "openalex", "semantic", "arxiv", "pubmed", "nssd", "dblp", "base", "all"):
         _output({"status": "error", "code": "UNKNOWN_SOURCE", "message": f"未知数据源: {source}"})
         return
 
@@ -349,7 +353,7 @@ def cmd_search(args) -> None:
                 file=sys.stderr,
             )
 
-        elif has_keyword and enable_fallback and source in ("openalex", "semantic", "arxiv", "nssd", "dblp", "base"):
+        elif has_keyword and enable_fallback and source in ("openalex", "semantic", "arxiv", "pubmed", "nssd", "dblp", "base"):
             fallback_result = search_with_fallback(
                 query=args.query,
                 primary_source=source,
@@ -374,6 +378,14 @@ def cmd_search(args) -> None:
                 print(f"[fallback] {fallback_result['error']}", file=sys.stderr)
 
         elif has_keyword:
+            if source == "pubmed":
+                results.extend(search_pubmed(
+                    args.query, limit=api_limit,
+                    year_from=args.year_from, year_to=args.year_to,
+                    sort=args.sort or "relevance",
+                    field=field_param, journal=journal_filter,
+                    author=author_filter, page=page,
+                ))
             if source in ("openalex", "all"):
                 results.extend(search_openalex(
                     args.query, limit=api_limit,
@@ -475,6 +487,8 @@ def cmd_search(args) -> None:
             search_output["cnki_error"] = {"code": cnki_error.get("code"), "message": cnki_error.get("message")}
             search_output["status"] = "partial"
         if args.export:
+            if args.export in ("gbt7714", "gb", "apa", "mla", "chicago", "footnote", "bibtex", "ris"):
+                _enrich_bibliography_subset(deduped, deduped, _session_project(args))
             content = export_papers(deduped, args.export, args.output)
             if isinstance(content, dict) and content.get("status") == "error":
                 search_output["export_error"] = content
@@ -867,22 +881,64 @@ def cmd_auth_cnki(args) -> None:
     ))
 
 
+def _enrich_bibliography_subset(
+    selected_papers: List[Dict[str, Any]],
+    all_papers: List[Dict[str, Any]],
+    project: Optional[str],
+) -> bool:
+    """对选中论文子集统一执行单会话知网详情补全与 Crossref 卷期页码补全，若发生变更则持久化写回会话。"""
+    session_dirty = False
+    cnki_need_enrich = [
+        p for p in selected_papers
+        if _is_cnki_paper(p)
+        and p.get("url")
+        and not p.get("pages")
+        and not p.get("is_online_first")
+        and "cnki.net" in p.get("url", "")
+    ]
+    if cnki_need_enrich:
+        print(f"[cite] 正在单会话批量补全 {len(cnki_need_enrich)} 篇知网论文的卷期页码...", file=sys.stderr)
+        batch_read_detail(papers=cnki_need_enrich, top_n=len(cnki_need_enrich), fulltext=False)
+        session_dirty = True
+
+    for i, p in enumerate(selected_papers):
+        if p.get("doi") and (not p.get("volume") or not p.get("pages")) and not _is_cnki_paper(p):
+            if i > 0:
+                time.sleep(0.5)
+            crossref_data = resolve_crossref(p["doi"])
+            if crossref_data:
+                for k, v in crossref_data.items():
+                    if v and not p.get(k):
+                        p[k] = v
+                        session_dirty = True
+
+    if session_dirty and all_papers:
+        _save_session(all_papers, project=project)
+    return session_dirty
+
+
 def cmd_export(args) -> None:
     project = _session_project(args)
-    papers = _load_session(project)
-    if not papers:
+    all_papers = _load_session(project)
+    if not all_papers:
         _output({"status": "error", "code": "NO_SESSION_DATA", "message": "没有可导出的数据，请先执行 search、batch-search 或 import"})
         return
     indices_raw = getattr(args, "indices", None)
     if indices_raw:
         try:
-            pick_idx = parse_indices_spec(indices_raw, len(papers), preserve_order=True)
+            pick_idx = parse_indices_spec(indices_raw, len(all_papers), preserve_order=True)
         except ValueError:
             pick_idx = []
         if not pick_idx:
-            _output({"status": "error", "code": "INVALID_INDICES", "message": f"无效序号 '{indices_raw}'，当前共 {len(papers)} 篇"})
+            _output({"status": "error", "code": "INVALID_INDICES", "message": f"无效序号 '{indices_raw}'，当前共 {len(all_papers)} 篇"})
             return
-        papers = [papers[i] for i in pick_idx]
+        papers = [all_papers[i] for i in pick_idx]
+    else:
+        papers = all_papers
+
+    bib_formats = {"gbt7714", "gb", "apa", "mla", "chicago", "footnote", "bibtex", "ris"}
+    if args.export_format in bib_formats and not getattr(args, "no_enrich", False):
+        _enrich_bibliography_subset(papers, all_papers, project)
 
     result = export_papers(papers, args.export_format, args.output)
     if isinstance(result, dict) and result.get("status") == "error":
@@ -939,46 +995,21 @@ def cmd_cite(args) -> None:
         pick_idx = list(range(len(all_papers)))
 
     selected_papers = [all_papers[i] for i in pick_idx]
-    session_dirty = False
-
-    cnki_need_enrich = [
-        p for p in selected_papers
-        if _is_cnki_paper(p)
-        and p.get("url")
-        and not p.get("pages")
-        and not p.get("gbt7714_raw")
-        and not p.get("is_online_first")
-        and "cnki.net" in p.get("url", "")
-    ]
-    if cnki_need_enrich:
-        print(f"[cite] 正在单会话批量补全 {len(cnki_need_enrich)} 篇知网论文的卷期页码...", file=sys.stderr)
-        batch_read_detail(papers=cnki_need_enrich, top_n=len(cnki_need_enrich), fulltext=False)
-        session_dirty = True
+    _enrich_bibliography_subset(selected_papers, all_papers, project)
 
     enriched = []
     incomplete_indices: List[int] = []
     keep_numbers = bool(getattr(args, "keep_numbers", False))
     for out_pos, orig_i in enumerate(pick_idx, 1):
         p = all_papers[orig_i]
-        if p.get("doi") and not p.get("volume") and not _is_cnki_paper(p):
-            if out_pos > 1:
-                time.sleep(1)
-            crossref_data = resolve_crossref(p["doi"])
-            if crossref_data:
-                p.update({k: v for k, v in crossref_data.items() if v and not p.get(k)})
-                session_dirty = True
         doc_type = str(p.get("doc_type") or "journal")
         if (
             doc_type == "journal"
             and not p.get("pages")
-            and not p.get("gbt7714_raw")
             and not p.get("is_online_first")
         ):
             incomplete_indices.append((orig_i + 1) if keep_numbers else out_pos)
         enriched.append(p)
-
-    if session_dirty:
-        _save_session(all_papers, project=project)
 
     style = args.style or "gbt7714"
     ref_list = generate_reference_list(enriched, style)
@@ -1176,7 +1207,13 @@ def _normalize_snowball_items(items: List[Dict[str, Any]], relation: str) -> Lis
     return normalized
 
 
-def _maybe_save_citations_to_session(args, citing: List[Dict[str, Any]], references: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _maybe_save_citations_to_session(
+    args,
+    citing: List[Dict[str, Any]],
+    references: List[Dict[str, Any]],
+    extra_items: Optional[List[Dict[str, Any]]] = None,
+    extra_relation: str = "",
+) -> Optional[Dict[str, Any]]:
     save_mode = getattr(args, "save", None)
     if not save_mode:
         return None
@@ -1185,6 +1222,8 @@ def _maybe_save_citations_to_session(args, citing: List[Dict[str, Any]], referen
         to_save.extend(_normalize_snowball_items(citing, "citing"))
     if save_mode in ("cited", "both"):
         to_save.extend(_normalize_snowball_items(references, "cited"))
+    if save_mode in ("coref", "cocited") and extra_items:
+        to_save.extend(_normalize_snowball_items(extra_items, extra_relation or save_mode))
     to_save = deduplicate_results(to_save)
     project = _session_project(args)
     do_append = bool(getattr(args, "append", False))
@@ -1207,17 +1246,28 @@ def cmd_citations(args) -> None:
     limit = args.limit or 20
 
     if _is_cnki_citation_target(paper_id):
-        print(f"[citations] 查询知网论文 '{paper_id[:50]}' 的双向引文网络（方向: {direction}）...", file=sys.stderr)
+        print(f"[citations] 查询知网论文 '{paper_id[:50]}' 的引文网络（方向: {direction}）...", file=sys.stderr)
         cnki_res = get_cnki_citations(paper_id, direction=direction, limit=limit)
         if cnki_res.get("status") != "error":
+            extra = cnki_res.get("coreferences") or cnki_res.get("cocitations") or []
             saved_info = _maybe_save_citations_to_session(
                 args,
                 cnki_res.get("citing", []),
                 cnki_res.get("references", []),
+                extra_items=extra,
+                extra_relation=direction,
             )
             if saved_info is not None:
                 cnki_res = {**cnki_res, "saved_to_session": saved_info}
         _output(cnki_res)
+        return
+
+    if direction in ("coref", "cocited"):
+        _output({
+            "status": "error",
+            "code": "UNSUPPORTED_DIRECTION",
+            "message": f"方向 '{direction}'（共引/同被引文献）目前仅知网中文论文支持；英文论文请使用 citing / cited / both",
+        })
         return
 
     print(f"[citations] 查询 {paper_id} 的引文网络（方向: {direction}）...", file=sys.stderr)
@@ -1241,6 +1291,181 @@ def cmd_citations(args) -> None:
     if saved_info is not None:
         out["saved_to_session"] = saved_info
     _output(out)
+
+
+def cmd_zotero(args) -> None:
+    res = query_local_zotero(
+        query=args.query or "",
+        collection=args.collection or "",
+        data_dir=args.data_dir,
+        limit=args.limit or 30,
+    )
+    if getattr(args, "list_collections", False) and res.get("status") == "success":
+        _output({
+            "status": "success",
+            "backend": res.get("backend"),
+            "data_dir": res.get("data_dir"),
+            "collections": res.get("collections", []),
+        })
+        return
+    if res.get("status") == "success" and getattr(args, "save", False) and res.get("results"):
+        papers = res["results"]
+        for p in papers:
+            p["quality_score"] = calculate_quality_score(p)
+        project = _session_project(args)
+        do_append = bool(getattr(args, "append", False))
+        _save_session(papers, append=do_append, project=project)
+        res["saved_to_session"] = {"count": len(papers), "append": do_append, "project": project}
+    _output(res)
+
+
+def cmd_verify_refs(args) -> None:
+    """真伪核验与『作者对但题名改名/回译偏差』自动纠偏 + 缺页码补全。"""
+    from cnki.search import _extract_first_author_clean, _title_similarity
+
+    project = _session_project(args)
+    all_papers = _load_session(project)
+    if not all_papers:
+        _output({"status": "error", "code": "NO_SESSION_DATA", "message": "会话中没有待核验文献，请先执行 search 或 import"})
+        return
+
+    indices_raw = getattr(args, "indices", None)
+    if indices_raw:
+        try:
+            pick_idx = parse_indices_spec(indices_raw, len(all_papers), preserve_order=True)
+        except ValueError:
+            pick_idx = []
+        if not pick_idx:
+            _output({"status": "error", "code": "INVALID_INDICES", "message": f"无效序号 '{indices_raw}'"})
+            return
+    else:
+        pick_idx = list(range(len(all_papers)))
+
+    fix_session = bool(getattr(args, "fix_session", False))
+    report_items: List[Dict[str, Any]] = []
+    cnki_papers_to_enrich: List[Dict[str, Any]] = []
+    counts = {"verified": 0, "title_reconciled": 0, "not_found": 0}
+    dirty = False
+
+    for orig_i in pick_idx:
+        p = all_papers[orig_i]
+        title = str(p.get("title") or "").strip()
+        authors = str(p.get("authors") or "").strip()
+        journal = str(p.get("journal") or "").strip()
+        year = p.get("year")
+        is_cjk_item = _is_cnki_paper(p) or (any("\u4e00" <= ch <= "\u9fff" for ch in title) and not p.get("doi"))
+
+        if is_cjk_item:
+            rec = reconcile_cnki_paper(title=title, author=authors, journal=journal, year=year)
+            if rec.get("matched") and isinstance(rec.get("paper"), dict):
+                matched_p = rec["paper"]
+                changed = bool(rec.get("title_changed"))
+                st = "title_reconciled" if changed else "verified"
+                counts[st] += 1
+                item_rep: Dict[str, Any] = {
+                    "index": orig_i + 1,
+                    "status": st,
+                    "method": rec.get("method"),
+                    "similarity": rec.get("similarity"),
+                    "title": title,
+                    "authentic_title": matched_p.get("title", title),
+                    "authors": matched_p.get("authors") or authors,
+                    "journal": matched_p.get("journal") or journal,
+                    "year": matched_p.get("year") or year,
+                    "url": matched_p.get("url", ""),
+                }
+                if fix_session:
+                    if changed:
+                        p["original_unverified_title"] = title
+                        p["title"] = matched_p.get("title", title)
+                    for k in ("url", "journal", "year", "authors", "is_core", "core_type", "cited_by", "downloads"):
+                        if matched_p.get(k) and (changed or not p.get(k)):
+                            p[k] = matched_p[k]
+                    p["source"] = p.get("source") or "CNKI"
+                    dirty = True
+                    if not p.get("pages") and p.get("url") and not p.get("is_online_first"):
+                        cnki_papers_to_enrich.append(p)
+                report_items.append(item_rep)
+            else:
+                counts["not_found"] += 1
+                report_items.append({
+                    "index": orig_i + 1,
+                    "status": "not_found",
+                    "title": title,
+                    "authors": authors,
+                    "reason": rec.get("reason", "not_found_on_cnki"),
+                })
+        else:
+            # 英文 / DOI 文献通过 Crossref + OpenAlex 作者锚定核验
+            matched_en = None
+            sim_en = 0.0
+            if p.get("doi"):
+                cr = resolve_crossref(str(p["doi"]))
+                if cr and cr.get("title"):
+                    sim_en = _title_similarity(title, cr["title"]) if title else 1.0
+                    matched_en = cr
+            if matched_en is None and title:
+                first_au = _extract_first_author_clean(authors)
+                oa_hits = search_openalex(title, limit=5, author=first_au or None)
+                if not oa_hits and first_au:
+                    # 英文题名若被改写，按作者 + 题名前几个实词回查
+                    core_words = " ".join(w for w in title.split() if len(w) > 3)[:40]
+                    oa_hits = search_openalex(core_words or first_au, limit=10, author=first_au)
+                for cand in oa_hits:
+                    sc = _title_similarity(title, cand.get("title", ""))
+                    if sc > sim_en:
+                        sim_en = sc
+                        matched_en = cand
+
+            if matched_en and sim_en >= 0.45:
+                changed = sim_en < 0.90
+                st = "title_reconciled" if changed else "verified"
+                counts[st] += 1
+                if fix_session:
+                    if changed:
+                        p["original_unverified_title"] = title
+                        p["title"] = matched_en.get("title", title)
+                    for k in ("volume", "issue", "pages", "doi", "journal", "year"):
+                        if matched_en.get(k) and not p.get(k):
+                            p[k] = matched_en[k]
+                    dirty = True
+                report_items.append({
+                    "index": orig_i + 1,
+                    "status": st,
+                    "similarity": round(sim_en, 3),
+                    "title": title,
+                    "authentic_title": matched_en.get("title", title),
+                    "pages": matched_en.get("pages") or p.get("pages", ""),
+                    "doi": matched_en.get("doi") or p.get("doi", ""),
+                })
+            else:
+                counts["not_found"] += 1
+                report_items.append({
+                    "index": orig_i + 1,
+                    "status": "not_found",
+                    "title": title,
+                    "authors": authors,
+                })
+
+    if fix_session and cnki_papers_to_enrich:
+        batch_read_detail(papers=cnki_papers_to_enrich, top_n=len(cnki_papers_to_enrich), fulltext=False)
+        for item_rep in report_items:
+            orig_p = all_papers[item_rep["index"] - 1]
+            if orig_p.get("pages"):
+                item_rep["pages"] = orig_p["pages"]
+        dirty = True
+
+    if dirty:
+        _save_session(all_papers, project=project)
+
+    overall = "warning" if (counts["not_found"] > 0 or counts["title_reconciled"] > 0) else "success"
+    _output({
+        "status": overall,
+        "project": project,
+        "fixed_session": fix_session and dirty,
+        "summary": counts,
+        "results": report_items,
+    })
 
 
 def cmd_close_browser(_args) -> None:
@@ -1456,7 +1681,7 @@ def main() -> None:
     p_search = sub.add_parser("search", help="搜索文献")
     p_search.add_argument("query", nargs="?", default="", help="搜索关键词（指定 --author / --journal / --affiliation / --expr 时可省略）")
     p_search.add_argument("--source", default="cnki",
-                          help="数据源: cnki/openalex/semantic/arxiv/nssd/dblp/base/all (默认 cnki)")
+                          help="数据源: cnki/openalex/semantic/arxiv/pubmed/nssd/dblp/base/all (默认 cnki)")
     p_search.add_argument("--limit", type=int, default=None, help="结果数量限制（默认 20，多页时自动扩展）")
     p_search.add_argument("--core", help="知网侧边栏来源类别，逗号分隔: 北大核心,CSSCI,AMI,WJCI,CSCD,EI")
     p_search.add_argument("--doc-type",
@@ -1546,6 +1771,7 @@ def main() -> None:
                           choices=["bibtex", "ris", "markdown", "json", "excel",
                                    "gbt7714", "footnote", "apa", "mla", "chicago"])
     p_export.add_argument("--indices", help="仅导出指定序号文献（按传入顺序，如 '1,3,7' 或 '1-5'）")
+    p_export.add_argument("--no-enrich", action="store_true", help="导出引用格式时不自动访问知网/Crossref 补全缺页码")
     p_export.add_argument("--output", help="输出文件路径")
     p_export.add_argument("--raw", action="store_true", help="输出纯文本而非 JSON")
     p_export.add_argument("--project", help="课题文献库名称")
@@ -1662,15 +1888,34 @@ def main() -> None:
     p_clean.set_defaults(func=cmd_clean_cache)
 
     # citations & trends
-    p_cite_net = sub.add_parser("citations", help="引文网络分析（支持知网 URL/中文题名及英文 DOI/arXiv ID，支持滚雪球入库）")
+    p_cite_net = sub.add_parser("citations", help="引文网络分析（支持知网引证/参考/共引/同被引及英文 DOI/arXiv ID，支持滚雪球入库）")
     p_cite_net.add_argument("paper_id", help="论文标识（知网详情 URL、中文论文题名、DOI、Semantic Scholar URL、arXiv ID）")
-    p_cite_net.add_argument("--direction", choices=["citing", "cited", "both"], default="both")
+    p_cite_net.add_argument("--direction", choices=["citing", "cited", "both", "coref", "cocited"], default="both",
+                            help="方向: citing(引证)/cited(参考)/both(双向)/coref(知网共引)/cocited(知网同被引)")
     p_cite_net.add_argument("--limit", type=int, default=20)
-    p_cite_net.add_argument("--save", choices=["citing", "cited", "both"], default=None,
-                            help="将抓取到的引证(citing)/参考(cited)/双向引文直接存入会话或课题库")
+    p_cite_net.add_argument("--save", choices=["citing", "cited", "both", "coref", "cocited"], default=None,
+                            help="将抓取到的引文直接存入会话或课题库")
     p_cite_net.add_argument("--append", action="store_true", help="配合 --save 追加到现有课题文献库")
     p_cite_net.add_argument("--project", help="配合 --save 写入指定课题文献库")
     p_cite_net.set_defaults(func=cmd_citations)
+
+    # zotero & verify-refs
+    p_zotero = sub.add_parser("zotero", help="检索或导入本机 Zotero 文献库（零依赖读取 zotero.sqlite 或本地 API）")
+    p_zotero.add_argument("query", nargs="?", default="", help="过滤关键词（匹配标题、作者、期刊、摘要、标签）")
+    p_zotero.add_argument("--collection", help="仅读取指定名称的 Zotero 分类文件夹")
+    p_zotero.add_argument("--data-dir", help="自定义 Zotero 数据目录（默认自动探测 ~/Zotero）")
+    p_zotero.add_argument("--limit", type=int, default=30, help="最多读取条数（默认 30）")
+    p_zotero.add_argument("--list-collections", action="store_true", help="仅列出本机 Zotero 所有分类文件夹")
+    p_zotero.add_argument("--save", action="store_true", help="将结果存入当前会话或指定 --project 课题库")
+    p_zotero.add_argument("--append", action="store_true", help="配合 --save 追加到现有课题库")
+    p_zotero.add_argument("--project", help="课题文献库名称")
+    p_zotero.set_defaults(func=cmd_zotero)
+
+    p_vrefs = sub.add_parser("verify-refs", help="核验会话文献真伪，自动找回『作者正确但题名改名/回译偏差』的真实题名并补全页码")
+    p_vrefs.add_argument("--indices", help="仅核验指定序号（如 '1,3,5-8'，默认全部）")
+    p_vrefs.add_argument("--fix-session", action="store_true", help="自动将会话中的偏差题名修正为官方真实题名并补齐缺失卷期页码")
+    p_vrefs.add_argument("--project", help="课题文献库名称")
+    p_vrefs.set_defaults(func=cmd_verify_refs)
 
     p_trends = sub.add_parser("trends", help="研究趋势分析（基于会话中的搜索结果）")
     p_trends.add_argument("--project", help="课题文献库名称")

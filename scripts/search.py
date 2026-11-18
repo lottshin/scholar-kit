@@ -68,6 +68,7 @@ CACHE_TTL_BY_SOURCE = {
     "openalex": 24 * 7,      # 7 天（更新较慢）
     "semantic_scholar": 24 * 3,  # 3 天
     "arxiv": 24,             # 1 天（更新快）
+    "pubmed": 24 * 3,        # 3 天（Europe PMC / PubMed）
     "cnki": 24 * 7,          # 7 天
     "nssd": 24 * 7,          # 7 天
     "crossref": 24 * 30,     # 30 天（元数据稳定）
@@ -158,6 +159,7 @@ API_FALLBACK_CHAIN = {
     "semantic": ["openalex", "arxiv"],
     "semantic_scholar": ["openalex", "arxiv"],
     "arxiv": ["openalex", "semantic_scholar"],
+    "pubmed": ["openalex", "semantic_scholar"],
     "nssd": ["openalex"],
     "dblp": ["openalex", "semantic_scholar"],
     "base": ["openalex"],
@@ -323,23 +325,41 @@ def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to:
             ]
         abstract = _invert_abstract(w.get("abstract_inverted_index"))
 
-        # 摘要质量增强：如果摘要为空且有 DOI，尝试从 Crossref 获取
-        if not abstract and doi:
+        # 提取卷、期、页码（OpenAlex 原生 biblio 字段，避免引用漏页码）
+        biblio = w.get("biblio") or {}
+        volume = str(biblio.get("volume") or "").strip()
+        issue = str(biblio.get("issue") or "").strip()
+        fp = str(biblio.get("first_page") or "").strip()
+        lp = str(biblio.get("last_page") or "").strip()
+        pages = f"{fp}-{lp}" if (fp and lp and fp != lp) else (fp or lp)
+
+        # 摘要与卷期增强：如果摘要或页码为空且有 DOI，尝试从 Crossref 补全
+        if (not abstract or not pages) and doi:
             try:
                 crossref_data = resolve_crossref(doi)
-                if crossref_data and crossref_data.get("abstract"):
-                    abstract = crossref_data["abstract"]
+                if crossref_data:
+                    if not abstract and crossref_data.get("abstract"):
+                        abstract = crossref_data["abstract"]
+                    if not volume and crossref_data.get("volume"):
+                        volume = str(crossref_data["volume"])
+                    if not issue and crossref_data.get("issue"):
+                        issue = str(crossref_data["issue"])
+                    if not pages and crossref_data.get("pages"):
+                        pages = str(crossref_data["pages"])
             except Exception:
                 pass  # 静默失败，不影响主流程
 
         # 添加摘要质量标记
         abstract_quality = "full" if len(abstract) > 200 else "partial" if abstract else "none"
 
-        results.append({
+        entry = {
             "title": w.get("title", ""),
             "authors": authors,
             "year": w.get("publication_year"),
             "journal": src.get("display_name", ""),
+            "volume": volume,
+            "issue": issue,
+            "pages": pages,
             "doi": doi,
             "cited_by": w.get("cited_by_count", 0),
             "url": w.get("id", ""),
@@ -349,7 +369,8 @@ def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to:
             "oa_url": w.get("open_access", {}).get("oa_url", ""),
             "keywords": keywords,
             "source": "OpenAlex",
-        })
+        }
+        results.append(entry)
 
     # 高级过滤：期刊（客户端过滤，因为 API 过滤不可靠）
     if journal:
@@ -402,7 +423,7 @@ def search_semantic_scholar(query: str, limit: int = 10, year_from: int = None, 
         "query": query,
         "limit": min(limit, 100),
         "offset": offset,
-        "fields": "title,authors,year,abstract,url,citationCount,externalIds,isOpenAccess,openAccessPdf,fieldsOfStudy,venue",
+        "fields": "title,authors,year,abstract,url,citationCount,externalIds,isOpenAccess,openAccessPdf,fieldsOfStudy,venue,journal",
     }
     # 添加排序参数
     if sort == "citations":
@@ -434,13 +455,18 @@ def search_semantic_scholar(query: str, limit: int = 10, year_from: int = None, 
             stopwords = {"the", "a", "an", "of", "in", "on", "for", "with", "to", "and", "or", "from", "by", "at", "as"}
             fos = [w for w in title_words if len(w) > 3 and w not in stopwords][:5]
 
-        venue = p.get("venue", "") or ""
+        j_info = p.get("journal") or {}
+        venue = p.get("venue", "") or j_info.get("name", "") or ""
+        s2_vol = str(j_info.get("volume") or "").strip()
+        s2_pages = str(j_info.get("pages") or "").strip()
 
         results.append({
             "title": p.get("title", ""),
             "authors": ", ".join(a.get("name", "") for a in p.get("authors", [])),
             "year": p.get("year"),
             "journal": venue,
+            "volume": s2_vol,
+            "pages": s2_pages,
             "doi": ext_ids.get("DOI", ""),
             "arxiv_id": ext_ids.get("ArXiv", ""),
             "cited_by": p.get("citationCount", 0),
@@ -687,11 +713,19 @@ def search_nssd(query: str, limit: int = 10, year_from: int = None, year_to: int
         year_match = re.search(r"(\d{4})", year_text)
         year = int(year_match.group(1)) if year_match else None
 
+        full_row_txt = item.get_text(" ", strip=True)
+        iss_m = re.search(r"第\s*(\d+)\s*期|\((\d+)\)", full_row_txt)
+        issue_val = (iss_m.group(1) or iss_m.group(2) or "").lstrip("0") if iss_m else ""
+        pg_m = re.search(r"(\d+[-–—]\d+)\s*页|[:：]\s*(\d+[-–—]\d+)", full_row_txt)
+        pages_val = (pg_m.group(1) or pg_m.group(2) or "").replace("–", "-").replace("—", "-") if pg_m else ""
+
         results.append({
             "title": title,
             "authors": authors,
             "year": year,
             "journal": journal,
+            "issue": issue_val,
+            "pages": pages_val,
             "doi": "",
             "cited_by": 0,
             "url": href,
@@ -771,14 +805,20 @@ def search_dblp(query: str, limit: int = 10, year_from: int = None, year_to: int
         url = info.get("url", "")
         ee = info.get("ee", "")  # 电子版链接
 
-        # 解析类型
+        # 解析类型与卷期页码
         doc_type = info.get("type", "")
+        volume = str(info.get("volume") or "").strip()
+        issue = str(info.get("number") or "").strip()
+        pages = str(info.get("pages") or "").strip()
 
         results.append({
             "title": info.get("title", ""),
             "authors": authors,
             "year": year,
             "journal": venue,
+            "volume": volume,
+            "issue": issue,
+            "pages": pages,
             "doi": doi,
             "cited_by": 0,  # DBLP 不提供引用数
             "url": url,
@@ -906,6 +946,113 @@ def search_base(query: str, limit: int = 10, year_from: int = None, year_to: int
     return results
 
 
+# ── PubMed / Europe PMC ───────────────────────────────
+
+def search_pubmed(
+    query: str,
+    limit: int = 10,
+    year_from: int = None,
+    year_to: int = None,
+    sort: str = "relevance",
+    field: str = "default",
+    journal: str = None,
+    author: str = None,
+    page: int = 1,
+) -> list[dict]:
+    """通过官方免 Key 的 Europe PMC REST API 检索 PubMed / MEDLINE 生物医学与生命科学文献（一次返回完整摘要与卷期页码）。"""
+    cache_key = _cache_key("pubmed", f"{query}_{limit}_{year_from}_{year_to}_{sort}_{field}_{journal}_{author}_{page}")
+    cached = _cache_get(cache_key, source="pubmed", query=query)
+    if cached is not None:
+        return cached
+
+    q_parts = []
+    if field == "title":
+        q_parts.append(f'TITLE:"{query}"')
+    elif field == "abstract":
+        q_parts.append(f'ABSTRACT:"{query}"')
+    else:
+        q_parts.append(f"({query})")
+
+    if author:
+        q_parts.append(f'AUTH:"{author}"')
+    if journal:
+        q_parts.append(f'JOURNAL:"{journal}"')
+    if year_from is not None or year_to is not None:
+        y_lo = year_from or 1900
+        y_hi = year_to or datetime.now().year
+        q_parts.append(f"PUB_YEAR:[{y_lo} TO {y_hi}]")
+
+    full_query = " AND ".join(q_parts)
+    if sort == "citations":
+        full_query += " sort_cited:y"
+    elif sort == "date":
+        full_query += " sort_date:y"
+
+    params = {
+        "query": full_query,
+        "format": "json",
+        "resultType": "core",
+        "pageSize": min(max(limit, 1), 100),
+        "page": max(page, 1),
+    }
+
+    data = _http_get("https://www.ebi.ac.uk/europepmc/webservices/rest/search", params=params)
+    if not isinstance(data, dict):
+        return []
+    raw_items = (data.get("resultList") or {}).get("result") or []
+    if not raw_items:
+        return []
+
+    results = []
+    for item in raw_items[:limit]:
+        j_info = item.get("journalInfo") or {}
+        j_obj = j_info.get("journal") or {}
+        journal_title = j_obj.get("title") or item.get("journalTitle") or ""
+        volume = str(j_info.get("volume") or item.get("journalVolume") or "").strip()
+        issue = str(j_info.get("issue") or item.get("issue") or "").strip()
+        pages = str(item.get("pageInfo") or "").strip()
+        pmid = str(item.get("pmid") or "").strip()
+        pmcid = str(item.get("pmcid") or "").strip()
+        doi = str(item.get("doi") or "").strip()
+        pub_year = item.get("pubYear")
+        try:
+            year_val = int(pub_year) if pub_year else None
+        except (TypeError, ValueError):
+            year_val = None
+
+        kw_list = (item.get("keywordList") or {}).get("keyword") or []
+        keywords = [str(k).strip() for k in kw_list if k][:10]
+        is_oa = str(item.get("isOpenAccess") or "").upper() == "Y"
+        url = (
+            f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+            if pmid else (f"https://doi.org/{doi}" if doi else f"https://europepmc.org/article/PMC/{pmcid}")
+        )
+        oa_url = f"https://europepmc.org/articles/{pmcid}?pdf=render" if (is_oa and pmcid) else ""
+
+        results.append({
+            "title": (item.get("title") or "").strip().rstrip("."),
+            "authors": (item.get("authorString") or "").strip().rstrip("."),
+            "year": year_val,
+            "journal": journal_title,
+            "volume": volume,
+            "issue": issue,
+            "pages": pages,
+            "doi": doi,
+            "pmid": pmid,
+            "pmcid": pmcid,
+            "cited_by": int(item.get("citedByCount") or 0),
+            "url": url,
+            "abstract": (item.get("abstractText") or "").strip(),
+            "keywords": keywords,
+            "is_oa": is_oa,
+            "oa_url": oa_url,
+            "source": "PubMed",
+        })
+
+    _cache_set(cache_key, results, source="pubmed")
+    return results
+
+
 # ── 聚合搜索 ─────────────────────────────────────────
 
 def search_with_fallback(query: str, primary_source: str, limit: int = 10,
@@ -938,6 +1085,7 @@ def search_with_fallback(query: str, primary_source: str, limit: int = 10,
         "semantic_scholar": search_semantic_scholar,
         "semantic": search_semantic_scholar,
         "arxiv": search_arxiv,
+        "pubmed": search_pubmed,
         "nssd": search_nssd,
         "dblp": search_dblp,
         "base": search_base,
@@ -956,6 +1104,13 @@ def search_with_fallback(query: str, primary_source: str, limit: int = 10,
                 page=kwargs.get("page", 1),
                 **common,
             )
+        if source_name == "pubmed":
+            pm_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key in ("field", "journal", "author", "page")
+            }
+            return source_func(query, sort=sort, **common, **pm_kwargs)
         if source_name in ("openalex", "semantic", "semantic_scholar"):
             api_kwargs = {
                 key: value
@@ -1295,7 +1450,7 @@ def calculate_quality_score(paper: dict) -> float:
     if paper.get("is_oa"):
         score += 10
 
-    if source in ("OpenAlex", "Semantic Scholar"):
+    if source in ("OpenAlex", "Semantic Scholar", "PubMed"):
         score += 5
     elif source == "arXiv":
         score += 3

@@ -81,7 +81,7 @@ CNKI_SELECTORS: Dict[str, Dict[str, Any]] = {
         "sidebar_core": 'dl[groupid="LYBSM"]',
     },
     "detail": {
-        "title": ".wx-tit h1, h1.title, h1[class*='title'], h1",
+        "title": ".wx-tit h1, .brief h1, .doc-top h1",
         "abstract": "#ChDivSummary, .abstract-text, span#ChDivSummary",
         "keywords": ".keywords a, p.keywords a",
         "authors": ".author a, h3.author a",
