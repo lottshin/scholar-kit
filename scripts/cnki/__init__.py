@@ -5,15 +5,16 @@ cnki - 知网 (CNKI) 搜索与下载模块
 from __future__ import annotations
 
 from .constants import (
-    CNKI_SEARCH_URL, REQUEST_INTERVAL, CNKI_SIDEBAR_CORES,
+    CNKI_SEARCH_URL, CNKI_ADV_SEARCH_URL, REQUEST_INTERVAL, CNKI_SIDEBAR_CORES,
     HAS_SELENIUM, _log,
 )
 from .driver import (
     _detect_browser, _create_driver, _load_cookies, _save_cookies,
     _handle_captcha, check_cnki_access, _cookie_path,
     _is_cnki_security_gate, _show_browser_for_captcha,
-    authenticate_cnki,
+    authenticate_cnki, _release_driver, _safe_get, close_shared_browser,
 )
-from .search import search_cnki, batch_search_cnki
-from .detail import get_detail, batch_read_detail
+from .selectors import CNKI_SELECTORS, probe_cnki_dom_contracts, save_adv_dom_diagnosis
+from .search import search_cnki, batch_search_cnki, build_cnki_expression, refresh_cnki_url
+from .detail import get_detail, batch_read_detail, get_cnki_citations, parse_cnki_citation_item
 from .download import download_cnki, batch_download_cnki, parse_cnki_export

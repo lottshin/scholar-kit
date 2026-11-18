@@ -81,14 +81,56 @@ _REALISTIC_UA = (
 )
 
 
-def _cookie_path() -> Path:
-    return Path.cwd() / ".scholar-kit" / "cookies.json"
+def _build_user_agent(browser: str = "edge", headless: bool = False) -> Optional[str]:
+    """构建与当前操作系统和浏览器一致的 User-Agent。
+
+    有头模式下返回 None，直接使用本机浏览器原生 UA，避免在 macOS/Linux Chrome
+    上注入 Windows Edge UA 导致 navigator.platform / userAgentData 指纹冲突。
+    无头模式下返回去除 HeadlessChrome 特征且匹配 OS 与浏览器的 UA。
+    """
+    if not headless:
+        return None
+
+    if sys.platform == "darwin":
+        os_token = "Macintosh; Intel Mac OS X 10_15_7"
+    elif sys.platform == "win32":
+        os_token = "Windows NT 10.0; Win64; x64"
+    else:
+        os_token = "X11; Linux x86_64"
+
+    base = (
+        f"Mozilla/5.0 ({os_token}) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
+    if browser == "edge":
+        return f"{base} Edg/131.0.0.0"
+    return base
+
+
+def _profile_dir(create: bool = False) -> Path:
+    try:
+        from config import browser_profile_dir
+        return browser_profile_dir(create=create)
+    except ImportError:
+        d = Path.cwd() / ".scholar-kit" / "browser-profile"
+        if create:
+            d.mkdir(parents=True, exist_ok=True)
+        return d
+
+
+def _cookie_path(for_write: bool = False) -> Path:
+    try:
+        from config import cookie_file
+        return cookie_file(for_write=for_write)
+    except ImportError:
+        return Path.cwd() / ".scholar-kit" / "cookies.json"
 
 
 def _save_cookies(driver: "webdriver.Remote"):
-    """将当前浏览器 cookies 持久化到项目目录"""
+    """将当前浏览器 cookies 持久化到状态目录"""
     try:
-        p = _cookie_path()
+        p = _cookie_path(for_write=True)
         p.parent.mkdir(parents=True, exist_ok=True)
         cookies = driver.get_cookies()
         p.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -98,7 +140,7 @@ def _save_cookies(driver: "webdriver.Remote"):
 
 def _load_cookies(driver: "webdriver.Remote"):
     """从持久化文件加载 cookies 到浏览器"""
-    p = _cookie_path()
+    p = _cookie_path(for_write=False)
     if not p.exists():
         return
     try:
@@ -268,11 +310,7 @@ def _launch_browser_outside_sandbox(browser: str, port: int = _DEFAULT_DEBUG_POR
         _log(f"[cnki] 未找到 {browser} 可执行文件，无法外部启动")
         return False
 
-    profile_dir = Path.cwd() / ".scholar-kit" / "browser-profile"
-    try:
-        profile_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
+    profile_dir = _profile_dir(create=True)
 
     args = [
         f"--remote-debugging-port={port}",
@@ -281,9 +319,9 @@ def _launch_browser_outside_sandbox(browser: str, port: int = _DEFAULT_DEBUG_POR
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-blink-features=AutomationControlled",
-        f"--user-agent={_REALISTIC_UA}",
         f"--window-position={_VISIBLE_POS[0]},{_VISIBLE_POS[1]}",
-        "--window-size=1200,900",
+        "--window-size=1280,900",
+        "about:blank",
     ]
 
     if sys.platform == "win32":
@@ -336,16 +374,28 @@ def _launch_browser_outside_sandbox(browser: str, port: int = _DEFAULT_DEBUG_POR
     return False
 
 
+def _is_debug_port_open(port: int = _DEFAULT_DEBUG_PORT, timeout: float = 0.35) -> bool:
+    """毫秒级探测本地调试端口是否已存活。"""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except PermissionError:
+        return _wait_for_debug_port_http(port, 1)
+    except (ConnectionRefusedError, OSError, socket.timeout):
+        return False
+
+
 def _wait_for_debug_port(port: int = _DEFAULT_DEBUG_PORT, timeout: int = 15) -> bool:
     """等待浏览器调试端口就绪。"""
     import socket
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=2):
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
                 return True
         except (ConnectionRefusedError, OSError, socket.timeout):
-            time.sleep(1)
+            time.sleep(0.25)
         except PermissionError:
             _log("[cnki] socket 权限被拒（沙盒），改用 HTTP 探测调试端口...")
             return _wait_for_debug_port_http(port, max(1, int(deadline - time.time())))
@@ -367,23 +417,26 @@ def _wait_for_debug_port_http(port: int, timeout: int) -> bool:
 
 
 def _connect_remote_browser(browser: str, port: int = _DEFAULT_DEBUG_PORT) -> "webdriver.Remote":
-    """通过远程调试端口连接到已运行的浏览器。"""
+    """通过远程调试端口连接到已运行的浏览器（优先由 Selenium Manager 精确匹配驱动版本，离线时回退最高版本本地驱动）。"""
     OptionsClass = webdriver.EdgeOptions if browser == "edge" else webdriver.ChromeOptions
     DriverClass = webdriver.Edge if browser == "edge" else webdriver.Chrome
 
     options = OptionsClass()
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
 
-    local_driver = _find_local_driver(browser)
-    if local_driver:
+    driver = None
+    try:
+        driver = DriverClass(options=options)
+    except Exception as first_err:
+        local_driver = _find_local_driver(browser)
+        if not local_driver:
+            raise first_err
         if browser == "edge":
             from selenium.webdriver.edge.service import Service
         else:
             from selenium.webdriver.chrome.service import Service
         service = Service(executable_path=local_driver)
         driver = DriverClass(service=service, options=options)
-    else:
-        driver = DriverClass(options=options)
 
     _log(f"[cnki] 已通过远程调试端口 {port} 连接到 {browser}")
     return driver
@@ -483,7 +536,11 @@ def _ensure_selenium_cache():
         test_file.write_text("ok")
         test_file.unlink()
     except (PermissionError, OSError):
-        fallback = Path.cwd() / ".scholar-kit" / "selenium-cache"
+        try:
+            from config import cache_dir
+            fallback = cache_dir("selenium-cache", create=True)
+        except ImportError:
+            fallback = Path.cwd() / ".scholar-kit" / "selenium-cache"
         try:
             fallback.mkdir(parents=True, exist_ok=True)
             os.environ["SE_CACHE_PATH"] = str(fallback)
@@ -498,7 +555,7 @@ def _find_local_driver(browser: str) -> Optional[str]:
     搜索顺序：
     1. SCHOLAR_DRIVER_PATH 环境变量（用户显式指定）
     2. PATH 环境变量
-    3. Selenium 缓存目录
+    3. Selenium 缓存目录（全平台支持）
     4. Edge/Chrome 安装目录的版本子文件夹
     5. selenium-manager --offline 模式（利用 Selenium 内置工具查找）
     """
@@ -516,15 +573,38 @@ def _find_local_driver(browser: str) -> Optional[str]:
         _log(f"[cnki] 在 PATH 中找到驱动: {found}")
         return found
 
+    cache_roots = []
+    if os.environ.get("SE_CACHE_PATH"):
+        cache_roots.append(Path(os.environ["SE_CACHE_PATH"]))
     if sys.platform == "win32":
-        se_cache = os.environ.get("SE_CACHE_PATH") or str(
-            Path(os.environ.get("LOCALAPPDATA", "")) / "selenium")
-        if os.path.isdir(se_cache):
-            for root, _dirs, files in os.walk(se_cache):
+        cache_roots.append(Path(os.environ.get("LOCALAPPDATA", "")) / "selenium")
+    else:
+        cache_roots.append(Path.home() / ".cache" / "selenium")
+    try:
+        from config import cache_dir
+        cache_roots.append(cache_dir("selenium-cache", create=False))
+    except ImportError:
+        pass
+
+    cached_candidates: list[str] = []
+    for se_cache in cache_roots:
+        if se_cache and se_cache.is_dir():
+            for root, _dirs, files in os.walk(str(se_cache)):
                 if driver_name in files:
-                    p = os.path.join(root, driver_name)
-                    _log(f"[cnki] 在缓存中找到驱动: {p}")
-                    return p
+                    cached_candidates.append(os.path.join(root, driver_name))
+    if cached_candidates:
+        def _ver_key(path_str: str) -> tuple:
+            nums = tuple(int(x) for x in re.findall(r"\d+", path_str))
+            try:
+                mtime = os.path.getmtime(path_str)
+            except OSError:
+                mtime = 0.0
+            return (nums, mtime)
+
+        cached_candidates.sort(key=_ver_key, reverse=True)
+        best = cached_candidates[0]
+        _log(f"[cnki] 在缓存中找到最新驱动: {best}")
+        return best
 
     if sys.platform == "win32":
         app_dirs = []
@@ -576,8 +656,156 @@ def _find_local_driver(browser: str) -> Optional[str]:
     return None
 
 
+def _should_reuse_browser(headless: bool = False) -> bool:
+    """判断是否启用常驻浏览器热复用（默认开启，可通过 SCHOLAR_REUSE_BROWSER=0 关闭）。"""
+    if headless:
+        return False
+    env_raw = os.environ.get("SCHOLAR_REUSE_BROWSER", "").strip().lower()
+    if env_raw in ("0", "false", "no", "off"):
+        return False
+    if env_raw in ("1", "true", "yes", "on"):
+        return True
+    try:
+        from config import get as cfg_get
+        return bool(int(cfg_get("reuse_browser", 1)))
+    except Exception:
+        return True
+
+
+def _safe_get(driver: "webdriver.Remote", url: str, retries: int = 2, retry_delay: float = 1.2) -> None:
+    """带瞬态连接重置自动重试的 driver.get 包装器。"""
+    transient_markers = (
+        "ERR_CONNECTION_RESET",
+        "ERR_CONNECTION_CLOSED",
+        "ERR_NETWORK_CHANGED",
+        "ERR_TIMED_OUT",
+        "ERR_SOCKET_NOT_CONNECTED",
+        "Read timed out",
+    )
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            driver.get(url)
+            return
+        except Exception as e:
+            last_exc = e
+            msg = str(e)
+            if attempt < retries and any(m in msg for m in transient_markers):
+                _log(f"[cnki] 导航瞬态网络波动 ({msg[:80]})，{retry_delay}s 后第 {attempt + 1} 次重试...")
+                time.sleep(retry_delay)
+                if "kns.cnki.net/" not in url.rstrip("/") or url.rstrip("/") != "https://kns.cnki.net":
+                    try:
+                        driver.get("https://kns.cnki.net/")
+                        time.sleep(0.4)
+                    except Exception:
+                        pass
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+
+
+def _release_driver(driver: Optional["webdriver.Remote"], *, force_quit: bool = False) -> None:
+    """安全释放浏览器会话：
+    - 常驻复用模式 (`_scholar_reused=True`) 下仅保存 Cookie、清理多余标签页并停止本轮 chromedriver 服务，
+      保持后台 Chrome 进程存活供下一条 CLI 命令秒级热附着；
+    - 独占模式或 `force_quit=True` 时完整退出浏览器。
+    """
+    if driver is None:
+        return
+    try:
+        _save_cookies(driver)
+    except Exception:
+        pass
+
+    reused = bool(getattr(driver, "_scholar_reused", False))
+    if reused and not force_quit:
+        try:
+            handles = list(getattr(driver, "window_handles", []) or [])
+            if len(handles) > 1:
+                keep = handles[0]
+                for h in handles[1:]:
+                    try:
+                        driver.switch_to.window(h)
+                        driver.close()
+                    except Exception:
+                        pass
+                try:
+                    driver.switch_to.window(keep)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            svc = getattr(driver, "service", None)
+            if svc is not None:
+                svc.stop()
+        except Exception:
+            pass
+        return
+
+    try:
+        if reused and force_quit:
+            try:
+                driver.execute_cdp_cmd("Browser.close", {})
+            except Exception:
+                pass
+        driver.quit()
+    except Exception:
+        pass
+
+
+def close_shared_browser(port: Optional[int] = None) -> dict:
+    """显式关闭后台常驻的知网共享浏览器实例。"""
+    active_port = int(port or os.environ.get("SCHOLAR_DEBUG_PORT", _DEFAULT_DEBUG_PORT))
+    if not _is_debug_port_open(active_port):
+        return {
+            "status": "success",
+            "closed": False,
+            "port": active_port,
+            "message": f"端口 {active_port} 未检测到运行中的共享浏览器实例",
+        }
+    driver = None
+    try:
+        browser = _detect_browser()
+        driver = _connect_remote_browser(browser, active_port)
+        _save_cookies(driver)
+        try:
+            driver.execute_cdp_cmd("Browser.close", {})
+        except Exception:
+            pass
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        deadline = time.time() + 3.0
+        while time.time() < deadline and _is_debug_port_open(active_port, timeout=0.2):
+            time.sleep(0.2)
+        return {
+            "status": "success",
+            "closed": True,
+            "port": active_port,
+            "message": f"已保存 Cookie 并关闭端口 {active_port} 上的共享浏览器实例",
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "code": "CLOSE_BROWSER_FAILED",
+            "port": active_port,
+            "message": str(e),
+        }
+    finally:
+        if driver is not None:
+            try:
+                svc = getattr(driver, "service", None)
+                if svc is not None:
+                    svc.stop()
+            except Exception:
+                pass
+
+
 def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Remote":
-    """创建浏览器实例。默认有头模式，完成验证后最小化到任务栏，便于随时恢复查看。"""
+    """创建或热附着浏览器实例。默认开启有头常驻热复用，后续命令秒级连接。"""
     if not HAS_SELENIUM:
         raise RuntimeError(
             "selenium 未安装。请运行: pip install selenium>=4.10\n"
@@ -602,9 +830,11 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
         "--disable-dev-shm-usage",
         "--disable-gpu",
         "--disable-features=RendererCodeIntegrity",
-        f"--user-agent={_REALISTIC_UA}",
         "--window-size=1920,1080",
     ]
+    custom_ua = _build_user_agent(browser, headless=headless)
+    if custom_ua:
+        startup_args.append(f"--user-agent={custom_ua}")
     if not headless:
         startup_args.append(f"--window-position={_VISIBLE_POS[0]},{_VISIBLE_POS[1]}")
     for arg in startup_args:
@@ -612,7 +842,7 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    sandbox_profile = Path.cwd() / ".scholar-kit" / "browser-profile"
+    sandbox_profile = _profile_dir(create=True)
     try:
         sandbox_profile.mkdir(parents=True, exist_ok=True)
         options.add_argument(f"--user-data-dir={sandbox_profile}")
@@ -621,44 +851,76 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
 
     driver = None
     first_err = None
+    was_already_warm = False
+    port = int(os.environ.get("SCHOLAR_DEBUG_PORT", _DEFAULT_DEBUG_PORT))
+
+    # 策略 0: 常驻热复用模式（优先连接已有调试端口，未启动则以独立会话启动供跨命令共享）
+    if _should_reuse_browser(headless=headless):
+        if _is_debug_port_open(port):
+            try:
+                driver = _connect_remote_browser(browser, port)
+                handles = list(driver.window_handles or [])
+                if not handles:
+                    driver.switch_to.new_window("tab")
+                else:
+                    driver.switch_to.window(handles[0])
+                driver._scholar_reused = True
+                was_already_warm = True
+                _log(f"[cnki] 热复用已就绪浏览器实例 (port={port})")
+            except Exception as e:
+                _log(f"[cnki] 复用已有调试端口失败，将重新启动: {e}")
+                driver = None
+        if driver is None:
+            launched = _launch_browser_outside_sandbox(browser, port)
+            if launched and _wait_for_debug_port(port, timeout=10):
+                try:
+                    driver = _connect_remote_browser(browser, port)
+                    driver._scholar_reused = True
+                except Exception as e:
+                    first_err = e
+                    _log(f"[cnki] 独立会话浏览器连接失败，回退常规启动: {e}")
+                    driver = None
 
     # 策略 1: 正常方式启动（含本地驱动回退）
-    try:
-        driver = DriverClass(options=options)
-    except Exception as e:
-        first_err = e
-        _log(f"[cnki] 默认方式创建浏览器失败: {e}")
-        local_driver = _find_local_driver(browser)
-        if local_driver:
-            _log(f"[cnki] 找到本地驱动，尝试使用: {local_driver}")
-            if browser == "edge":
-                from selenium.webdriver.edge.service import Service
-            else:
-                from selenium.webdriver.chrome.service import Service
-            service = Service(executable_path=local_driver)
-            try:
-                driver = DriverClass(service=service, options=options)
-            except Exception:
-                pass
+    if driver is None:
+        try:
+            driver = DriverClass(options=options)
+            driver._scholar_reused = False
+        except Exception as e:
+            first_err = e
+            _log(f"[cnki] 默认方式创建浏览器失败: {e}")
+            local_driver = _find_local_driver(browser)
+            if local_driver:
+                _log(f"[cnki] 找到本地驱动，尝试使用: {local_driver}")
+                if browser == "edge":
+                    from selenium.webdriver.edge.service import Service
+                else:
+                    from selenium.webdriver.chrome.service import Service
+                service = Service(executable_path=local_driver)
+                try:
+                    driver = DriverClass(service=service, options=options)
+                    driver._scholar_reused = False
+                except Exception:
+                    pass
 
     # 策略 2: 沙盒内启动失败 → 在沙盒外启动浏览器并通过远程调试连接
     if driver is None:
         _log("[cnki] 沙盒内启动失败，尝试在沙盒外启动浏览器...")
-        port = int(os.environ.get("SCHOLAR_DEBUG_PORT", _DEFAULT_DEBUG_PORT))
         launched = _launch_browser_outside_sandbox(browser, port)
         if launched and _wait_for_debug_port(port):
             try:
                 driver = _connect_remote_browser(browser, port)
+                driver._scholar_reused = _should_reuse_browser(headless=headless)
             except Exception as e:
                 _log(f"[cnki] 远程连接失败: {e}")
 
     # 策略 3: 尝试连接用户可能已打开的浏览器调试端口
     if driver is None:
-        port = int(os.environ.get("SCHOLAR_DEBUG_PORT", _DEFAULT_DEBUG_PORT))
         if _wait_for_debug_port(port, timeout=3):
             _log(f"[cnki] 检测到端口 {port} 已有浏览器，尝试连接...")
             try:
                 driver = _connect_remote_browser(browser, port)
+                driver._scholar_reused = _should_reuse_browser(headless=headless)
             except Exception as e:
                 _log(f"[cnki] 连接已有浏览器失败: {e}")
 
@@ -686,7 +948,7 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
     driver.set_page_load_timeout(30)
     driver.implicitly_wait(3)
 
-    if not headless:
+    if not headless and not was_already_warm:
         _hide_browser(driver)
 
     return driver
@@ -953,7 +1215,7 @@ def authenticate_cnki(
                 "access_confirmed": True,
                 "cookies_saved": cookies_saved,
                 "cookie_file": str(_cookie_path()),
-                "profile_dir": str(Path.cwd() / ".scholar-kit" / "browser-profile"),
+                "profile_dir": str(_profile_dir()),
                 "direct_domains": direct_domain_list,
                 "diagnostics": _auth_diagnostics(driver),
                 "message": "检测到已有知网机构会话，已复用，无需再次登录。",
@@ -1002,7 +1264,7 @@ def authenticate_cnki(
             "access_confirmed": access_confirmed,
             "cookies_saved": cookies_saved,
             "cookie_file": str(_cookie_path()),
-            "profile_dir": str(Path.cwd() / ".scholar-kit" / "browser-profile"),
+            "profile_dir": str(_profile_dir()),
             "direct_domains": direct_domain_list,
             "diagnostics": diagnostics,
             "debug_snapshot": snapshot_file,
@@ -1031,10 +1293,7 @@ def authenticate_cnki(
     finally:
         _restore_direct_domains(previous_direct_domains)
         if driver is not None and not keep_browser:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+            _release_driver(driver)
 
 
 # ── 验证码 / 安全验证页 ─────────────────────────────────

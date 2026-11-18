@@ -27,9 +27,17 @@ except ImportError:
     BeautifulSoup = None
 
 def _cache_dir() -> Path:
-    d = Path.cwd() / ".scholar-kit"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    try:
+        from config import cache_dir
+        return cache_dir("cache", create=True)
+    except ImportError:
+        d = Path.cwd() / ".scholar-kit" / "cache"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+
+def _legacy_cache_file(key: str) -> Path:
+    return Path.cwd() / ".scholar-kit" / f"{key}.json"
 
 
 def _get_cache_ttl_hours() -> int:
@@ -103,8 +111,12 @@ def _cache_key(prefix: str, query: str) -> str:
 
 
 def _cache_get(key: str, source: str = "default", query: str = ""):
-    """获取缓存，支持智能 TTL"""
+    """获取缓存，支持智能 TTL（兼容旧版根目录缓存文件）"""
     path = _cache_dir() / f"{key}.json"
+    if not path.exists():
+        legacy = _legacy_cache_file(key)
+        if legacy.exists():
+            path = legacy
     if not path.exists():
         return None
     try:
@@ -1168,21 +1180,22 @@ def _openalex_to_doi(openalex_url: str) -> Optional[str]:
 # ── 结果去重 ──────────────────────────────────────────
 
 def deduplicate_results(results: list[dict]) -> list[dict]:
-    """基于 DOI 和标题去重，保留第一个出现的版本。
+    """基于 CNKI 唯一标识、DOI 和标题去重，保留第一个出现的版本。
 
-    优先级：DOI 精确匹配 > 标题相似度 > 保留
-
-    Args:
-        results: 搜索结果列表
-
-    Returns:
-        去重后的结果列表
+    优先级：CNKI ID 精确匹配 > DOI 精确匹配 > 标题标准化匹配 > 保留
     """
+    seen_cnki_ids = set()
     seen_dois = set()
     seen_titles = set()
     unique = []
 
     for r in results:
+        cnki_id = (r.get("cnki_id") or "").upper().strip()
+        if cnki_id and cnki_id in seen_cnki_ids:
+            continue
+        if cnki_id:
+            seen_cnki_ids.add(cnki_id)
+
         # DOI 去重（精确匹配）
         doi = (r.get("doi") or "").lower().strip()
         if doi and doi in seen_dois:
@@ -1192,7 +1205,6 @@ def deduplicate_results(results: list[dict]) -> list[dict]:
 
         # 标题去重（标准化后精确匹配）
         title = (r.get("title") or "").lower().strip()
-        # 移除多余空格和标点
         title = re.sub(r'\s+', ' ', title)
         title = re.sub(r'[^\w\s]', '', title)
 
@@ -1209,30 +1221,61 @@ def deduplicate_results(results: list[dict]) -> list[dict]:
 # ── 质量评分 ──────────────────────────────────────────
 
 def calculate_quality_score(paper: dict) -> float:
-    """计算论文质量分数（0-100）。
+    """计算论文质量分数（0-100），兼容英文开放 API 与知网/NSSD 中文文献双轨特征。
 
-    评分维度：
-    - 摘要完整性（0-30）
-    - DOI 存在（20）
-    - 被引次数（0-20，对数归一化）
-    - 关键词存在（10）
-    - 开放获取（10）
-    - 数据源可靠性（5）
-    - 年份新近性（0-10）
-
-    Args:
-        paper: 论文字典
-
-    Returns:
-        质量分数（0-100）
+    背景：知网列表页默认不直接内联摘要与 DOI，若直接套用英文 OA 字段权重，会导致
+    被引数千次的 CSSCI 权威期刊论文仅得 ~20 分、远低于无引用的 arXiv 预印本。
+    因此对知网/NSSD 中文条目结合核心期刊收录 (`is_core`)、被引频次 (`cited_by`)、
+    下载频次 (`downloads`)、期刊载体与时效性进行均衡校准。
     """
     import math
     from datetime import datetime
 
-    score = 0.0
+    source = str(paper.get("source") or "")
+    abstract = str(paper.get("abstract") or "")
+    cited_by = int(paper.get("cited_by") or 0)
+    downloads = int(paper.get("downloads") or 0)
+    keywords = paper.get("keywords") or []
+    year = paper.get("year")
+    is_cn_source = source in ("CNKI", "CNKI-export", "NSSD") or bool(paper.get("is_core"))
 
-    # 摘要完整性
-    abstract = paper.get("abstract", "")
+    recency_bonus = 0.0
+    if year:
+        try:
+            age = datetime.now().year - int(year)
+            if 0 <= age <= 5:
+                recency_bonus = float(max(0, 10 - (age * 2)))
+        except (TypeError, ValueError):
+            pass
+
+    if is_cn_source:
+        score = 8.0 if source in ("CNKI", "CNKI-export") else 5.0
+        if paper.get("journal"):
+            score += 10.0
+        if paper.get("is_core"):
+            score += 25.0
+        if paper.get("doi"):
+            score += 10.0
+        if len(abstract) > 300:
+            score += 20.0
+        elif abstract:
+            score += 12.0
+        if keywords:
+            score += 8.0
+
+        # 列表页尚未抓取详情摘要时，加大被引与下载实证影响力的鉴别权重
+        cite_cap = 22.0 if abstract else 30.0
+        cite_factor = 6.5 if abstract else 8.5
+        if cited_by > 0:
+            score += min(cite_cap, math.log10(cited_by + 1) * cite_factor)
+        if downloads > 0:
+            score += min(15.0, math.log10(downloads + 1) * 3.8)
+
+        score += recency_bonus
+        return round(min(100.0, score), 1)
+
+    # 英文 / 国际开放 API 条目评分
+    score = 0.0
     if len(abstract) > 500:
         score += 30
     elif len(abstract) > 200:
@@ -1240,40 +1283,25 @@ def calculate_quality_score(paper: dict) -> float:
     elif abstract:
         score += 10
 
-    # DOI 存在
     if paper.get("doi"):
         score += 20
 
-    # 被引次数（对数归一化）
-    cited_by = paper.get("cited_by", 0)
     if cited_by > 0:
         score += min(20, math.log10(cited_by + 1) * 5)
 
-    # 关键词存在
-    keywords = paper.get("keywords", [])
     if keywords and len(keywords) > 0:
         score += 10
 
-    # 开放获取
     if paper.get("is_oa"):
         score += 10
 
-    # 数据源可靠性
-    source = paper.get("source", "")
     if source in ("OpenAlex", "Semantic Scholar"):
         score += 5
     elif source == "arXiv":
         score += 3
 
-    # 年份新近性（最近 5 年）
-    year = paper.get("year")
-    if year:
-        current_year = datetime.now().year
-        age = current_year - year
-        if age <= 5:
-            score += max(0, 10 - (age * 2))  # 每年递减 2 分
-
-    return min(100, score)
+    score += recency_bonus
+    return round(min(100.0, score), 1)
 
 
 # ── 研究趋势分析 ──────────────────────────────────────

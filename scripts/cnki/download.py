@@ -15,23 +15,35 @@ from .constants import (
 )
 from .driver import (
     _detect_browser, _create_driver, _load_cookies, _save_cookies,
-    _handle_captcha, check_cnki_access,
+    _handle_captcha, check_cnki_access, _release_driver, _safe_get,
 )
 
 def _get_batch_window_size() -> int:
     try:
         from config import get as cfg_get
-        val = cfg_get("batch_window_size", 10)
+        val = cfg_get("batch_window_size", 4)
     except ImportError:
-        val = os.environ.get("SCHOLAR_BATCH_WINDOW_SIZE", "10")
+        val = os.environ.get("SCHOLAR_BATCH_WINDOW_SIZE", "4")
     try:
         return max(1, int(val))
     except (TypeError, ValueError):
-        return 10
+        return 4
 
 BATCH_WINDOW_SIZE = _get_batch_window_size()
 COOLDOWN_MIN = 4
 COOLDOWN_MAX = 8
+
+
+def _enable_download_behavior(driver, abs_save_dir: str) -> None:
+    """在当前浏览器会话与当前标签页同时绑定下载目录（兼容多标签与远程调试连接）。"""
+    for cmd, params in (
+        ("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": abs_save_dir, "eventsEnabled": True}),
+        ("Page.setDownloadBehavior", {"behavior": "allow", "downloadPath": abs_save_dir}),
+    ):
+        try:
+            driver.execute_cdp_cmd(cmd, params)
+        except Exception:
+            pass
 
 
 def _split_evenly(items: list, max_per_batch: int) -> list[list]:
@@ -111,7 +123,10 @@ def _click_download_btn(driver, file_format: str = "pdf") -> Optional[str]:
     知网不同页面（期刊 vs 学位论文）的按钮 ID/结构不一致，
     因此先按 ID 找，再按链接文字找，确保都能命中。
     """
-    btn_id = "pdfDown" if file_format == "pdf" else "cajDown"
+    from .selectors import CNKI_SELECTORS
+
+    dl_sel = CNKI_SELECTORS["download"]
+    btn_id = dl_sel["pdf_btn_id"] if file_format == "pdf" else dl_sel["caj_btn_id"]
     btn_text = "PDF下载" if file_format == "pdf" else "CAJ下载"
 
     btn_selectors = [
@@ -181,17 +196,13 @@ def download_cnki(
         browser = _detect_browser()
         driver = _create_driver(browser=browser)
 
-        driver.get("https://kns.cnki.net/")
-        time.sleep(1)
+        _safe_get(driver, "https://kns.cnki.net/")
+        time.sleep(0.6)
         _load_cookies(driver)
 
-        driver.execute_cdp_cmd("Browser.setDownloadBehavior", {
-            "behavior": "allow",
-            "downloadPath": abs_save_dir,
-            "eventsEnabled": True,
-        })
+        _enable_download_behavior(driver, abs_save_dir)
 
-        driver.get(url)
+        _safe_get(driver, url)
         time.sleep(REQUEST_INTERVAL)
         driver = _handle_captcha(driver)
 
@@ -205,11 +216,7 @@ def download_cnki(
             os.makedirs(fallback_save_dir, exist_ok=True)
             active_save_dir = fallback_save_dir
             abs_save_dir = os.path.abspath(active_save_dir)
-            driver.execute_cdp_cmd("Browser.setDownloadBehavior", {
-                "behavior": "allow",
-                "downloadPath": abs_save_dir,
-                "eventsEnabled": True,
-            })
+            _enable_download_behavior(driver, abs_save_dir)
             snapshot = set(os.listdir(active_save_dir))
             actual_format = _click_download_btn(driver, fallback_format)
             fallback_used = bool(actual_format)
@@ -250,11 +257,7 @@ def download_cnki(
                 "message": str(e)}
     finally:
         if driver is not None:
-            try:
-                _save_cookies(driver)
-                driver.quit()
-            except Exception:
-                pass
+            _release_driver(driver)
 
 
 def _cleanup_orphan_tabs(driver, safe_handles: set, main_window: str):
@@ -331,9 +334,12 @@ def _trigger_batch_window(
                 continue
             orphan_handle = new_handles.pop()
             driver.switch_to.window(orphan_handle)
-            driver.get(url)
+            _enable_download_behavior(driver, os.path.abspath(save_dir))
+            _safe_get(driver, url)
             tab_handles.append((url, orphan_handle, idx))
             orphan_handle = None
+            if i < len(urls_window) - 1:
+                time.sleep(random.uniform(0.8, 1.8))
         except Exception as e:
             _log(f"[cnki-download] [{idx}/{total}] 开标签失败: {e}")
             batch_errors.append({"url": url, "code": "CNKI_DOWNLOAD_FAILED", "error": str(e)})
@@ -379,6 +385,7 @@ def _trigger_batch_window(
 
             batch_meta.append({"url": url, "title": title})
             _log(f"[cnki-download] [{idx}/{total}] 下载已触发")
+            time.sleep(random.uniform(0.6, 1.4))
 
             driver.close()
             driver.switch_to.window(main_window)
@@ -531,9 +538,10 @@ def batch_download_cnki(
             else:
                 return {"status": "error", "code": "CNKI_UNREACHABLE", "message": msg}
 
+    window_size = _get_batch_window_size()
     total = len(urls)
     _log(f"[cnki-download] 开始批量下载: {total} 篇论文"
-         f"（每批 {BATCH_WINDOW_SIZE} 篇，批间冷却 {COOLDOWN_MIN}-{COOLDOWN_MAX}s）")
+         f"（每批 {window_size} 篇，批间冷却 {COOLDOWN_MIN}-{COOLDOWN_MAX}s）")
 
     all_ok: List[Dict[str, Any]] = []
     all_errors: List[Dict[str, Any]] = []
@@ -544,20 +552,16 @@ def batch_download_cnki(
             browser = _detect_browser()
             driver = _create_driver(browser=browser)
 
-            driver.get("https://kns.cnki.net/")
-            time.sleep(1)
+            _safe_get(driver, "https://kns.cnki.net/")
+            time.sleep(0.6)
             _load_cookies(driver)
 
             driver = _handle_captcha(driver)
             _save_cookies(driver)
 
-        driver.execute_cdp_cmd("Browser.setDownloadBehavior", {
-            "behavior": "allow",
-            "downloadPath": abs_save_dir,
-            "eventsEnabled": True,
-        })
+        _enable_download_behavior(driver, abs_save_dir)
 
-        batches = _split_evenly(urls, BATCH_WINDOW_SIZE)
+        batches = _split_evenly(urls, window_size)
 
         offset = 0
         for batch_idx, batch_urls in enumerate(batches):
@@ -600,7 +604,7 @@ def batch_download_cnki(
             _log(f"[cnki-download] 重试前冷却 {cooldown:.1f}s...")
             time.sleep(cooldown)
 
-            retry_batches = _split_evenly(unique_retry, BATCH_WINDOW_SIZE)
+            retry_batches = _split_evenly(unique_retry, window_size)
 
             for rb_idx, rb_urls in enumerate(retry_batches):
                 _log(f"[cnki-download] 重试批次 {rb_idx + 1}/{len(retry_batches)}")
@@ -657,11 +661,7 @@ def batch_download_cnki(
                 "message": str(e)}
     finally:
         if driver is not None and owns_driver:
-            try:
-                _save_cookies(driver)
-                driver.quit()
-            except Exception:
-                pass
+            _release_driver(driver)
 
 
 def _wait_for_download(
@@ -749,6 +749,14 @@ def _parse_bibtex_export(content: str) -> list[dict]:
         doi_m = re.search(r'doi\s*=\s*\{(.+?)\}', entry)
         if doi_m:
             paper["doi"] = doi_m.group(1).strip()
+        abs_m = re.search(r'abstract\s*=\s*\{(.+?)\}', entry, re.DOTALL)
+        if abs_m:
+            paper["abstract"] = re.sub(r'\s+', ' ', abs_m.group(1)).strip()
+        kw_m = re.search(r'keywords\s*=\s*\{(.+?)\}', entry)
+        if kw_m:
+            kws = [k.strip() for k in re.split(r'[;；,，]+', kw_m.group(1)) if k.strip()]
+            if kws:
+                paper["keywords"] = kws
         if paper.get("title"):
             results.append(paper)
     return results
@@ -778,6 +786,17 @@ def _parse_noteexpress_export(content: str) -> list[dict]:
                 paper["pages"] = line.split(" ", 1)[-1].strip()
             elif line.startswith("{DOI}") or line.startswith("DO "):
                 paper["doi"] = line.split(" ", 1)[-1].strip()
+            elif line.startswith("{Abstract}") or line.startswith("AB "):
+                paper["abstract"] = line.split(" ", 1)[-1].strip()
+            elif line.startswith("{Keywords}") or line.startswith("K1 ") or line.startswith("KW "):
+                raw_kw = line.split(" ", 1)[-1].strip()
+                kws = [k.strip() for k in re.split(r'[;；,，]+', raw_kw) if k.strip()]
+                if kws:
+                    paper["keywords"] = list(dict.fromkeys((paper.get("keywords") or []) + kws))
+            elif line.startswith("{Author Address}") or line.startswith("AD "):
+                addr = line.split(" ", 1)[-1].strip()
+                if addr:
+                    paper["institutions"] = [s.strip() for s in re.split(r'[;；]+', addr) if s.strip()]
         if paper.get("title"):
             results.append(paper)
     return results
@@ -785,7 +804,7 @@ def _parse_noteexpress_export(content: str) -> list[dict]:
 
 def _parse_refworks_export(content: str) -> list[dict]:
     results = []
-    blocks = re.split(r'\nER\s*\n', content)
+    blocks = re.split(r'\nER\s*(?:\n|$)|(?=\nRT\s)', content)
     for block in blocks:
         paper = {"source": "CNKI-export"}
         for line in block.strip().split("\n"):
@@ -800,7 +819,7 @@ def _parse_refworks_export(content: str) -> list[dict]:
                 y = re.search(r'\d{4}', line)
                 if y:
                     paper["year"] = int(y.group())
-            elif line.startswith("JF "):
+            elif line.startswith("JF ") or line.startswith("JO "):
                 paper["journal"] = line[3:].strip()
             elif line.startswith("VO "):
                 paper["volume"] = line[3:].strip()
@@ -821,6 +840,16 @@ def _parse_refworks_export(content: str) -> list[dict]:
                     paper["pages"] = ep
             elif line.startswith("DO "):
                 paper["doi"] = line[3:].strip()
+            elif line.startswith("AB "):
+                paper["abstract"] = line[3:].strip()
+            elif line.startswith("K1 ") or line.startswith("KW "):
+                kws = [k.strip() for k in re.split(r'[;；,，]+', line[3:].strip()) if k.strip()]
+                if kws:
+                    paper["keywords"] = list(dict.fromkeys((paper.get("keywords") or []) + kws))
+            elif line.startswith("AD "):
+                addrs = [s.strip() for s in re.split(r'[;；]+', line[3:].strip()) if s.strip()]
+                if addrs:
+                    paper["institutions"] = addrs
         if paper.get("title"):
             results.append(paper)
     return results

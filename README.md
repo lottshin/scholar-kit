@@ -6,51 +6,43 @@
 
 ### 文献检索
 
-支持知网、OpenAlex、Semantic Scholar、arXiv、NSSD、DBLP、BASE 七个数据源。知网侧支持核心期刊筛选（北大核心、CSSCI、CSCD 等）、文献类型筛选（硕士/博士/期刊/会议/报纸）、搜索字段指定（主题/篇名/关键词/摘要/全文/作者/来源）、按作者/期刊/年份的高级搜索、多关键词批量搜索。API 源支持作者、期刊、学科、分页过滤，`--enable-fallback` 可在单一 API 源无结果时自动切换备用源，`--async-search --source all` 可并发检索多源。`--enrich N` 参数可在搜索后自动补全前 N 篇论文的卷期页码。搜索结果缓存复用，避免重复启动浏览器或重复请求 API。API 数据源基于标准库 urllib 即可运行，不依赖知网环境。
+支持知网、OpenAlex、Semantic Scholar、arXiv、NSSD、DBLP、BASE 七个数据源：
+- **知网双引擎高级/专业检索**：优先采用 KNS8S `majorSearch` 专业布尔检索式（`--expr "TKA=('数字经济' + '数据要素') AND ..."`），自动回退 `#gradetxt` 多条件表单；支持 `篇关摘`（`TKA`）、第一作者（`--first-author`）、作者单位（`--affiliation`）、期刊精确/模糊限定（`--journal`）、基金资助（`--fund`）、前置核心期刊勾选（北大核心、CSSCI、CSCD、AMI、WJCI、EI）与出版年度限定。
+- **高吞吐与常驻浏览器热复用**：默认开启 `9222` 端口浏览器热复用（`SCHOLAR_REUSE_BROWSER=1`，后续命令 `<0.2s` 秒级附着，支持 `close-browser` 显式关闭）；支持单页 50 条扩容（`--per-page 50`，`--limit > 20` 时自动启用）、按下载量排序（`--sort downloads`）与批量题录摘要导出（`--bulk-abstract`）。
+- **国际开放 API 并发与降级**：API 源支持作者、期刊、学科、分页过滤；`--enable-fallback` 在主源无结果时自动切换备用源，`--async-search --source all` 并发检索全部 API 源并完整复用智能 TTL 缓存；中英文双轨 `quality_score` 评分确保核心期刊与国际文献公平排序。
 
 ### 论文下载
 
-知网 PDF/CAJ 批量下载，支持搜索+下载一步完成（`search --download`），自动分批并设置冷却间隔避免触发风控。断点续传机制确保中途失败后可从上次位置继续。下载文件按格式写入 `pdf/`、`caj/` 子目录；用户明确要 PDF 时，`search --download` 可用 `--download-fallback-format caj`（也兼容 `--fallback-format caj` 别名），`batch-download` 可用 `--fallback-format caj`，在 PDF 不可用时显式降级到 CAJ，不会静默混放。批量下载会生成 Markdown 清单，按 GB/T 7714、APA、MLA 或 Chicago 列出已下载和未下载文献。英文 OA 论文通过 DOI 获取。
+知网 PDF/CAJ 批量下载，支持搜索+下载一步完成（`search --download`），默认采用防风控并发窗口（每批 4 篇 + 随机抖动冷却）与多标签页目录绑定。断点续传机制确保中途失败后可从上次位置继续。下载文件按格式写入 `pdf/`、`caj/` 子目录；用户明确要 PDF 时可用 `--fallback-format caj` 在 PDF 不可用时显式降级到 CAJ，不会静默混放。批量下载自动生成按 GB/T 7714、APA、MLA 或 Chicago 格式排版的 Markdown 下载清单。英文 OA 论文可通过 DOI 解析获取。
 
-### 全文阅读
+### 全文阅读、本地 PDF 库导入与元数据解析
 
-知网论文全文抓取与本地缓存。期刊论文使用 HTML 阅读提取，硕博论文通过 FlowPDF 三级加速提取（PDF.js API 直取 → 批量滚动 → 逐页补漏）。支持 .docx / .txt / .md 文件解析，自动处理中文编码（UTF-8 / GBK / GB18030）。`pdf-meta` 命令可从 PDF 文件中提取元数据（标题、作者、DOI），并通过 Crossref 自动补全完整书目信息。
+- **稳定键缓存与本地 PDF 极速提取**：知网详情页直接提取隐藏唯一标识 `cnki_id`（`CJFQ:...`）与未折叠完整摘要，跨会话动态 URL（`v=`）变化仍 100% 命中缓存；若 `./papers/pdf` 已下载对应 PDF，直接本地提取带 `[第 N 页]` 标记的正文，免去网页全文阅读滑块；历史链接 `404` 过期时自动按精确题名重定位。
+- **本地 PDF 文件夹一键入库**（`import <PDF目录或文件>`）：自动递归解析英文 DOI/Crossref 元数据及中文知网 PDF 首页摘要、关键词、年卷期，直接复用后续 `read-detail --fulltext`、`review` 与 `cite` 管线。
+- **文稿段落锚点读取**（`read-paper --numbered`）：支持 `.docx` / `.txt` / `.md` 编码自动识别，输出 `[P12]`、`[T1R2]` 精确段落与表格行锚点。
 
-### 引用生成与导出
+### 引用生成、子集重排与导出
 
-支持 GB/T 7714、APA、MLA、Chicago、BibTeX、RIS、脚注等引用格式。文献列表可导出为 BibTeX、RIS、Markdown、JSON、Excel。支持导入知网导出的 NoteExpress / Refworks / BibTeX 题录文件（含卷期页码完整解析）。搜索结果自带引用预览（`citation_preview`），cite 命令对知网论文自动补全卷期页码。
+支持 GB/T 7714（含知网网络首发文献 `[J/OL]` 规范著录）、APA、MLA、Chicago、BibTeX、RIS、中文脚注等格式。`cite --indices 9,2,5` 与 `export --indices ...` 支持按正文首次引用顺序定向生成子集并自动重排为 `[1][2][3]`（或加 `--keep-numbers` 保留原序号），单会话批量补全卷期页码并持久化写回 `session.json`。支持导入 NoteExpress / Refworks / BibTeX 题录文件。
 
-### 引文网络分析
+### 双向引文滚雪球、课题库整理与 Word 安全回填
 
-基于 Semantic Scholar API 的前向/后向引用追踪。输入 DOI、arXiv ID 或论文 URL，获取"谁引用了这篇"和"这篇引用了谁"的双向引用链。不依赖知网，任何环境均可使用。
-
-### 研究趋势分析
-
-对搜索结果进行聚合统计：年份分布、高频关键词 Top 30、高被引论文 Top 10、数据源分布。用于选题分析和研究热点判断。
-
-### Word 文档处理
-
-Markdown 转学术格式 .docx（自动生成脚注和参考文献节）。支持在现有 .docx 上打补丁——插入引用、脚注、参考文献，保留原文档格式。
-
-### Agent 驱动的工作流
-
-以下功能由 Agent 结合脚本完成，不需要单独的命令：
-
-- **文献综述** — 读取用户论文，提取关键词搜索，筛选后基于全文/摘要撰写综述
-- **引用建议** — 识别论文中需要引用的句子，匹配文献并区分"必须引用"和"建议引用"
-- **文献对比矩阵** — 多篇论文按研究问题、方法、发现、局限性等维度结构化对比
-- **阅读笔记** — 按模板提取每篇论文的核心信息，多篇时附综合评述
-- **学术表达优化** — 按三段式（审计 → 改写 → 报告）逐段诊断论文：先标出原创性薄弱段、中文 AI 腔与证据缺口，再逐条改写并留变更日志。判据见 [references/style-audit.md](references/style-audit.md)，不改变任何数字与引文
+- **中英文双向引文网络与滚雪球扩检**（`citations`）：中文论文支持直接传入**知网详情 URL 或中文题名**抓取 `#refpartdiv` 原生**引证文献（`citing`）**与**参考文献（`references`）**（无需个人账号登录）；英文/DOI/arXiv 论文基于 Semantic Scholar Graph API；叠加 `--save both --append --project <课题>` 可一键将双向引文并入课题文献库。
+- **课题文献库整理与批注**（`library`）：支持 `--remove` 剔除噪音、`--keep` 精选留存、`--dedupe` 跨轮去重，以及 `--indices ... --tag --note` 阅读批注。
+- **学科中立证据包与论断核查**（`review` / `validate` / `topics`）：基于检索语料真实关键词动态聚类，输出覆盖度缺口提示、待核对原文标记与正文 `[序号]` 证据支撑度评分。
+- **Word 安全打补丁与预检**（`write-docx` / `patch-docx`）：支持按 `"paragraph": "P12"` / `"T1R2"` 精确替换正文或表格单元格、插入原生 OOXML 脚注与追加悬挂缩进参考文献；提供 `patch-docx --dry-run` 零写入预检，100% 确认命中后再落盘。
+- **知网改版 5 秒契约自检**（`check --cnki-dom`）：集中选择器注册表（`scripts/cnki/selectors.py`）配合只读 DOM 契约巡检与脱敏诊断快照，秒级定位前端改版。
+- **学术表达优化**：按三段式（审计 → 改写 → 报告）逐段诊断论文原创性薄弱段、中文 AI 腔与证据缺口，判据见 [references/style-audit.md](references/style-audit.md)，不改变任何数字、公式与引文。
 
 ## Usage
 
 安装完成后，直接用自然语言指示 Agent：
 
-```
+```text
 "帮我搜索关于乡村振兴的核心期刊论文"
 "搜20篇新闻传播的CSSCI论文并下载"
 "搜几篇关于数字经济的硕士论文，抓取全文"
-"读取我的论文，帮我写一段文献综述"
+"读取我的论文，帮我写一段文献综述并校验引用支撑"
 "把这些引用插入我的 Word 文档"
 "这篇论文被哪些后续研究引用了"
 "分析一下这批搜索结果的研究趋势"
@@ -58,104 +50,65 @@ Markdown 转学术格式 .docx（自动生成脚注和参考文献节）。支�
 "帮我优化这篇论文的学术表达"
 ```
 
-Agent 会自动识别意图并调用 Scholar Kit。
-
 ## Installation
 
 ### 一句话安装（所有平台通用）
 
 在 Agent 聊天中发送：
 
-```
+```text
 Fetch and follow instructions from https://raw.githubusercontent.com/lottshin/scholar-kit/main/setup.md
 ```
-
-Agent 会自动识别平台、clone 到正确位置、安装依赖并验证环境。
-
-适用于 Cursor、Claude Code 及任何支持 fetch 指令的 AI Agent。
 
 ### 手动安装
 
 <details>
-<summary>展开手动安装步骤</summary>
+<summary>展开各平台手动安装步骤</summary>
 
 ```bash
-# Cursor — Windows (PowerShell)
-git clone https://github.com/lottshin/scholar-kit "$env:USERPROFILE\.cursor\skills\scholar-kit"
+# Claude Code
+git clone https://github.com/lottshin/scholar-kit ~/.claude/skills/scholar-kit
+
+# Codex
+git clone https://github.com/lottshin/scholar-kit ~/.codex/skills/scholar-kit
+
+# Antigravity（全局或工作区）
+git clone https://github.com/lottshin/scholar-kit ~/.gemini/config/skills/scholar-kit
+# 或工作区内: git clone https://github.com/lottshin/scholar-kit .agents/skills/scholar-kit
 
 # Cursor — macOS / Linux
 git clone https://github.com/lottshin/scholar-kit ~/.cursor/skills/scholar-kit
 
-# Claude Code (Codex)
-git clone https://github.com/lottshin/scholar-kit ~/.codex/skills/scholar-kit
+# Cursor — Windows (PowerShell)
+git clone https://github.com/lottshin/scholar-kit "$env:USERPROFILE\.cursor\skills\scholar-kit"
 
 # Gemini CLI
 gemini skills install https://github.com/lottshin/scholar-kit.git
-# 或手动 clone:
-# git clone https://github.com/lottshin/scholar-kit ~/.gemini/skills/scholar-kit
 
-# 安装依赖
-pip install -r <安装路径>/scripts/requirements.txt
+# 多 Agent 共用建议：保留一份主仓库（如 ~/.agents/skills/scholar-kit），其余目录用 ln -s 软链接指向它
+
+# 安装依赖（若系统 Python 受 PEP 668 保护，可装入 ~/.scholar-kit/.venv 或运行 check --fix 自动引导）
+python3 -m pip install -r <安装路径>/scripts/requirements.txt
+python3 <安装路径>/scripts/literature.py check --fix
 ```
 
 </details>
 
-### 验证
+## State & Configuration
 
-开启新会话，对 Agent 说：
-
-> "帮我搜索关于乡村振兴的核心期刊论文"
-
-Agent 应自动识别 Scholar Kit 并执行。
-
-## Requirements
-
-| 要求 | 说明 |
-|------|------|
-| Python | 3.9+ |
-| 浏览器 | Edge 或 Chrome（知网功能需要） |
-| 网络 | 知网需校园网、机构 VPN，或学校支持的 CARSI/校外统一认证 |
-| Selenium | 4.10+（自动管理 WebDriver，无需手动下载） |
-| httpx | 可选（未安装时 HTTP 请求走标准库 urllib 兜底） |
-
-## Configuration
-
-<details>
-<summary>可选配置</summary>
-
-在项目目录下创建 `.scholar-kit/config.json`：
-
-```json
-{
-  "request_interval": 3,
-  "cache_ttl_days": 30,
-  "save_dir": "./papers",
-  "browser": "auto",
-  "batch_window_size": 10
-}
-```
-
-也可通过环境变量覆盖，详见 [SKILL.md](SKILL.md#配置)。
-
-</details>
-
-## Platform Notes
-
-- **知网功能**需要本地桌面浏览器（Edge/Chrome）+ 合法机构访问权限（校园网、机构 VPN，或学校支持的 CARSI/校外统一认证），沙箱环境中需具备这些条件才可用
-- **校外访问知网**可运行 `auth-cnki` 预热会话：默认打开 CNKI FSSO，也可用 `--auth-url` 传学校图书馆、VPN 或 CARSI 入口；`--institution` 可选，不传时由用户在浏览器中手动选择机构。登录成功后会复用 `.scholar-kit/browser-profile` 和 cookies，通常同一项目/会话无需反复登录。
-- **代理/梯子软件**（Clash、Mihomo、Surge、Quantumult X、系统 PAC 等）需要让 CNKI、CARSI 和学校认证域名直连。脚本会给浏览器注入 `proxy-bypass-list`，但 TUN/全局接管模式仍需在代理软件中配置 DIRECT 规则；可用 `--direct-domain` 或 `SCHOLAR_CNKI_DIRECT_DOMAINS` 追加学校认证域名。
-- **其他功能**（API 搜索、引用生成、Word 文档处理、引文网络、趋势分析）在所有平台均可用
-- `check` 命令返回 `capabilities` 字段，Agent 据此自动选择可用的数据源
+Scholar Kit 默认将状态拆分为两层，避免切换目录重复登录或污染业务 Git 仓库：
+- **全局共享目录 `~/.scholar-kit/`**（可通过 `SCHOLAR_HOME` 覆盖）：保存知网 `browser-profile/`、`cookies.json`、API/全文 `cache/`、可选 `.venv/` 与全局 `config.json`，一次完成校内/CARSI 认证即可在所有项目目录复用。
+- **工作区会话目录 `./.scholar-kit/`**（自动生成 `.gitignore`）：仅保存当前课题的 `session.json`、`projects/<课题>/` 与项目级 `config.json` 覆盖项。
 
 ## File Structure
 
 <details>
 <summary>展开目录结构</summary>
 
-```
+```text
 scholar-kit/
-├── SKILL.md              ← Agent 指令（核心）
-├── setup.md              ← 一句话自动安装脚本
+├── SKILL.md              ← Agent 核心指令（渐进式披露）
+├── setup.md              ← 一句话自动安装指引
 ├── README.md
 ├── LICENSE
 ├── .gitignore
@@ -166,34 +119,36 @@ scholar-kit/
 │   ├── api-search-best-practices.md
 │   ├── style-audit.md    ← 学术表达审计规则
 │   └── workflows.md
-└── scripts/              ← Python 脚本
-    ├── literature.py     ← 统一 CLI 入口
-    ├── requirements.txt
-    ├── config.py
-    ├── formatter.py
-    ├── search.py
-    ├── search_async.py
-    ├── workflows.py
-    └── cnki/             ← 知网模块
+├── scripts/              ← Python 模块
+│   ├── literature.py     ← 统一 CLI 路由入口
+│   ├── config.py         ← 全局/工作区路径与配置管理
+│   ├── evidence.py       ← 会话课题库、动态聚类、证据包与论断校验
+│   ├── docx_tools.py     ← 论文读取、PDF 元数据提取与 Word 排版/补丁
+│   ├── doctor.py         ← 环境自检、PEP 668 虚拟环境与安全缓存清理
+│   ├── formatter.py      ← GB/T 7714 / APA / MLA / Chicago / BibTeX / RIS
+│   ├── search.py         ← 开放学术 API 检索与智能缓存
+│   ├── search_async.py   ← 多源并发调度器
+│   ├── workflows.py      ← 预定义工作流模板
+│   ├── requirements.txt
+│   └── cnki/             ← 知网浏览器自动化与解析模块
+└── tests/                ← pytest 单元测试套件
 ```
 
 </details>
 
 ## Update
 
-在 skill 安装目录执行：
-
 ```bash
 git pull
-pip install -r scripts/requirements.txt
+python3 -m pip install -r scripts/requirements.txt
 ```
 
-`check` 命令会自动检测是否有新版本可用。
+`check` 命令会自动只读检测是否有新版本可用。
 
 ## Disclaimer
 
 - 本工具仅供学术研究用途
-- 使用知网功能需遵守 CNKI 服务条款，需具备合法访问权限（校园网/机构 VPN）
+- 使用知网功能需遵守 CNKI 服务条款，需具备合法访问权限（校园网/机构 VPN/CARSI）
 - 下载的论文版权归原作者和出版方所有
 - 本项目不提供任何绕过付费墙的功能
 

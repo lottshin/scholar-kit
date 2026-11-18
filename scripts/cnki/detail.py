@@ -14,7 +14,7 @@ from .constants import (
 )
 from .driver import (
     _detect_browser, _create_driver, _load_cookies, _save_cookies,
-    _handle_captcha,
+    _handle_captcha, _release_driver, _safe_get,
 )
 
 if HAS_SELENIUM:
@@ -26,25 +26,49 @@ if HAS_SELENIUM:
     )
 
 
+def _is_cnki_error_or_404(driver) -> bool:
+    """检测知网加密详情链接 (`kcms2?v=...`) 是否已过期或跳转到 404/错误页。"""
+    try:
+        title = (driver.title or "").strip().lower()
+        if "404" in title or "error page" in title or "错误" in title:
+            return True
+        body = driver.execute_script(
+            "return (document.body && document.body.innerText || '').substring(0, 800);"
+        ) or ""
+        return any(m in body for m in ("404", "页面不存在", "所访问的页面不存在", "参数错误"))
+    except Exception:
+        return False
+
+
 # ── 论文详情 ──────────────────────────────────────────
 
-def get_detail(url: str) -> Dict[str, Any]:
-    """获取知网论文详情页信息（摘要、关键词、参考文献等）"""
+def get_detail(url: str, expected_title: str = "") -> Dict[str, Any]:
+    """获取知网论文详情页信息（摘要、关键词、隐藏结构化字段等，支持过期 URL 自动重定位）。"""
     driver = None
     try:
         browser = _detect_browser()
         driver = _create_driver(browser=browser)
 
-        driver.get("https://kns.cnki.net/")
-        time.sleep(1)
+        _safe_get(driver, "https://kns.cnki.net/")
+        time.sleep(0.6)
         _load_cookies(driver)
 
-        driver.get(url)
+        active_url = url
+        _safe_get(driver, active_url)
         time.sleep(REQUEST_INTERVAL)
         driver = _handle_captcha(driver)
 
+        if _is_cnki_error_or_404(driver) and expected_title:
+            from .search import refresh_cnki_url
+            refreshed = refresh_cnki_url(driver, title=expected_title)
+            if refreshed:
+                active_url = refreshed
+                _safe_get(driver, active_url)
+                time.sleep(max(1.2, REQUEST_INTERVAL - 1))
+                driver = _handle_captcha(driver)
+
         detail = _parse_detail_page(driver)
-        detail["url"] = url
+        detail["url"] = active_url
         detail["source"] = "CNKI"
         return detail
 
@@ -53,11 +77,7 @@ def get_detail(url: str) -> Dict[str, Any]:
                 "message": str(e), "url": url}
     finally:
         if driver is not None:
-            try:
-                _save_cookies(driver)
-                driver.quit()
-            except Exception:
-                pass
+            _release_driver(driver)
 
 
 def _split_authors_institutions(raw_items: List[str]) -> tuple:
@@ -88,11 +108,13 @@ def _parse_detail_page(driver) -> Dict[str, Any]:
     """从已加载的知网详情页 DOM 中提取元数据（标题、摘要、关键词等）。
     调用者负责导航到详情页并处理验证码，本函数只做解析。
     """
+    from .selectors import CNKI_SELECTORS
+
+    d_sel = CNKI_SELECTORS["detail"]
     detail: Dict[str, Any] = {}
 
     try:
-        title_el = driver.find_element(By.CSS_SELECTOR,
-            ".wx-tit h1, h1.title, h1[class*='title'], h1")
+        title_el = driver.find_element(By.CSS_SELECTOR, d_sel["title"])
         detail["title"] = title_el.text.strip()
     except NoSuchElementException:
         detail["title"] = ""
@@ -105,15 +127,13 @@ def _parse_detail_page(driver) -> Dict[str, Any]:
             pass
 
     try:
-        abstract_el = driver.find_element(
-            By.CSS_SELECTOR, "#ChDivSummary, .abstract-text, span#ChDivSummary"
-        )
+        abstract_el = driver.find_element(By.CSS_SELECTOR, d_sel["abstract"])
         detail["abstract"] = abstract_el.text.strip()
     except NoSuchElementException:
         detail["abstract"] = ""
 
     try:
-        kw_els = driver.find_elements(By.CSS_SELECTOR, ".keywords a, p.keywords a")
+        kw_els = driver.find_elements(By.CSS_SELECTOR, d_sel["keywords"])
         detail["keywords"] = [
             kw.text.strip().rstrip(";；") for kw in kw_els if kw.text.strip()
         ]
@@ -122,7 +142,7 @@ def _parse_detail_page(driver) -> Dict[str, Any]:
 
     institutions = []
     try:
-        author_els = driver.find_elements(By.CSS_SELECTOR, ".author a, h3.author a")
+        author_els = driver.find_elements(By.CSS_SELECTOR, d_sel["authors"])
         raw_authors = [a.text.strip() for a in author_els if a.text.strip()]
         authors, institutions = _split_authors_institutions(raw_authors)
         detail["authors"] = "; ".join(authors)
@@ -130,14 +150,14 @@ def _parse_detail_page(driver) -> Dict[str, Any]:
         detail["authors"] = ""
 
     try:
-        org_els = driver.find_elements(By.CSS_SELECTOR, ".orgn a, .organ a")
+        org_els = driver.find_elements(By.CSS_SELECTOR, d_sel["orgs"])
         orgs = [o.text.strip() for o in org_els if o.text.strip()]
         detail["institutions"] = orgs if orgs else institutions
     except Exception:
         detail["institutions"] = institutions
 
     try:
-        fund_els = driver.find_elements(By.CSS_SELECTOR, ".fund a, p.fund a")
+        fund_els = driver.find_elements(By.CSS_SELECTOR, d_sel["funds"])
         detail["funds"] = [f.text.strip() for f in fund_els if f.text.strip()]
     except Exception:
         detail["funds"] = []
@@ -236,52 +256,133 @@ def _extract_pub_info(driver, detail: Dict[str, Any]):
         except Exception:
             pass
 
-    # 4) 备用：通过 JavaScript 提取页面中的结构化数据
-    if not detail.get("pages") or not detail.get("volume"):
-        try:
-            meta_info = driver.execute_script("""
-                var info = {};
-                // 知网详情页有时在 meta 标签或隐藏字段中存储结构化数据
-                var metas = document.querySelectorAll('meta[name]');
-                metas.forEach(function(m) {
-                    var name = m.getAttribute('name').toLowerCase();
-                    if (name === 'citation_volume') info.volume = m.content;
-                    if (name === 'citation_issue') info.issue = m.content;
-                    if (name === 'citation_firstpage') info.firstpage = m.content;
-                    if (name === 'citation_lastpage') info.lastpage = m.content;
-                    if (name === 'citation_doi') info.doi = m.content;
-                });
-                return info;
-            """)
-            if meta_info:
-                if meta_info.get("volume") and not detail.get("volume"):
-                    detail["volume"] = meta_info["volume"]
-                if meta_info.get("issue") and not detail.get("issue"):
-                    detail["issue"] = meta_info["issue"]
-                if not detail.get("pages"):
-                    fp = meta_info.get("firstpage", "")
-                    lp = meta_info.get("lastpage", "")
+    # 4) 优先提取 2026 版 kcms2 详情页隐藏 input 与 meta 结构化字段（最干净、无截断）
+    try:
+        hidden_info = driver.execute_script(r"""
+            function val(ids) {
+                for (var i = 0; i < ids.length; i++) {
+                    var el = document.getElementById(ids[i]);
+                    if (el && el.value && el.value.trim()) return el.value.trim();
+                }
+                return '';
+            }
+            var info = {
+                filename: val(['param-filename', 'paramfilename']),
+                dbcode: val(['paramdbcode', 'param-dbcode']),
+                dbname: val(['paramdbname', 'param-dbname']),
+                abstract_text: val(['abstract_text']),
+                keywords_raw: val(['params-nvsmkeywors']),
+                year: val(['article-year']),
+                issue: val(['article-qi']),
+                pages: val(['prite-page-num', 'page-pange']),
+                online_first: false
+            };
+            var tip = document.querySelector('.top-tip, .wx-tit');
+            if (tip && (tip.textContent || '').indexOf('网络首发') >= 0) {
+                info.online_first = true;
+            }
+            var metas = document.querySelectorAll('meta[name]');
+            metas.forEach(function(m) {
+                var name = (m.getAttribute('name') || '').toLowerCase();
+                if (name === 'citation_volume' && !info.volume) info.volume = m.content;
+                if (name === 'citation_issue' && !info.issue) info.issue = m.content;
+                if (name === 'citation_firstpage') info.firstpage = m.content;
+                if (name === 'citation_lastpage') info.lastpage = m.content;
+                if (name === 'citation_doi' && !info.doi) info.doi = m.content;
+            });
+            return info;
+        """) or {}
+        if isinstance(hidden_info, dict):
+            fn = hidden_info.get("filename", "")
+            dbc = hidden_info.get("dbcode", "")
+            if fn and dbc:
+                detail["filename"] = fn
+                detail["dbcode"] = dbc
+                detail["cnki_id"] = f"{dbc.upper()}:{fn.upper()}"
+            elif fn:
+                detail["filename"] = fn
+
+            abs_hidden = hidden_info.get("abstract_text", "")
+            if abs_hidden and len(abs_hidden) > len(detail.get("abstract", "")):
+                detail["abstract"] = abs_hidden
+
+            if not detail.get("keywords") and hidden_info.get("keywords_raw"):
+                kws = [k.strip() for k in re.split(r"[;；]+", hidden_info["keywords_raw"]) if k.strip()]
+                if kws:
+                    detail["keywords"] = kws
+
+            if hidden_info.get("year") and not detail.get("year"):
+                try:
+                    detail["year"] = int(str(hidden_info["year"])[:4])
+                except ValueError:
+                    pass
+            if hidden_info.get("volume") and not detail.get("volume"):
+                detail["volume"] = hidden_info["volume"]
+            if hidden_info.get("issue") and not detail.get("issue"):
+                detail["issue"] = str(hidden_info["issue"]).lstrip("0") or "0"
+            if not detail.get("pages"):
+                if hidden_info.get("pages"):
+                    detail["pages"] = str(hidden_info["pages"]).replace("–", "-").replace("—", "-")
+                else:
+                    fp = hidden_info.get("firstpage", "")
+                    lp = hidden_info.get("lastpage", "")
                     if fp and lp:
                         detail["pages"] = f"{fp}-{lp}"
                     elif fp:
                         detail["pages"] = fp
-                if meta_info.get("doi") and not detail.get("doi"):
-                    detail["doi"] = meta_info["doi"]
-        except Exception:
-            pass
+            if hidden_info.get("doi") and not detail.get("doi"):
+                detail["doi"] = hidden_info["doi"].rstrip(".")
+            if hidden_info.get("online_first") and not detail.get("pages"):
+                detail["is_online_first"] = True
+    except Exception:
+        pass
 
 
-# ── HTML 全文阅读 ─────────────────────────────────────
+# ── HTML 全文阅读与稳定键缓存 ──────────────────────────
 
 def _fulltext_cache_dir() -> Path:
-    d = Path.cwd() / ".scholar-kit" / "fulltext"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    try:
+        from config import cache_dir
+        return cache_dir("fulltext", create=True)
+    except ImportError:
+        d = Path.cwd() / ".scholar-kit" / "fulltext"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+
+def _legacy_fulltext_cache_file(key: str) -> Path:
+    return Path.cwd() / ".scholar-kit" / "fulltext" / f"{key}.json"
 
 
 def _cache_key(url: str) -> str:
-    """从知网 URL 中提取稳定的缓存文件名"""
-    return hashlib.md5(url.encode()).hexdigest()
+    """基于 URL 的兼容缓存键"""
+    return hashlib.md5((url or "").encode("utf-8")).hexdigest()
+
+
+def _stable_paper_cache_keys(url: str, paper: Optional[Dict[str, Any]] = None) -> List[str]:
+    """按稳定性优先级生成全文缓存键列表：
+    1. `cnki_id` (`CJFQ:GLSJ202202013`) — 完全不受 `kcms2?v=...` 动态令牌变化影响
+    2. 归一化 `title|first_author|year` MD5 — 列表页尚未拿到 `cnki_id` 时跨会话稳定命中
+    3. 传统 `url` MD5 — 向后兼容已有缓存文件
+    """
+    keys: List[str] = []
+    if isinstance(paper, dict):
+        cid = str(paper.get("cnki_id") or "").strip()
+        if cid:
+            safe_cid = re.sub(r"[^A-Za-z0-9_-]", "_", cid)
+            keys.append(f"id_{safe_cid}")
+        title = re.sub(r"\W+", "", str(paper.get("title") or "")).lower()
+        if title:
+            authors = str(paper.get("authors") or "")
+            first_au = re.split(r"[;；,，\s]+", authors.strip())[0] if authors.strip() else ""
+            year = str(paper.get("year") or str(paper.get("date") or "")[:4] or "")
+            meta_h = hashlib.md5(f"{title}|{first_au}|{year}".encode("utf-8")).hexdigest()
+            keys.append(f"meta_{meta_h}")
+    if url:
+        u_key = _cache_key(url)
+        if u_key not in keys:
+            keys.append(u_key)
+    return keys or [_cache_key(url)]
 
 
 def _get_cache_ttl() -> int:
@@ -294,13 +395,20 @@ def _get_cache_ttl() -> int:
 _FULLTEXT_CACHE_TTL_DAYS = _get_cache_ttl()
 
 
-def _load_cached_fulltext(url: str) -> Optional[Dict[str, Any]]:
-    cache_file = _fulltext_cache_dir() / f"{_cache_key(url)}.json"
-    if cache_file.exists():
+def _load_cached_fulltext(url: str, paper: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    cdir = _fulltext_cache_dir()
+    for key in _stable_paper_cache_keys(url, paper):
+        cache_file = cdir / f"{key}.json"
+        if not cache_file.exists():
+            legacy = _legacy_fulltext_cache_file(key)
+            if legacy.exists():
+                cache_file = legacy
+        if not cache_file.exists():
+            continue
         try:
             data = json.loads(cache_file.read_text(encoding="utf-8"))
             if not data.get("fulltext"):
-                return None
+                continue
             ts = data.get("_cached_at", "")
             if ts and _FULLTEXT_CACHE_TTL_DAYS > 0:
                 from datetime import datetime, timedelta
@@ -308,19 +416,22 @@ def _load_cached_fulltext(url: str) -> Optional[Dict[str, Any]]:
                     cached_at = datetime.fromisoformat(ts)
                     if datetime.now() - cached_at > timedelta(days=_FULLTEXT_CACHE_TTL_DAYS):
                         _log(f"[cnki-detail] 缓存已过期（>{_FULLTEXT_CACHE_TTL_DAYS}天），重新抓取")
-                        return None
+                        continue
                 except ValueError:
                     pass
+            data["_cache_file"] = str(cache_file)
             return data
         except Exception as e:
             _log(f"[cnki-detail] 缓存读取失败: {e}")
     return None
 
 
-def _save_cached_fulltext(url: str, data: Dict[str, Any]):
+def _save_cached_fulltext(url: str, data: Dict[str, Any], paper: Optional[Dict[str, Any]] = None) -> Path:
     from datetime import datetime
+    data = dict(data)
     data["_cached_at"] = datetime.now().isoformat()
-    cache_file = _fulltext_cache_dir() / f"{_cache_key(url)}.json"
+    primary_key = _stable_paper_cache_keys(url, paper)[0]
+    cache_file = _fulltext_cache_dir() / f"{primary_key}.json"
     tmp_file = cache_file.with_suffix(".tmp")
     try:
         tmp_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -331,6 +442,7 @@ def _save_cached_fulltext(url: str, data: Dict[str, Any]):
             tmp_file.unlink(missing_ok=True)
         except Exception:
             pass
+    return cache_file
 
 
 def _has_fulltext_slider(driver) -> bool:
@@ -751,6 +863,71 @@ def _read_fulltext_flowpdf(driver, detail_url: str) -> Optional[str]:
         return None
 
 
+# ── 本地已下载 PDF 极速提取（免网页滑块） ─────────────────
+
+def _extract_local_pdf_fulltext(title: str, save_dir: Optional[str] = None) -> Optional[str]:
+    """若目标论文已在本地 `./papers/pdf` 下载过 PDF，直接通过 pdfplumber/pypdf 提取带页码正文。"""
+    if not title:
+        return None
+    title_clean = re.sub(r'[\s\-_：:""\'\'【】（）()]+', '', title).lower()
+    if len(title_clean) < 4:
+        return None
+    core = title_clean[:min(len(title_clean), 20)]
+
+    try:
+        from config import get as cfg_get
+        base_dir = Path(save_dir or cfg_get("save_dir", "./papers"))
+    except ImportError:
+        base_dir = Path(save_dir or "./papers")
+
+    search_dirs = [base_dir / "pdf", base_dir]
+    matched_pdf: Optional[Path] = None
+    for d in search_dirs:
+        if not d.is_dir():
+            continue
+        for f in d.iterdir():
+            if f.suffix.lower() != ".pdf" or not f.is_file():
+                continue
+            fname_clean = re.sub(r"[\s\-_.]", "", f.stem).lower()
+            if core in fname_clean:
+                matched_pdf = f
+                break
+        if matched_pdf:
+            break
+
+    if not matched_pdf:
+        return None
+
+    pages_text: List[str] = []
+    try:
+        import pdfplumber
+        with pdfplumber.open(str(matched_pdf)) as pdf:
+            for idx, page in enumerate(pdf.pages, 1):
+                txt = (page.extract_text() or "").strip()
+                if txt:
+                    pages_text.append(f"[第 {idx} 页]\n{txt}")
+    except ImportError:
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(str(matched_pdf))
+            for idx, page in enumerate(reader.pages, 1):
+                txt = (page.extract_text() or "").strip()
+                if txt:
+                    pages_text.append(f"[第 {idx} 页]\n{txt}")
+        except Exception as e:
+            _log(f"[cnki-detail] 本地 PDF 读取失败 ({matched_pdf.name}): {e}")
+            return None
+    except Exception as e:
+        _log(f"[cnki-detail] 本地 PDF 提取异常 ({matched_pdf.name}): {e}")
+        return None
+
+    combined = "\n\n".join(pages_text).strip()
+    if len(combined) > 200:
+        _log(f"[cnki-detail] 命中本地已下载 PDF ({matched_pdf.name})，直接提取 {len(combined)} 字（免网页全文滑块）")
+        return combined
+    return None
+
+
 # ── 批量详情 ──────────────────────────────────────────
 
 def batch_read_detail(
@@ -758,16 +935,7 @@ def batch_read_detail(
     top_n: int = 5,
     fulltext: bool = False,
 ) -> List[Dict[str, Any]]:
-    """批量获取论文详情（摘要+可选全文），复用同一个浏览器会话。
-
-    Args:
-        papers:   搜索结果列表（需含 url 字段）
-        top_n:    只处理前 N 篇（默认 5）
-        fulltext: 是否抓取 HTML 全文（默认 False，只抓摘要）
-
-    Returns:
-        增强后的论文列表（追加 abstract/keywords/fulltext 等字段）
-    """
+    """批量获取论文详情（摘要+可选全文），复用同一个浏览器会话。"""
     if not papers:
         return []
 
@@ -776,41 +944,79 @@ def batch_read_detail(
         _log("[cnki-detail] 没有可访问的论文 URL")
         return papers
 
-    _log(f"[cnki-detail] 将获取 {len(targets)} 篇论文的{'全文' if fulltext else '摘要'}")
+    # 先检查缓存与本地 PDF，若全部命中则连浏览器都无需访问
+    need_web_targets: List[Dict[str, Any]] = []
+    for paper in targets:
+        url = paper["url"]
+        if fulltext:
+            cached = _load_cached_fulltext(url, paper=paper)
+            if cached:
+                _log(f"[cnki-detail] 命中稳定键缓存: {paper.get('title', '')[:35]}")
+                cache_path = cached.get("_cache_file", "")
+                for k, v in cached.items():
+                    if k.startswith("_"):
+                        continue
+                    if k == "fulltext":
+                        paper["has_fulltext"] = True
+                        paper["fulltext"] = v
+                        paper["fulltext_length"] = len(v)
+                        if cache_path:
+                            paper["fulltext_cache"] = cache_path
+                    elif v and not paper.get(k):
+                        paper[k] = v
+                continue
+            local_ft = _extract_local_pdf_fulltext(paper.get("title", ""))
+            if local_ft and paper.get("abstract"):
+                saved = _save_cached_fulltext(url, {
+                    "abstract": paper.get("abstract", ""),
+                    "keywords": paper.get("keywords", []),
+                    "fulltext": local_ft,
+                    "fulltext_length": len(local_ft),
+                }, paper=paper)
+                paper["has_fulltext"] = True
+                paper["fulltext"] = local_ft
+                paper["fulltext_length"] = len(local_ft)
+                paper["fulltext_cache"] = str(saved)
+                continue
+        need_web_targets.append(paper)
+
+    if not need_web_targets:
+        return papers
+
+    _log(f"[cnki-detail] 将通过浏览器获取 {len(need_web_targets)} 篇论文的{'全文' if fulltext else '摘要/元数据'}")
 
     driver = None
     try:
         browser = _detect_browser()
         driver = _create_driver(browser=browser)
 
-        driver.get("https://kns.cnki.net/")
-        time.sleep(1)
+        _safe_get(driver, "https://kns.cnki.net/")
+        time.sleep(0.6)
         _load_cookies(driver)
         _save_cookies(driver)
 
-        for idx, paper in enumerate(targets):
+        for idx, paper in enumerate(need_web_targets):
             url = paper["url"]
-            _log(f"\n[cnki-detail] === {idx + 1}/{len(targets)}: {paper.get('title', '')[:40]} ===")
-
-            if fulltext:
-                cached = _load_cached_fulltext(url)
-                if cached:
-                    _log("[cnki-detail] 命中缓存，跳过抓取")
-                    for k, v in cached.items():
-                        if k == "fulltext":
-                            paper["has_fulltext"] = True
-                            paper["fulltext_length"] = len(v)
-                            paper["fulltext_cache"] = str(
-                                _fulltext_cache_dir() / f"{_cache_key(url)}.json"
-                            )
-                        elif v and not paper.get(k):
-                            paper[k] = v
-                    continue
+            _log(f"\n[cnki-detail] === {idx + 1}/{len(need_web_targets)}: {paper.get('title', '')[:40]} ===")
 
             try:
-                driver.get(url)
-                time.sleep(REQUEST_INTERVAL)
+                _safe_get(driver, url)
+                time.sleep(max(1.2, REQUEST_INTERVAL - 1))
                 driver = _handle_captcha(driver)
+
+                if _is_cnki_error_or_404(driver) and paper.get("title"):
+                    from .search import refresh_cnki_url
+                    refreshed = refresh_cnki_url(
+                        driver,
+                        title=paper.get("title", ""),
+                        journal=paper.get("journal", ""),
+                    )
+                    if refreshed:
+                        url = refreshed
+                        paper["url"] = refreshed
+                        _safe_get(driver, url)
+                        time.sleep(max(1.2, REQUEST_INTERVAL - 1))
+                        driver = _handle_captcha(driver)
 
                 detail = _parse_detail_page(driver)
                 for k, v in detail.items():
@@ -818,24 +1024,35 @@ def batch_read_detail(
                         paper[k] = v
 
                 if fulltext:
-                    ft = _read_fulltext_html(driver, url)
+                    # 拿到 cnki_id 后再次检查是否命中稳定键缓存或本地 PDF
+                    cached = _load_cached_fulltext(url, paper=paper)
+                    if cached:
+                        ft = cached["fulltext"]
+                        paper["has_fulltext"] = True
+                        paper["fulltext"] = ft
+                        paper["fulltext_length"] = len(ft)
+                        paper["fulltext_cache"] = cached.get("_cache_file", "")
+                        continue
+
+                    ft = _extract_local_pdf_fulltext(paper.get("title", ""))
+                    if not ft:
+                        ft = _read_fulltext_html(driver, url)
                     if not ft:
                         _log("[cnki-detail] HTML阅读不可用，尝试原版阅读(FlowPDF)...")
                         ft = _read_fulltext_flowpdf(driver, url)
                     if ft:
-                        paper["has_fulltext"] = True
-                        paper["fulltext"] = ft
-                        paper["fulltext_length"] = len(ft)
-                        paper["fulltext_cache"] = str(
-                            _fulltext_cache_dir() / f"{_cache_key(url)}.json"
-                        )
-                        _log(f"[cnki-detail] 全文获取成功: {len(ft)} 字")
-                        _save_cached_fulltext(url, {
+                        saved = _save_cached_fulltext(url, {
+                            "cnki_id": paper.get("cnki_id", ""),
                             "abstract": paper.get("abstract", ""),
                             "keywords": paper.get("keywords", []),
                             "fulltext": ft,
                             "fulltext_length": len(ft),
-                        })
+                        }, paper=paper)
+                        paper["has_fulltext"] = True
+                        paper["fulltext"] = ft
+                        paper["fulltext_length"] = len(ft)
+                        paper["fulltext_cache"] = str(saved)
+                        _log(f"[cnki-detail] 全文获取成功: {len(ft)} 字")
                     else:
                         _log("[cnki-detail] HTML阅读和原版阅读均失败，仅保留摘要")
                         paper["has_fulltext"] = False
@@ -847,7 +1064,8 @@ def batch_read_detail(
                 paper["detail_error"] = str(e)
                 continue
 
-            time.sleep(1)
+            if idx < len(need_web_targets) - 1:
+                time.sleep(0.8)
 
         return papers
 
@@ -856,8 +1074,330 @@ def batch_read_detail(
         return papers
     finally:
         if driver is not None:
+            _release_driver(driver)
+
+
+# ── 知网原生双向引文网络 (`#refpartdiv` 引证文献 / 参考文献) ──────────────
+
+def parse_cnki_citation_item(text: str, href: str = "") -> Optional[Dict[str, Any]]:
+    """解析知网详情页 `#refpartdiv` 单条引文文本，例如:
+    `[1] 现实需要如何推动经济学在中国的发展[J]. 黄少安.经济学动态,2021(05)`
+    `[2] 数字普惠金融研究[D]. 李明.中央财经大学,2023`
+    """
+    raw = re.sub(r"\s+", " ", (text or "")).strip()
+    if not raw:
+        return None
+    body = re.sub(r"^\[\d+\]\s*", "", raw).strip()
+    if not body:
+        return None
+
+    title = ""
+    doc_tag = "J"
+    rest = ""
+
+    m_tag = re.match(r"^(.+?)\[([A-Za-z/]+)\]\s*[.．]?\s*(.*)$", body)
+    if m_tag:
+        title = m_tag.group(1).strip()
+        doc_tag = m_tag.group(2).upper()
+        rest = m_tag.group(3).strip()
+    else:
+        parts = re.split(r"[.．]\s*", body, maxsplit=1)
+        title = parts[0].strip()
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if not title:
+        return None
+
+    year = None
+    issue = ""
+    authors = ""
+    journal = ""
+
+    y_m = re.search(r"((?:19|20)\d{2})(?:\s*\((\w+)\))?", rest)
+    if y_m:
+        year = int(y_m.group(1))
+        if y_m.group(2):
+            issue = y_m.group(2).lstrip("0") or "0"
+        before_year = rest[:y_m.start()].rstrip(" ,，.．:：")
+    else:
+        before_year = rest.rstrip(" ,，.．:：")
+
+    if before_year:
+        # 切分「作者.期刊/单位」：最后一个句点之后通常是期刊或学位授予单位
+        dot_parts = [p.strip() for p in re.split(r"[.．]", before_year) if p.strip()]
+        if len(dot_parts) >= 2:
+            journal = dot_parts[-1]
+            authors = ", ".join(dot_parts[:-1])
+        else:
+            authors = dot_parts[0]
+
+    entry: Dict[str, Any] = {
+        "title": title,
+        "authors": authors,
+        "journal": journal,
+        "year": year,
+        "doc_tag": doc_tag,
+        "url": href or "",
+        "raw": raw,
+        "source": "CNKI",
+    }
+    if issue:
+        entry["issue"] = issue
+    return entry
+
+
+def _extract_visible_citnet_items(driver, tab_kind: str = "", limit: int = 20) -> List[Dict[str, Any]]:
+    """提取当前激活且可见的 `#refpartdiv` 引文条目（按 `citations` / `references` 容器隔离并支持模块内翻页）。"""
+    collected: List[Dict[str, Any]] = []
+    seen_titles: set[str] = set()
+    max_pages = max(1, (limit + 9) // 10)
+    prefix = f"nxgp-kcms-data-ref-{tab_kind}-" if tab_kind in ("citations", "references") else ""
+
+    for _page in range(max_pages):
+        raw_items = driver.execute_script(r"""
+            var prefix = arguments[0];
+            var refDiv = document.querySelector('#refpartdiv');
+            if (!refDiv) return [];
+            var containers = prefix
+                ? Array.from(refDiv.querySelectorAll('[id^="' + prefix + '"]'))
+                : [refDiv];
+            if (!containers.length) containers = [refDiv];
+            var out = [];
+            for (var c = 0; c < containers.length; c++) {
+                var box = containers[c];
+                if (prefix && box.offsetParent === null && box.querySelectorAll('li').length === 0) continue;
+                var lis = box.querySelectorAll('li');
+                for (var i = 0; i < lis.length; i++) {
+                    var li = lis[i];
+                    if (!prefix && li.offsetParent === null) continue;
+                    var txt = (li.textContent || '').trim();
+                    if (!/^\[\d+\]/.test(txt)) continue;
+                    var a = li.querySelector('a[href]');
+                    out.push({text: txt, href: a ? a.href : ''});
+                }
+            }
+            return out;
+        """, prefix) or []
+
+        added_this_page = 0
+        for item in raw_items:
+            parsed = parse_cnki_citation_item(item.get("text", ""), item.get("href", ""))
+            if not parsed:
+                continue
+            key = parsed["title"].lower()
+            if key not in seen_titles:
+                seen_titles.add(key)
+                collected.append(parsed)
+                added_this_page += 1
+                if len(collected) >= limit:
+                    return collected
+
+        if len(collected) >= limit or added_this_page == 0:
+            break
+
+        clicked_next = driver.execute_script(r"""
+            var prefix = arguments[0];
+            var refDiv = document.querySelector('#refpartdiv');
+            if (!refDiv) return false;
+            var scope = prefix ? refDiv.querySelector('[id^="' + prefix + '"][class*="pageBar"]') : null;
+            var links = (scope || refDiv).querySelectorAll('a.next, .pageBar a, a');
+            for (var i = 0; i < links.length; i++) {
+                var a = links[i];
+                if (a.offsetParent === null) continue;
+                var t = (a.textContent || '').trim();
+                var cls = (a.className || '').toLowerCase();
+                if ((t === '下一页' || cls.indexOf('next') >= 0) && cls.indexOf('disabled') < 0) {
+                    a.click();
+                    return true;
+                }
+            }
+            return false;
+        """, prefix)
+        if not clicked_next:
+            break
+        time.sleep(1.0)
+
+    return collected
+
+
+def _activate_and_wait_citnet_tab(driver, tab_kind: str, timeout: float = 6.0) -> bool:
+    """激活 `ul.module-tab li[data-id="<tab_kind>"]` 并等待对应 `nxgp-kcms-data-ref-<tab_kind>-*` 容器加载数据。"""
+    clicked = driver.execute_script(r"""
+        var kind = arguments[0];
+        var sel = 'ul.module-tab li[data-id="' + kind + '"], ul.module-tab li.' + kind + ', #refpartdiv li.' + kind;
+        var li = document.querySelector(sel);
+        if (!li) return false;
+        li.scrollIntoView({block: 'center'});
+        li.click();
+        if (typeof window.changeRefTypeTag === 'function') {
+            try { window.changeRefTypeTag(li); } catch (e) {}
+        }
+        return true;
+    """, tab_kind)
+    if not clicked:
+        return False
+
+    prefix = f"nxgp-kcms-data-ref-{tab_kind}-"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        has_rows = driver.execute_script(r"""
+            var prefix = arguments[0];
+            var boxes = document.querySelectorAll('[id^="' + prefix + '"]');
+            for (var i = 0; i < boxes.length; i++) {
+                var lis = boxes[i].querySelectorAll('li');
+                for (var j = 0; j < lis.length; j++) {
+                    if (/^\[\d+\]/.test((lis[j].textContent || '').trim())) return true;
+                }
+            }
+            return false;
+        """, prefix)
+        if has_rows:
+            return True
+        time.sleep(0.35)
+    return False
+
+
+def get_cnki_citations(
+    target: str,
+    direction: str = "both",
+    limit: int = 20,
+) -> Dict[str, Any]:
+    """获取中文论文在知网详情页原生的双向引文网络（无需个人账号登录）：
+    - `citing` (`li.citations` / `a#citations`): 引证文献（谁引用了它）
+    - `references` (`li.references` / `a#references`): 参考文献（它引用了谁）
+    支持传入知网详情页 URL、`cnki:<中文题名>` 或直接传入中文论文标题。
+    """
+    raw_target = (target or "").strip()
+    if raw_target.lower().startswith("cnki:"):
+        raw_target = raw_target[5:].strip()
+    if not raw_target:
+        return {"status": "error", "code": "NO_PAPER_ID", "message": "未提供知网论文 URL 或中文题名"}
+
+    # 读取 7 天引文缓存
+    cache_file: Optional[Path] = None
+    try:
+        from config import cache_dir
+        from datetime import datetime, timedelta
+        c_key = hashlib.md5(f"{raw_target}|{direction}|{limit}".encode("utf-8")).hexdigest()[:16]
+        cache_file = cache_dir("cache", create=True) / f"cnki_citnet_{c_key}.json"
+        if cache_file.exists():
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            ts = cached.get("_cached_at", "")
+            if ts and datetime.now() - datetime.fromisoformat(ts) <= timedelta(days=7):
+                return cached["data"]
+    except Exception:
+        pass
+
+    driver = None
+    try:
+        browser = _detect_browser()
+        driver = _create_driver(browser=browser)
+
+        _safe_get(driver, "https://kns.cnki.net/")
+        time.sleep(0.6)
+        _load_cookies(driver)
+
+        detail_url = raw_target if raw_target.lower().startswith("http") else ""
+        if not detail_url:
+            from .search import refresh_cnki_url
+            detail_url = refresh_cnki_url(driver, title=raw_target) or ""
+            if not detail_url:
+                return {
+                    "status": "error",
+                    "code": "RESOLVE_FAILED",
+                    "message": f"未能在知网定位论文: {raw_target}",
+                }
+
+        cit_url = detail_url if "anchor=citnet" in detail_url else (
+            f"{detail_url}&anchor=citnet" if "?" in detail_url else f"{detail_url}?anchor=citnet"
+        )
+        _safe_get(driver, cit_url)
+        time.sleep(max(1.5, REQUEST_INTERVAL - 1))
+        driver = _handle_captcha(driver)
+
+        if _is_cnki_error_or_404(driver) and not raw_target.lower().startswith("http"):
+            return {"status": "error", "code": "CNKI_URL_EXPIRED", "message": "知网详情链接已失效 (404)"}
+
+        paper_meta = _parse_detail_page(driver)
+        paper_meta["url"] = detail_url
+        paper_meta["source"] = "CNKI"
+
+        # 滚动到引文网络区域触发懒加载
+        driver.execute_script(r"""
+            var ref = document.querySelector('#refpartdiv');
+            if (ref) ref.scrollIntoView({block: 'center'});
+            else window.scrollTo(0, document.body.scrollHeight * 0.7);
+        """)
+
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            has_items = driver.execute_script(r"""
+                var ref = document.querySelector('#refpartdiv');
+                if (!ref) return false;
+                var lis = ref.querySelectorAll('li');
+                for (var i = 0; i < lis.length; i++) {
+                    if (/^\[\d+\]/.test((lis[i].textContent || '').trim())) return true;
+                }
+                return false;
+            """)
+            if has_items:
+                break
+            time.sleep(0.4)
+
+        tab_totals = driver.execute_script(r"""
+            var mapEl = document.querySelector('#quoted-refcountpart, #refpartdiv');
+            var txt = mapEl ? (mapEl.innerText || mapEl.textContent || '') : '';
+            var mCit = txt.match(/(?:^|[^级])引证文献\s*\(\s*(\d+)\s*\)/);
+            var mRef = txt.match(/(?:^|[^级])参考文献\s*\(\s*(\d+)\s*\)/);
+            return {
+                citing_total: mCit ? parseInt(mCit[1], 10) : null,
+                references_total: mRef ? parseInt(mRef[1], 10) : null
+            };
+        """) or {}
+
+        citing_list: List[Dict[str, Any]] = []
+        references_list: List[Dict[str, Any]] = []
+
+        if direction in ("citing", "both"):
+            _activate_and_wait_citnet_tab(driver, "citations", timeout=6.0)
+            citing_list = _extract_visible_citnet_items(driver, tab_kind="citations", limit=limit)
+
+        if direction in ("cited", "both"):
+            _activate_and_wait_citnet_tab(driver, "references", timeout=6.0)
+            references_list = _extract_visible_citnet_items(driver, tab_kind="references", limit=limit)
+
+        result = {
+            "status": "success" if paper_meta.get("title") else "partial",
+            "source": "CNKI",
+            "paper": {
+                "title": paper_meta.get("title", ""),
+                "authors": paper_meta.get("authors", ""),
+                "journal": paper_meta.get("journal", ""),
+                "year": paper_meta.get("year"),
+                "doi": paper_meta.get("doi", ""),
+                "cnki_id": paper_meta.get("cnki_id", ""),
+                "url": detail_url,
+                "cited_by_count": tab_totals.get("citing_total") or len(citing_list),
+                "references_total": tab_totals.get("references_total") or len(references_list),
+            },
+            "citing_count": len(citing_list),
+            "references_count": len(references_list),
+            "citing": citing_list,
+            "references": references_list,
+        }
+
+        if cache_file and result["status"] == "success":
             try:
-                _save_cookies(driver)
-                driver.quit()
+                from datetime import datetime
+                cache_file.write_text(
+                    json.dumps({"_cached_at": datetime.now().isoformat(), "data": result}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
             except Exception:
                 pass
+        return result
+    except Exception as e:
+        return {"status": "error", "code": "CNKI_CITATIONS_FAILED", "message": str(e)}
+    finally:
+        if driver is not None:
+            _release_driver(driver)

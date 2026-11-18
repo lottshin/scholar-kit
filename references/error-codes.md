@@ -19,6 +19,8 @@ Agent 根据此表决定如何回应用户。
 | `NO_URLS` | 未提供下载 URL | Agent 应从搜索结果中选取 URL 后传入 |
 | `NO_KEYWORDS` | 未提供搜索关键词 | Agent 应从用户请求中提取关键词 |
 | `NO_RESULTS` | 搜索无匹配结果 | 尝试同义词/英文关键词、放宽年份或改用 `--source all --enable-fallback` |
+| `CNKI_ADV_SEARCH_FAILED` | 知网高级检索条件提交失败（已拒绝静默退回未过滤结果） | 读取返回中的 `dom_diagnosis_file`（脱敏 DOM 快照）或运行 `check --cnki-dom` 检查是否知网改版/停留在验证页；需要时更新 `scripts/cnki/selectors.py` |
+| `CNKI_EXPR_SYNTAX_ERROR` | 知网专业检索式 `--expr` 语法有误 | 检查英文单引号闭合与括号配对；年份改用 `--year-from/--year-to`（勿写 `YE=` / `YE>=`） |
 | `ADV_SEARCH_FALLBACK` | 高级搜索失败且无关键词可回退 | 提示用户补充关键词，或建议稍后重试；Agent 也可尝试改为传 keyword 重新搜索 |
 | `UNKNOWN_SOURCE` | 未知数据源 | 可用：cnki, openalex, semantic, arxiv, nssd, dblp, base, all |
 | `DRIVER_MISSING` | 浏览器驱动缺失 | 运行 `check --fix`，必要时以平台提权方式允许联网下载驱动 |

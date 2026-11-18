@@ -294,7 +294,90 @@ WORKFLOW_TEMPLATES: Dict[str, Dict[str, Any]] = {
         "estimated_time_seconds": 10,
         "requirements": ["cnki_feasible"],
         "notes": "core_type 可选: 北大核心, CSSCI, CSCD, EI 等"
-    }
+    },
+
+    "cnki_literature_review": {
+        "name": "知网中文核心文献综述闭环",
+        "description": "知网高被引基石文献 + 近三年最新进展 + 自动补全摘要与主题聚类/空白分析",
+        "steps": [
+            {
+                "command": "search",
+                "args": {
+                    "query": "{topic}",
+                    "source": "cnki",
+                    "field": "篇关摘",
+                    "core": "{core_type}",
+                    "sort": "citations",
+                    "year_from": 2018,
+                    "limit": 20,
+                    "project": "{project}",
+                },
+                "description": "检索核心期刊高被引基石论文",
+            },
+            {
+                "command": "search",
+                "args": {
+                    "query": "{topic}",
+                    "source": "cnki",
+                    "field": "篇关摘",
+                    "core": "{core_type}",
+                    "sort": "date",
+                    "year_from": 2024,
+                    "limit": 10,
+                    "append": True,
+                    "project": "{project}",
+                },
+                "description": "补充近两年最新核心期刊进展并合并至课题库",
+            },
+            {
+                "command": "review",
+                "args": {
+                    "project": "{project}",
+                    "topic": "{topic}",
+                    "auto_detail": True,
+                    "detail_top_n": 6,
+                    "cluster": True,
+                    "gaps": True,
+                },
+                "description": "自动补全高相关论文摘要，生成动态主题聚类与覆盖度分析",
+            },
+        ],
+        "variables": ["topic", "core_type", "project"],
+        "expected_output": "课题文献库 + 摘要证据包 + 主题聚类 + 空白信号",
+        "estimated_time_seconds": 35,
+        "requirements": ["cnki_feasible"],
+    },
+
+    "snowball_citation_tracking": {
+        "name": "滚雪球引文追踪扩检",
+        "description": "围绕单篇核心种子论文抓取双向引文（引证+参考）并直接并入课题库生成综述线索",
+        "steps": [
+            {
+                "command": "citations",
+                "args": {
+                    "identifier": "{seed_paper}",
+                    "direction": "both",
+                    "limit": 15,
+                    "save": "both",
+                    "append": True,
+                    "project": "{project}",
+                },
+                "description": "抓取种子论文的参考文献（溯源）与引证文献（前沿）并写入课题库",
+            },
+            {
+                "command": "review",
+                "args": {
+                    "project": "{project}",
+                    "cluster": True,
+                    "gaps": True,
+                },
+                "description": "对扩检后的课题文献库执行聚类梳理",
+            },
+        ],
+        "variables": ["seed_paper", "project"],
+        "expected_output": "双向引文入库结果 + 主题脉络梳理",
+        "estimated_time_seconds": 20,
+    },
 }
 
 
@@ -352,13 +435,13 @@ def render_workflow_argv(workflow_id: str, variables: Dict[str, str]) -> List[Li
         for arg_name, arg_value in step["args"].items():
             arg_value = _render_arg_value(arg_value, variables)
 
-            # 构建命令参数
+            # 构建命令参数（对空字符串可选过滤参数自动跳过）
             if isinstance(arg_value, bool):
                 if arg_value:
                     cmd_parts.append(f"--{arg_name.replace('_', '-')}")
             elif arg_name in positional_args:
                 cmd_parts.append(str(arg_value))
-            else:
+            elif arg_value is not None and str(arg_value).strip() != "":
                 cmd_parts.extend([f"--{arg_name.replace('_', '-')}", str(arg_value)])
 
         commands.append(cmd_parts)

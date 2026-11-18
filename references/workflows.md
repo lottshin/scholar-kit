@@ -12,6 +12,33 @@ Agent 执行具体任务时按需读取本文档。决策入口见 [SKILL.md 决
 3. `cnki_feasible: true` → 单词用 `search`，多词用 `batch-search`；`cnki_feasible: false` → 用 `search --source openalex` 等 API 源
 4. 展示结果，注明筛选了哪些来源类别
 
+### 知网（CNKI）高级检索与专业检索技巧
+
+新版知网检索底层采用**双引擎机制**（优先 `majorSearch` 专业检索布尔式，自动回退 `#gradetxt` 多条件表单，并在提交前一次性预设文献库、来源类别与发表年份区间）：
+
+- **高频复合字段 `--field 篇关摘`（`TKA`）**：同时匹配篇名 + 关键词 + 摘要，比默认 `主题` 边界更清晰、比单搜 `篇名` 检全率更高，综述检索首选。
+- **结构化多维限定**（位置参数 `query` 在只按作者/机构/期刊搜时可省略）：
+  - `--author "张三"`（`AU='张三'`） / `--first-author "张三"`（`FI='张三'`）
+  - `--affiliation "清华大学"`（`AF % '清华大学'`，默认模糊包含以覆盖院系后缀）
+  - `--journal "《中国社会科学》"`（带书名号精确匹配 `LY='中国社会科学'`；不带书名号默认 `LY %` 兼容学报分版）
+  - `--fund "国家社会科学基金"`（`FU % '国家社会科学基金'`）
+  - `--fuzzy`：对主题/篇关摘/篇名启用 `%` 模糊包含匹配
+- **单次布尔专业检索 `--expr`（强烈推荐替代同义词多轮 `batch-search`）**：
+  - 语法：字段代码（`SU` / `TKA` / `TI` / `KY` / `AB` / `AU` / `FI` / `AF` / `LY` / `FU`）+ `=`（精确）或 `%`（模糊）+ **英文单引号**包裹词项；同字段内并列用 `+`、交集用 `*`、排除用 `-`；跨字段用 `AND` / `OR` / `NOT`（注意 `AND` 后必须带字段代码，如 `AND TKA=(...)`）。
+  - 注意：年份直接搭配 `--year-from` / `--year-to` 即可（知网 KNS8S 专业检索式不支持 `YE` 字段）。
+
+```bash
+# 1. 一条专业检索式同时覆盖多组同义词 + 核心期刊 + 年份（1 次请求完成，大幅降低滑块触发概率）
+search --expr "TKA=('数字经济' + '数据要素') AND TKA=('乡村振兴' + '县域治理')" --core 北大核心,CSSCI --year-from 2021
+
+# 2. 限定高校/机构 + 第一作者或期刊（无需传空字符串 query）
+search --affiliation "北京大学" --journal "《管理世界》" --year-from 2020
+search --first-author "张三" --doc-type journal
+
+# 3. 篇关摘检索博硕士学位论文
+search "大模型微调" --field 篇关摘 --doc-type doctor --year-from 2023
+```
+
 ### API 源高级检索技巧
 
 **排序策略**：
@@ -89,59 +116,60 @@ search "AI in education" --source all --async-search --limit 30
 python scripts\literature.py workflows --execute literature_review_classic --variables '{""topic"":""deep learning""}' --dry-run
 ```
 
-## 写文献综述
+## 写文献综述（建库 → 去噪扩检 → 证据包 → 撰写 → 校验 → 定向国标引用）
 
-1. `read-paper` 读取用户论文
-2. 提取 5-10 组关键词 → 搜索（`cnki_feasible` 时用 `batch-search --append`；否则逐组执行 `search --source openalex "关键词"`，Agent 从每次 JSON 输出中收集结果自行合并）
-3. 初筛 3-5 篇 → `cnki_feasible` 时用 `read-detail --fulltext`，否则直接使用 API 返回的摘要
-4. 基于全文/摘要提炼观点，标注引用来源
-5. `cite --style gbt7714` 生成参考文献（有 DOI 的论文会自动通过 Crossref 补全卷期页码，引用更完整）
+1. **检索建库（推荐指定 `--project <课题名>` 持久化积累）**
+   - `cnki_feasible: true`：优先用 `--expr` 布尔专业检索一次性覆盖同义词与核心期刊（例如 `search --expr "TKA=('数字经济' + '数据要素') AND TKA=('新质生产力' + '高质量发展')" --core 北大核心,CSSCI --sort citations --limit 25 --project 数字经济综述`），再视需要加跑一轮 `--sort date --year-from 2024 --append --project 数字经济综述` 补充前沿文献。
+   - 滚雪球溯源与前沿扩检（可选）：挑 1–2 篇高被引基石论文运行 `citations "<知网URL或题名>" --save both --append --project 数字经济综述`。
+   - `cnki_feasible: false`：用 `search "<英文词>" --source all --async-search --project <课题名>`，多组检索叠加 `--append`。
+2. **筛选去噪与阅读批注（`library`）**
+   - 运行 `library --project <课题名> --dedupe` 自动跨轮去重；
+   - 用 `library --project <课题名> --remove 4,9`（或 `--keep 1,2,3,5-12`）剔除偏题文献，必要时用 `--indices 1,3 --tag "核心机制" --note "基准实证模型"` 标记重点文献。
+3. **生成可追溯综述证据包与全文精读**
+   - 运行 `review --project <课题名> --topic "<综述主题>" --auto-detail --detail-top-n 6 --cluster --gaps`（自动单会话补全知网摘要、输出动态聚类与覆盖度空白提示）；
+   - 对需要深挖论证细节的 3–5 篇代表作运行 `read-detail --project <课题名> --indices 1,2,5 --fulltext`（本地已下载 PDF 时秒级提取免滑块）。
+4. **撰写综述与证据支撑核验（`validate`）**
+   - Agent 基于证据包撰写综述正文（先按正文引用先后保留课题库证据序号用于核查，运行 `validate --project <课题名> --file draft.md` 检查是否存在无支撑断言或仅题录强断言）。
+5. **按正文引用顺序生成标准参考文献（`cite --indices`）**
+   - 按正文最终首次出现顺序传入 `--indices`（如正文依次引了课题库第 5、1、8 篇，则运行 `cite --project <课题名> --indices 5,1,8 --style gbt7714`），脚本仅对被选文献补全卷期页码并自动重编为 `[1][2][3]`，严禁手拼参考文献。
 
 ## 引用建议
 
-1. `read-paper` 读取论文
-2. 识别需要引用的句子 → 提取关键词
-3. 搜索（同上，按 `cnki_feasible` 选命令）→ 初筛
-4. 精准匹配：哪句话引哪篇的哪段
-5. 区分"必须引用"和"建议引用"
+1. `read-paper --numbered` 读取用户论文（获取 `[P12]` 等段落锚点）
+2. 识别需要引用的句子 → 提取关键词检索入库 → `read-detail --indices ...` 核对摘要/全文
+3. 精准匹配：哪一段（`[P12]`）哪句话引哪篇文献的哪个论据，区分"必须引用"和"建议引用"
+4. 调用 `cite --indices <选用序号> --style gbt7714` 生成标准引文
 
 ## 改写论文并生成 Word（内容大改）
 
 1. `read-paper` 读取用户论文
-2. 提取关键词 → 搜索（按 `cnki_feasible` 选命令）→ 获取参考文献内容
+2. 提取关键词 → 搜索并筛选入库 → 获取参考文献摘要/全文
 3. Agent 改写论文，输出 Markdown 文件，用 `[^1]` 标记脚注
-4. 在 Markdown 末尾用 `[^1]: 引用文本` 定义脚注内容（或用 `## 参考文献` 节）
+4. 在 Markdown 末尾用 `[^1]: 引用文本` 定义脚注内容（或用 `## 参考文献` 节附上 `cite` 生成的国标引文）
 5. `write-docx draft.md --output 论文.docx` → 生成标准学术格式 Word
 
 ## 基于用户提供的 PDF 文献库
 
-用户提供一个文件夹（含多篇 PDF），要求筛选可用文献、写综述或插入引用：
+用户提供一个文件夹（含多篇中英文 PDF），要求筛选可用文献、写综述或插入引用：
 
-1. 用 Glob 扫描文件夹获取所有 `.pdf` 路径
-2. 逐篇用 Agent 内置的文件读取工具读取 PDF 内容（**不要用 `read-paper`，PDF 直接读取**）
-3. 对每篇提取：标题、作者、摘要/核心观点、与用户论文的关联度
-4. 按关联度排序，向用户报告筛选结果
-5. 后续操作视用户需求而定：
-   - 写综述 → Agent 综合各篇观点，输出 Markdown，用 `write-docx` 生成 Word
-   - 插引用 → Agent 生成 patch JSON，用 `patch-docx` 在用户论文上打补丁
-   - 仅推荐 → 展示推荐列表 + 理由
+1. **一键导入课题库**：运行 `import "<PDF目录路径>" --project <课题名>`（自动递归扫描全部 `.pdf`，解析英文 DOI/Crossref 元数据及中文知网 PDF 首页摘要、关键词、年卷期，并记录 `local_pdf` 路径）。
+2. **初筛与整理**：运行 `library --project <课题名>` 查看题录，用 `library --remove ...` 剔除无关条目，或运行 `review --project <课题名> --cluster --gaps` 获取主题聚类。
+3. **按需提取带页码全文**：对核心篇目运行 `read-detail --project <课题名> --indices 1,3,5 --fulltext`（直接提取本地 PDF `[第 N 页]` 全文）或用 Agent 内置文件读取工具精读图表。
+4. **闭环输出**：写综述用 `validate` + `write-docx`；生成参考文献统一调用 `cite --project <课题名> --indices ... --style gbt7714`；在原稿插引用用 `patch-docx --dry-run` 预检后写回。
 
-注意：PDF 数量多时（>10 篇），先读每篇前 2-3 页快速判断相关性，仅对相关篇目读全文。
+## 在原论文中插入引用（保留格式 + 锚点预检）
 
-## 在原论文中插入引用（保留格式）
-
-1. `read-paper` 读取用户论文
-2. 搜索匹配引用（同上）
-3. Agent 生成补丁 JSON 文件，格式：
+1. `read-paper 原论文.docx --numbered` 读取用户论文，记录目标段落锚点（如 `P12`、表格行 `T1R2`）。
+2. 搜索匹配引用并用 `cite --indices ...` 生成标准引用文本。
+3. Agent 生成补丁 JSON 文件（推荐带上 `"paragraph": "P12"` 消除跨章节同句歧义）：
    ```json
    {
-     "patches": [{"find": "原文片段", "replace": "替换后片段"}],
-     "footnotes": [{"after": "定位文本", "text": "脚注引用内容"}],
+     "patches": [{"paragraph": "P12", "find": "原文片段", "replace": "替换后片段[1]"}],
+     "footnotes": [{"paragraph": "P12", "after": "定位文本", "text": "脚注引用内容"}],
      "append_references": ["[1] 参考文献1", "[2] 参考文献2"]
    }
    ```
-   **生成 patch JSON 时注意**：`find` 和 `after` 的定位串要足够长（≥10 字）且在文档中唯一，避免命中错误位置；尽量不要让定位串跨越加粗/斜体等格式边界。
-4. `patch-docx 原论文.docx --patch patch.json --output 修改后.docx`
+4. **先预检再写盘**：先运行 `patch-docx 原论文.docx --patch patch.json --dry-run` 确认 `not_found == 0` 且无意外重复匹配，再去掉 `--dry-run` 输出正式 `.docx`（支持正文段落与表格单元格）。
 
 ## 学术表达优化
 
@@ -151,11 +179,11 @@ python scripts\literature.py workflows --execute literature_review_classic --var
 
 **第一步：阅读与理解论文**
 
-`read-paper` 读取用户论文，理解全文结构、核心论点、论证逻辑。用户提供了本人既往论文时，一并读取 1–2 篇作为风格样本。
+`read-paper 原论文.docx --numbered` 读取带 `[P1]...[Pn]` 段落锚点的全文，理解结构、核心论点与论证逻辑。用户提供了本人既往论文时，一并读取 1–2 篇作为风格样本。
 
 **第二步：审计（只诊断，不改写）**
 
-按 [style-audit](style-audit.md) 逐段检查三个维度，产出问题清单（段落 / 命中类型 / 初步改法），先交给用户确认再动手：
+按 [style-audit](style-audit.md) 逐段检查三个维度，产出问题清单（段落锚点 `P...` / 命中类型 / 初步改法），先交给用户确认再动手：
 - **原创性**：概念定义段、文献引述段、论证过渡段是否只做了搬运（style-audit 第一节）
 - **文体**：中文 AI 腔清单 2.1–2.10 命中哪些（写英文时另查 2.11）
 - **证据**：强断言无支撑、动词强于证据、空洞量级（style-audit 第四节）
@@ -172,29 +200,27 @@ python scripts\literature.py workflows --execute literature_review_classic --var
 
 约束：**不得改变原文学术含义，不得删除关键论据，不得引入原文未涉及的观点，不得改动任何数字、公式、引文**（见 style-audit 第三节保留清单）
 
-**第四步：写回文档**
+**第四步：预检与写回文档**
 
-生成 patch JSON → `patch-docx` 保留原格式写回：
-- 每个 `find` 是原始表述，`replace` 是优化后表述
-- 改写幅度大时可用 `write-docx` 全文输出
+生成带 `"paragraph": "P..."` 锚点的 patch JSON → 先运行 `patch-docx 原论文.docx --patch patch.json --dry-run` 确保 100% 命中无漏改 → 再执行 `patch-docx` 保留原格式写回（改写幅度极大时可用 `write-docx` 全文输出）。
 
 **第五步：报告改动**
 
-按 style-audit 第七节的模板输出变更日志：段落、命中类型、改动要点、证据核查结果，并声明数字/引文未改动的处数。
+按 style-audit 第七节的模板输出变更日志：段落锚点、命中类型、改动要点、证据核查结果，并声明数字/引文未改动的处数。
 
 **限制**：本工具不提供文本相似度检测，无法给出重复率数值，也不针对查重系统做规避；优化效果需用户自行验证。详见 [style-audit 第六节](style-audit.md#六与查重的边界)。
 
-## 引文网络分析
+## 引文网络分析（中英文双向引文 + 滚雪球入库）
 
-用户提供一篇论文（DOI、URL 或 arXiv ID），要求追踪引用关系：
+用户提供一篇论文（知网详情页 URL、中文论文题名、英文 DOI 或 arXiv ID），要求追踪引用关系：
 
-1. `citations "<DOI或URL>"` 获取双向引文网络（默认 `--direction both`）
+1. `citations "<知网URL / 中文题名 / DOI / arXiv>"` 获取双向引文网络（默认 `--direction both`，支持加 `--save both --append --project <课题>` 直接把引文并入课题文献库）：
+   - **中文论文（`cnki_feasible: true`）**：自动走知网详情页 `#refpartdiv` 原生引文网络（无需登录个人账号），同时抓取**引证文献（`citing`）**与**参考文献（`references`）**。
+   - **英文 / DOI / arXiv 论文**：自动走 Semantic Scholar Graph API，`cnki_feasible: false` 时仍可正常使用。
 2. Agent 展示结果：
    - 前向引用（`--direction citing`，输出字段 `citing`）：后续研究如何发展了这篇论文的观点
    - 后向引用（`--direction cited`，输出字段 `references`）：这篇论文引用了哪些前人工作
-3. 用户可进一步要求：下载高被引的引用论文、对引用论文做趋势分析
-
-注意：`citations` 基于 Semantic Scholar API，不需要知网，`cnki_feasible: false` 时仍可使用。
+3. 滚雪球后续动作：入库后可直接衔接 `library --dedupe`、`read-detail --indices ...`、`trends` 或 `review --cluster --gaps`。
 
 ## 研究趋势分析
 

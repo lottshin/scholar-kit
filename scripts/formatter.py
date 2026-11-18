@@ -277,7 +277,21 @@ def _detect_doc_type(paper: dict) -> str:
     return "journal"
 
 
+def _is_online_first_journal(doc_type: str, paper: dict) -> bool:
+    """判定是否为知网等期刊「网络首发」文献（尚无正式期号与页码，按 GB/T 7714 著录为 `[J/OL]`）。"""
+    if doc_type != "journal":
+        return False
+    if paper.get("pages") or paper.get("issue") or paper.get("number"):
+        return False
+    if paper.get("is_online_first"):
+        return True
+    date_str = _first_value(paper, "date", "published", "publication_date")
+    return bool(re.search(r"\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}", date_str) or "网络首发" in date_str)
+
+
 def _gbt_type_tag(doc_type: str, paper: dict) -> str:
+    if _is_online_first_journal(doc_type, paper):
+        return "J/OL"
     online = bool(_first_value(paper, "url")) and doc_type in {
         "webpage", "database", "dataset", "preprint"
     }
@@ -307,7 +321,7 @@ def _gbt_type_tag(doc_type: str, paper: dict) -> str:
 def format_gbt7714(paper: dict, index: int = 1) -> str:
     """
     GB/T 7714-2015 格式化（顺序编码制）
-    按文献类型生成期刊、专著、学位论文、会议析出、专利、电子文献等常见著录格式。
+    按文献类型生成期刊、网络首发期刊 [J/OL]、专著、学位论文、会议析出、专利、电子文献等常见著录格式。
     """
     raw = _first_value(paper, "gbt7714_raw", "gbt7714")
     if raw:
@@ -332,7 +346,19 @@ def format_gbt7714(paper: dict, index: int = 1) -> str:
     type_tag = _gbt_type_tag(doc_type, paper)
 
     ref = f"[{index}] {authors}. {title}[{type_tag}]. "
-    if doc_type == "journal":
+    if doc_type == "journal" and type_tag == "J/OL":
+        ref += journal or "刊名不详"
+        ymd_m = re.search(r"\d{4}-\d{2}-\d{2}", date)
+        pub_day = ymd_m.group(0) if ymd_m else ""
+        if pub_day:
+            ref += f"({pub_day})"
+        elif year:
+            ref += f", {year}"
+        if accessed:
+            ref += f"[{accessed}]"
+        if url and not _first_value(paper, "doi"):
+            ref += f". {url}"
+    elif doc_type == "journal":
         ref += journal or "刊名不详"
         if year:
             ref += f", {year}"
