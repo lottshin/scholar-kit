@@ -16,9 +16,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from cnki import batch_read_detail
-from config import workspace_state_dir
+from config import allowed_fulltext_dirs, workspace_state_dir
 from docx_tools import _write_docx_from_markdown
-from formatter import generate_reference_list
+from formatter import _extract_western_parts, _split_authors, generate_reference_list
 
 
 def _default_output(data: Any) -> None:
@@ -60,16 +60,7 @@ def _save_session(papers: list, append: bool = False, project: Optional[str] = N
     if append and session_file.exists():
         try:
             existing = json.loads(session_file.read_text(encoding="utf-8"))
-            seen_keys = set()
-            merged = []
-            for p in existing + papers:
-                key = p.get("doi") or p.get("url") or p.get("title", "")
-                if key and key not in seen_keys:
-                    seen_keys.add(key)
-                    merged.append(p)
-                elif not key:
-                    merged.append(p)
-            papers = merged
+            papers, _ = _dedupe_library_papers(existing + papers)
         except Exception:
             pass
     session_file.write_text(json.dumps(papers, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -772,8 +763,61 @@ def _append_references(markdown: str, selected: List[Dict[str, Any]], style: str
     return markdown
 
 
-def _sentence_evidence_indices(text: str) -> List[int]:
-    return [int(i) for i in re.findall(r"\[(\d+)\]", text)]
+def _sentence_evidence_indices(
+    text: str,
+    evidence_by_index: Optional[Dict[int, Dict[str, Any]]] = None,
+) -> List[int]:
+    """同时解析顺序编码制（`[1]`、`[1, 3]`、`[2-5]`）与著者-出版年制（`赵涛等（2020）`、`Vaswani et al. (2017)`）。"""
+    found: List[int] = []
+
+    # 1. 顺序编码方括号：支持单号、逗号分隔与连字符区间 `[1, 3-5, 9]`
+    for grp in re.findall(r"\[(\d+(?:\s*[,，\-–—]\s*\d+)*)\]", text):
+        for seg in re.split(r"\s*[,，]\s*", grp):
+            seg = seg.strip()
+            if not seg:
+                continue
+            m_rng = re.match(r"^(\d+)\s*[\-–—]\s*(\d+)$", seg)
+            if m_rng:
+                lo, hi = int(m_rng.group(1)), int(m_rng.group(2))
+                if 0 < lo <= hi and (hi - lo) <= 30:
+                    for x in range(lo, hi + 1):
+                        if x not in found:
+                            found.append(x)
+            elif seg.isdigit():
+                val = int(seg)
+                if val not in found:
+                    found.append(val)
+
+    # 2. 著者-出版年制匹配（当传入文献池时自动按第一作者姓名/姓氏 + 4位年份映射回序号）
+    if evidence_by_index:
+        for idx, ev in evidence_by_index.items():
+            p = ev.get("paper") or {}
+            yr_raw = str(p.get("year") or p.get("date") or "")
+            ym = re.search(r"\b((?:19|20)\d{2})\b", yr_raw)
+            if not ym:
+                continue
+            yr = ym.group(1)
+            if yr not in text:
+                continue
+            authors = _split_authors(p.get("authors"))
+            if not authors:
+                continue
+            a0 = authors[0]
+            if any("\u4e00" <= c <= "\u9fff" for c in a0):
+                # 中文：匹配 `赵涛（2020` / `赵涛等（2020` / `赵涛和张智（2020` / `（赵涛等，2020`
+                pat = rf"{re.escape(a0)}(?:[^。！？.!?（）()]{{0,12}})?[（(，,\s]{yr}[a-z]?"
+                if re.search(pat, text):
+                    if idx not in found:
+                        found.append(idx)
+            else:
+                surname, _ = _extract_western_parts(a0)
+                if surname and len(surname) >= 2:
+                    pat_en = rf"\b{re.escape(surname)}\b(?:[^。！？!?()（）]{{0,28}})?[(（,，\s]{yr}[a-z]?"
+                    if re.search(pat_en, text, re.IGNORECASE):
+                        if idx not in found:
+                            found.append(idx)
+
+    return found
 
 
 def _validation_body(markdown: str) -> str:
@@ -782,7 +826,10 @@ def _validation_body(markdown: str) -> str:
     return body
 
 
-def _claim_sentences(markdown: str) -> List[Dict[str, Any]]:
+def _claim_sentences(
+    markdown: str,
+    evidence_by_index: Optional[Dict[int, Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     body = _validation_body(markdown)
     claims = []
     section = "正文"
@@ -795,21 +842,45 @@ def _claim_sentences(markdown: str) -> List[Dict[str, Any]]:
             continue
         if stripped.startswith("-"):
             stripped = stripped.lstrip("- ").strip()
-        for raw in re.split(r"(?<=[。！？.!?])\s*", stripped):
-            sentence = raw.strip()
+        # 保护西文常见缩写点（如 et al., e.g., i.e., vs.）不被误切句
+        protected = re.sub(
+            r"\b(et\s+al|e\.g|i\.e|vs|cf|fig|eq|vol|no|pp)\.",
+            lambda m: m.group(1) + "\u2024",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+        for raw in re.split(r"(?<=[。！？.!?])\s*", protected):
+            sentence = raw.replace("\u2024", ".").strip()
             if len(sentence) < 12:
                 continue
             claims.append({
                 "section": section,
                 "claim": sentence[:260],
-                "evidence_indices": _sentence_evidence_indices(sentence),
+                "evidence_indices": _sentence_evidence_indices(sentence, evidence_by_index),
             })
     return claims
+
+
+def _load_cached_ft_snippet(paper: Dict[str, Any], limit_chars: int = 30000) -> str:
+    if paper.get("fulltext"):
+        return str(paper["fulltext"])[:limit_chars]
+    cache_p = paper.get("fulltext_cache")
+    if not cache_p:
+        return ""
+    try:
+        resolved = Path(cache_p).resolve()
+        if any(resolved == d or d in resolved.parents for d in allowed_fulltext_dirs()):
+            data = json.loads(resolved.read_text(encoding="utf-8"))
+            return str(data.get("fulltext") or "")[:limit_chars]
+    except Exception:
+        pass
+    return ""
 
 
 def _paper_validation_text(paper: Dict[str, Any]) -> str:
     keywords = " ".join(_normalize_keywords(paper.get("keywords")))
     tags = " ".join(str(t) for t in (paper.get("tags") or []))
+    ft_snip = _load_cached_ft_snippet(paper)
     parts = [
         paper.get("title", ""),
         paper.get("journal", ""),
@@ -817,7 +888,7 @@ def _paper_validation_text(paper: Dict[str, Any]) -> str:
         tags,
         paper.get("note", ""),
         paper.get("abstract", ""),
-        paper.get("fulltext", ""),
+        ft_snip,
     ]
     return " ".join(str(part) for part in parts if part).lower()
 
@@ -880,9 +951,9 @@ def _support_for_claim(claim: Dict[str, Any], evidence_by_index: Dict[int, Dict[
     for idx in indices:
         ev = evidence_by_index[idx]
         paper = ev["paper"]
-        if paper.get("abstract") or paper.get("fulltext"):
-            has_abstract = True
         p_text = _paper_validation_text(paper)
+        if paper.get("abstract") or paper.get("fulltext") or paper.get("fulltext_cache"):
+            has_abstract = True
         hits = [t for t in c_terms if _term_in_text(t, p_text)]
         if hits:
             matched_indices.append(idx)
@@ -907,9 +978,14 @@ def _support_for_claim(claim: Dict[str, Any], evidence_by_index: Dict[int, Dict[
     }
 
 
-def _validate_writing(markdown: str, selected: List[Dict[str, Any]]) -> Dict[str, Any]:
-    evidence_by_index = {item["index"]: item for item in selected}
-    claims = _claim_sentences(markdown)
+def _validate_writing(
+    markdown: str,
+    selected: List[Dict[str, Any]],
+    all_candidates: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    pool = all_candidates if all_candidates is not None else selected
+    evidence_by_index = {item["index"]: item for item in pool}
+    claims = _claim_sentences(markdown, evidence_by_index)
     claim_results = [_support_for_claim(c, evidence_by_index) for c in claims]
 
     counts: Counter[str] = Counter(r["support_level"] for r in claim_results)
@@ -1139,12 +1215,13 @@ def cmd_validate(args, output_fn: Callable[[Any], None] = _default_output) -> No
         return
     topic = args.topic or _session_project(args) or "当前课题"
     limit = min(args.limit or 12, len(papers))
+    all_candidates = _review_candidates(papers, topic)
     selected, clusters, gaps = _review_write_inputs(papers, topic, limit)
     if args.file:
         markdown = Path(args.file).read_text(encoding="utf-8")
     else:
         markdown = _build_review_draft(topic, selected, clusters, gaps, mode="draft")
-    validation = _validate_writing(markdown, selected)
+    validation = _validate_writing(markdown, selected, all_candidates=all_candidates)
     validation.update({
         "project": _session_project(args),
         "topic": topic,
@@ -1220,8 +1297,12 @@ def _dedupe_library_papers(papers: List[Dict[str, Any]]) -> tuple[List[Dict[str,
 
     for p in papers:
         cid = str(p.get("cnki_id") or "").upper().strip()
-        doi = str(p.get("doi") or "").lower().strip()
-        norm_title = re.sub(r"[^\w\s]", "", re.sub(r"\s+", " ", str(p.get("title") or "").lower().strip()))
+        doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", str(p.get("doi") or "").lower().strip())
+        raw_t = str(p.get("title") or "").lower().strip()
+        if any("\u4e00" <= c <= "\u9fff" for c in raw_t):
+            norm_title = re.sub(r"\W+", "", raw_t)
+        else:
+            norm_title = re.sub(r"[^\w\s]", "", re.sub(r"\s+", " ", raw_t)).strip()
 
         hit_idx = None
         for k in (f"cid:{cid}" if cid else "", f"doi:{doi}" if doi else "", f"title:{norm_title}" if norm_title else ""):

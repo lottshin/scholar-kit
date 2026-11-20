@@ -23,7 +23,11 @@ def cmd_read_paper(args, output_fn: Callable[[Any], None] = _default_output) -> 
 
     suffix = filepath.suffix.lower()
     numbered = bool(getattr(args, "numbered", False))
+    toc_only = bool(getattr(args, "toc", False))
+    section_spec = getattr(args, "section", None)
+    max_chars = getattr(args, "max_chars", None)
     text = ""
+    raw_for_sections = ""
     anchors: List[Dict[str, str]] = []
 
     if suffix == ".docx":
@@ -35,11 +39,21 @@ def cmd_read_paper(args, output_fn: Callable[[Any], None] = _default_output) -> 
         try:
             doc = Document(str(filepath))
             parts: List[str] = []
+            sec_parts: List[str] = []
             for p_idx, p in enumerate(doc.paragraphs, 1):
                 stripped = p.text.strip()
                 if stripped:
                     pid = f"P{p_idx}"
                     parts.append(f"[{pid}] {p.text}" if numbered else p.text)
+                    st_name = str(getattr(p.style, "name", "") or "").lower()
+                    if st_name.startswith("heading 1") or "标题 1" in st_name:
+                        sec_parts.append(f"# {stripped}")
+                    elif st_name.startswith("heading 2") or "标题 2" in st_name:
+                        sec_parts.append(f"## {stripped}")
+                    elif st_name.startswith("heading 3") or "标题 3" in st_name:
+                        sec_parts.append(f"### {stripped}")
+                    else:
+                        sec_parts.append(p.text)
                     if numbered:
                         anchors.append({"id": pid, "text": stripped[:120]})
             for t_idx, table in enumerate(doc.tables, 1):
@@ -49,9 +63,11 @@ def cmd_read_paper(args, output_fn: Callable[[Any], None] = _default_output) -> 
                         tid = f"T{t_idx}R{r_idx}"
                         joined = " | ".join(row_texts)
                         parts.append(f"[{tid}] {joined}" if numbered else joined)
+                        sec_parts.append(joined)
                         if numbered:
                             anchors.append({"id": tid, "text": joined[:120]})
             text = "\n\n".join(parts)
+            raw_for_sections = "\n\n".join(sec_parts)
         except Exception as e:
             output_fn({"status": "error", "code": "DOCX_PARSE_FAILED", "message": f"docx 解析失败: {e}"})
             return
@@ -71,6 +87,12 @@ def cmd_read_paper(args, output_fn: Callable[[Any], None] = _default_output) -> 
         if suffix == ".tex":
             # 过滤纯注释行以提取干净的正文段落结构
             text = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("%"))
+            raw_for_sections = re.sub(
+                r"\\(chapter|section)\*?\{([^}]+)\}", r"# \2",
+                re.sub(r"\\subsection\*?\{([^}]+)\}", r"## \1", text),
+            )
+        else:
+            raw_for_sections = text
         if numbered and text:
             blocks = [b for b in re.split(r"\n\s*\n", text) if b.strip()]
             parts = []
@@ -81,15 +103,56 @@ def cmd_read_paper(args, output_fn: Callable[[Any], None] = _default_output) -> 
             text = "\n\n".join(parts)
 
     elif suffix == ".pdf":
-        output_fn({
-            "status": "error",
-            "code": "UNSUPPORTED_FORMAT",
-            "message": "PDF 文献库导入请用 import <pdf路径或目录>；阅读单篇 PDF 请使用 Agent 内置文件工具",
-        })
-        return
+        pdf_ft = extract_fulltext_from_pdf_file(filepath)
+        if not pdf_ft:
+            output_fn({
+                "status": "error",
+                "code": "PDF_EXTRACT_FAILED",
+                "message": f"无法从 PDF 提取文本（可能是纯扫描件或缺少 pdfplumber/pypdf）: {filepath}",
+            })
+            return
+        text = pdf_ft
+        raw_for_sections = pdf_ft
     else:
         output_fn({"status": "error", "code": "UNSUPPORTED_FORMAT", "message": f"不支持的文件格式: {suffix}"})
         return
+
+    if toc_only or section_spec or max_chars:
+        from sections import parse_fulltext_sections, public_toc, slice_fulltext_sections
+        if toc_only and not section_spec:
+            toc = public_toc(parse_fulltext_sections(raw_for_sections))
+            if args.raw:
+                print("\n".join(
+                    f"[S{s['index']}] {'  ' * (s['level'] - 1)}{s['title']}"
+                    + (f" (第{s['page']}页, {s['chars']}字)" if s.get("page") else f" ({s['chars']}字)")
+                    for s in toc
+                ))
+            else:
+                output_fn({
+                    "status": "success",
+                    "file": str(filepath),
+                    "total_chars": len(raw_for_sections),
+                    "section_count": len(toc),
+                    "toc": toc,
+                })
+            return
+        sliced_res = slice_fulltext_sections(raw_for_sections, section_spec or "", max_chars=max_chars)
+        text = sliced_res["text"] if section_spec else sliced_res["text"]
+        if not args.output and not args.raw:
+            payload_sec: Dict[str, Any] = {
+                "status": "success" if (not section_spec or sliced_res["matched"]) else "warning",
+                "file": str(filepath),
+                "total_chars": len(raw_for_sections),
+                "chars": len(text),
+                "toc": sliced_res["toc"],
+                "matched_sections": sliced_res["matched_sections"],
+                "truncated": sliced_res["truncated"],
+                "text": text,
+            }
+            if sliced_res.get("warning"):
+                payload_sec["warning"] = sliced_res["warning"]
+            output_fn(payload_sec)
+            return
 
     char_count = len(text)
     para_count = len(anchors) if numbered else (text.count("\n\n") + 1 if text else 0)

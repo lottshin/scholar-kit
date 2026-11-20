@@ -105,9 +105,21 @@ def _split_authors_institutions(raw_items: List[str]) -> tuple:
 
 
 def _parse_detail_page(driver) -> Dict[str, Any]:
-    """从已加载的知网详情页 DOM 中提取元数据（标题、摘要、关键词等）。
-    调用者负责导航到详情页并处理验证码，本函数只做解析。
-    """
+    """从已加载的知网详情页 DOM 中提取元数据（临时关闭隐式等待，消除可选字段每项空等 3s）。"""
+    try:
+        driver.implicitly_wait(0)
+    except Exception:
+        pass
+    try:
+        return _parse_detail_page_inner(driver)
+    finally:
+        try:
+            driver.implicitly_wait(3)
+        except Exception:
+            pass
+
+
+def _parse_detail_page_inner(driver) -> Dict[str, Any]:
     from .search import _clean_scraped_cnki_title, _extract_pages_from_gbt7714
     from .selectors import CNKI_SELECTORS
 
@@ -680,21 +692,23 @@ def _extract_html_fulltext(driver) -> Optional[str]:
 
     sections = []
     try:
-        headings = container.find_elements(
-            By.CSS_SELECTOR, "h1, h2, h3, h4, .title, .section-title"
-        )
-        if headings:
-            all_text = container.text.strip()
-            sections.append(all_text)
+        # 克隆正文容器并为 HTML 章节标题补充 Markdown 层级前缀，便于后续 --toc / --section 精确切片
+        md_text = driver.execute_script(r"""
+            var root = arguments[0].cloneNode(true);
+            root.querySelectorAll('h1, h2, h3, h4, .section-title').forEach(function(h) {
+                var tag = (h.tagName || '').toUpperCase();
+                var prefix = tag === 'H1' ? '# ' : (tag === 'H2' ? '## ' : (tag === 'H3' || tag === 'H4' ? '### ' : '## '));
+                var t = (h.textContent || '').trim();
+                if (t && t.indexOf('#') !== 0) {
+                    h.textContent = '\n' + prefix + t + '\n';
+                }
+            });
+            return (root.innerText || root.textContent || '').trim();
+        """, container) or ""
+        if md_text:
+            sections.append(md_text)
         else:
-            paras = container.find_elements(By.CSS_SELECTOR, "p, div.para, div.p")
-            if paras:
-                for p in paras:
-                    t = p.text.strip()
-                    if t:
-                        sections.append(t)
-            else:
-                sections.append(container.text.strip())
+            sections.append(container.text.strip())
     except Exception:
         sections.append(container.text.strip())
 
@@ -891,7 +905,7 @@ def _read_fulltext_flowpdf(driver, detail_url: str) -> Optional[str]:
                 _log("[cnki-flowpdf] 未能提取到任何文本")
                 return None
 
-            parts = [all_pages[p] for p in sorted(all_pages.keys())]
+            parts = [f"[第 {p} 页]\n{all_pages[p]}" for p in sorted(all_pages.keys())]
             combined = "\n\n".join(parts)
             lines = combined.split("\n")
             deduped = []
@@ -924,35 +938,45 @@ def _read_fulltext_flowpdf(driver, detail_url: str) -> Optional[str]:
 
 # ── 本地已下载 PDF 极速提取（免网页滑块） ─────────────────
 
-def _extract_local_pdf_fulltext(title: str, save_dir: Optional[str] = None) -> Optional[str]:
-    """若目标论文已在本地 `./papers/pdf` 下载过 PDF，直接通过 pdfplumber/pypdf 提取带页码正文。"""
-    if not title:
-        return None
-    title_clean = re.sub(r'[\s\-_：:""\'\'【】（）()]+', '', title).lower()
-    if len(title_clean) < 4:
-        return None
-    core = title_clean[:min(len(title_clean), 20)]
-
-    try:
-        from config import get as cfg_get
-        base_dir = Path(save_dir or cfg_get("save_dir", "./papers"))
-    except ImportError:
-        base_dir = Path(save_dir or "./papers")
-
-    search_dirs = [base_dir / "pdf", base_dir]
+def _extract_local_pdf_fulltext(
+    title: str,
+    save_dir: Optional[str] = None,
+    explicit_pdf: Optional[str] = None,
+) -> Optional[str]:
+    """若目标论文已关联本地 PDF（如 Zotero 附件）或在 `./papers/pdf` 下载过，直接提取带页码正文。"""
     matched_pdf: Optional[Path] = None
-    for d in search_dirs:
-        if not d.is_dir():
-            continue
-        for f in d.iterdir():
-            if f.suffix.lower() != ".pdf" or not f.is_file():
+    if explicit_pdf:
+        cand = Path(explicit_pdf)
+        if cand.is_file() and cand.suffix.lower() == ".pdf":
+            matched_pdf = cand
+
+    if matched_pdf is None:
+        if not title:
+            return None
+        title_clean = re.sub(r'[\s\-_：:""\'\'【】（）()]+', '', title).lower()
+        if len(title_clean) < 4:
+            return None
+        core = title_clean[:min(len(title_clean), 20)]
+
+        try:
+            from config import get as cfg_get
+            base_dir = Path(save_dir or cfg_get("save_dir", "./papers"))
+        except ImportError:
+            base_dir = Path(save_dir or "./papers")
+
+        search_dirs = [base_dir / "pdf", base_dir]
+        for d in search_dirs:
+            if not d.is_dir():
                 continue
-            fname_clean = re.sub(r"[\s\-_.]", "", f.stem).lower()
-            if core in fname_clean:
-                matched_pdf = f
+            for f in d.iterdir():
+                if f.suffix.lower() != ".pdf" or not f.is_file():
+                    continue
+                fname_clean = re.sub(r"[\s\-_.]", "", f.stem).lower()
+                if core in fname_clean:
+                    matched_pdf = f
+                    break
+            if matched_pdf:
                 break
-        if matched_pdf:
-            break
 
     if not matched_pdf:
         return None
@@ -1024,7 +1048,7 @@ def batch_read_detail(
                     elif v and not paper.get(k):
                         paper[k] = v
                 continue
-            local_ft = _extract_local_pdf_fulltext(paper.get("title", ""))
+            local_ft = _extract_local_pdf_fulltext(paper.get("title", ""), explicit_pdf=paper.get("local_pdf"))
             if local_ft and paper.get("abstract"):
                 saved = _save_cached_fulltext(url, {
                     "abstract": paper.get("abstract", ""),
@@ -1081,6 +1105,8 @@ def batch_read_detail(
                 for k, v in detail.items():
                     if v and not paper.get(k):
                         paper[k] = v
+                if paper.get("pages"):
+                    paper["is_online_first"] = False
 
                 if fulltext:
                     # 拿到 cnki_id 后再次检查是否命中稳定键缓存或本地 PDF
@@ -1093,7 +1119,7 @@ def batch_read_detail(
                         paper["fulltext_cache"] = cached.get("_cache_file", "")
                         continue
 
-                    ft = _extract_local_pdf_fulltext(paper.get("title", ""))
+                    ft = _extract_local_pdf_fulltext(paper.get("title", ""), explicit_pdf=paper.get("local_pdf"))
                     if not ft:
                         ft = _read_fulltext_html(driver, url)
                     if not ft:
@@ -1168,15 +1194,28 @@ def parse_cnki_citation_item(text: str, href: str = "") -> Optional[Dict[str, An
         return None
 
     year = None
+    volume = ""
     issue = ""
+    pages = ""
     authors = ""
     journal = ""
 
-    y_m = re.search(r"((?:19|20)\d{2})(?:\s*\((\w+)\))?", rest)
+    # 匹配 `2020, 36(10): 65-76+188` / `2020(05): 12-25` / `2023`
+    y_m = re.search(
+        r"((?:19|20)\d{2})"
+        r"(?:\s*[,，]\s*(\d+))?"
+        r"(?:\s*[\(（]\s*([A-Za-z0-9]+)\s*[\)）])?"
+        r"(?:\s*[:：]\s*([A-Za-z0-9]+(?:\s*[-–—]\s*[A-Za-z0-9]+)?(?:\+\d+)?))?",
+        rest,
+    )
     if y_m:
         year = int(y_m.group(1))
         if y_m.group(2):
-            issue = y_m.group(2).lstrip("0") or "0"
+            volume = y_m.group(2).strip()
+        if y_m.group(3):
+            issue = y_m.group(3).lstrip("0") or "0"
+        if y_m.group(4):
+            pages = re.sub(r"\s*[-–—]\s*", "-", y_m.group(4).strip())
         before_year = rest[:y_m.start()].rstrip(" ,，.．:：")
     else:
         before_year = rest.rstrip(" ,，.．:：")
@@ -1190,18 +1229,26 @@ def parse_cnki_citation_item(text: str, href: str = "") -> Optional[Dict[str, An
         else:
             authors = dot_parts[0]
 
+    tag_to_doctype = {"J": "journal", "J/OL": "journal", "D": "thesis", "M": "book", "C": "conference", "N": "newspaper", "R": "report"}
     entry: Dict[str, Any] = {
         "title": title,
         "authors": authors,
         "journal": journal,
         "year": year,
         "doc_tag": doc_tag,
+        "doc_type": tag_to_doctype.get(doc_tag, "journal"),
         "url": href or "",
         "raw": raw,
         "source": "CNKI",
     }
+    if doc_tag in ("D", "M", "R") and journal:
+        entry["publisher"] = journal
+    if volume:
+        entry["volume"] = volume
     if issue:
         entry["issue"] = issue
+    if pages:
+        entry["pages"] = pages
     return entry
 
 

@@ -510,26 +510,39 @@ def search_semantic_scholar(query: str, limit: int = 10, year_from: int = None, 
 
 def resolve_crossref(doi: str) -> dict | None:
     """用 DOI 获取完整元数据（卷期页码等）"""
-    cache_key = _cache_key("crossref", doi)
+    clean_doi = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", (doi or "").strip(), flags=re.I)
+    if not clean_doi:
+        return None
+    cache_key = _cache_key("crossref", clean_doi)
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    data = _http_get(f"https://api.crossref.org/works/{quote(doi, safe='')}")
+    data = _http_get(f"https://api.crossref.org/works/{quote(clean_doi, safe='')}")
     if not data or "message" not in data:
         return None
 
     msg = data["message"]
     authors_raw = msg.get("author", [])
-    authors = ", ".join(
-        f"{a.get('family', '')} {a.get('given', '')}".strip()
-        for a in authors_raw
-    )
+    formatted_authors = []
+    for a in authors_raw:
+        fam = (a.get("family") or "").strip()
+        giv = (a.get("given") or "").strip()
+        if any("\u4e00" <= c <= "\u9fff" for c in (fam + giv)):
+            full = f"{fam}{giv}".strip()
+        else:
+            full = f"{giv} {fam}".strip()
+        if full:
+            formatted_authors.append(full)
+    authors = "; ".join(formatted_authors)
 
     published = msg.get("published-print") or msg.get("published-online") or {}
     parts = published.get("date-parts") or [[None]]
     date_parts = parts[0] if parts else [None]
     year = date_parts[0] if date_parts else None
+    raw_abs = msg.get("abstract") or ""
+    clean_abs = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", raw_abs)).strip()
+    clean_abs = re.sub(r"^abstract\s*[:.]?\s*", "", clean_abs, flags=re.I)
 
     result = {
         "title": (msg.get("title") or [""])[0],
@@ -539,11 +552,11 @@ def resolve_crossref(doi: str) -> dict | None:
         "volume": msg.get("volume", ""),
         "issue": msg.get("issue", ""),
         "pages": msg.get("page", ""),
-        "doi": msg.get("DOI", ""),
+        "doi": msg.get("DOI", "") or clean_doi,
         "issn": (msg.get("ISSN") or [""])[0],
         "publisher": msg.get("publisher", ""),
         "type": msg.get("type", ""),
-        "abstract": msg.get("abstract", ""),
+        "abstract": clean_abs,
         "source": "Crossref",
     }
 
@@ -555,14 +568,17 @@ def resolve_crossref(doi: str) -> dict | None:
 
 def resolve_unpaywall(doi: str, email: str = None) -> dict | None:
     """查找论文的开放获取 PDF 链接"""
+    clean_doi = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", (doi or "").strip(), flags=re.I)
+    if not clean_doi:
+        return None
     if email is None:
         email = _get_mailto()
-    cache_key = _cache_key("unpaywall", doi)
+    cache_key = _cache_key("unpaywall", clean_doi)
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    data = _http_get(f"https://api.unpaywall.org/v2/{quote(doi, safe='')}", params={"email": email})
+    data = _http_get(f"https://api.unpaywall.org/v2/{quote(clean_doi, safe='')}", params={"email": email})
     if not data:
         return None
 
@@ -573,7 +589,7 @@ def resolve_unpaywall(doi: str, email: str = None) -> dict | None:
         "oa_status": data.get("oa_status", ""),
         "journal": data.get("journal_name", ""),
         "title": data.get("title", ""),
-        "doi": doi,
+        "doi": clean_doi,
         "source": "Unpaywall",
     }
 
@@ -1334,41 +1350,72 @@ def _openalex_to_doi(openalex_url: str) -> Optional[str]:
 
 # ── 结果去重 ──────────────────────────────────────────
 
+def _merge_duplicate_paper(base: dict, extra: dict) -> None:
+    """跨源去重时，把后续重复条目的缺失字段（如页码、卷期、DOI、OA链接、摘要）合并进主条目。"""
+    for k in ("volume", "issue", "pages", "doi", "pmid", "pmcid", "cnki_id", "oa_url", "journal"):
+        if extra.get(k) and not base.get(k):
+            base[k] = extra[k]
+    if extra.get("is_oa") and not base.get("is_oa"):
+        base["is_oa"] = True
+    if extra.get("is_core") and not base.get("is_core"):
+        base["is_core"] = True
+        if extra.get("core_type") and not base.get("core_type"):
+            base["core_type"] = extra["core_type"]
+    if len(str(extra.get("abstract") or "")) > len(str(base.get("abstract") or "")):
+        base["abstract"] = extra["abstract"]
+    if extra.get("keywords") and not base.get("keywords"):
+        base["keywords"] = extra["keywords"]
+    try:
+        if int(extra.get("cited_by") or 0) > int(base.get("cited_by") or 0):
+            base["cited_by"] = int(extra["cited_by"])
+    except (TypeError, ValueError):
+        pass
+
+
 def deduplicate_results(results: list[dict]) -> list[dict]:
-    """基于 CNKI 唯一标识、DOI 和标题去重，保留第一个出现的版本。
+    """基于 CNKI 唯一标识、规范化 DOI 和标题去重，并自动融合多源互补字段（如页码、摘要、OA链接）。
 
     优先级：CNKI ID 精确匹配 > DOI 精确匹配 > 标题标准化匹配 > 保留
     """
-    seen_cnki_ids = set()
-    seen_dois = set()
-    seen_titles = set()
-    unique = []
+    idx_by_cnki_id: dict[str, int] = {}
+    idx_by_doi: dict[str, int] = {}
+    idx_by_title: dict[str, int] = {}
+    unique: list[dict] = []
 
     for r in results:
         cnki_id = (r.get("cnki_id") or "").upper().strip()
-        if cnki_id and cnki_id in seen_cnki_ids:
-            continue
-        if cnki_id:
-            seen_cnki_ids.add(cnki_id)
+        raw_doi = (r.get("doi") or "").strip()
+        clean_doi = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", raw_doi, flags=re.I)
+        if clean_doi and raw_doi != clean_doi:
+            r = dict(r, doi=clean_doi)
+        doi_key = clean_doi.lower()
 
-        # DOI 去重（精确匹配）
-        doi = (r.get("doi") or "").lower().strip()
-        if doi and doi in seen_dois:
-            continue
-        if doi:
-            seen_dois.add(doi)
+        raw_t = (r.get("title") or "").lower().strip()
+        if any("\u4e00" <= c <= "\u9fff" for c in raw_t):
+            title_key = re.sub(r"\W+", "", raw_t)
+        else:
+            title_key = re.sub(r"[^\w\s]", "", re.sub(r"\s+", " ", raw_t)).strip()
 
-        # 标题去重（标准化后精确匹配）
-        title = (r.get("title") or "").lower().strip()
-        title = re.sub(r'\s+', ' ', title)
-        title = re.sub(r'[^\w\s]', '', title)
+        hit_idx = None
+        if cnki_id and cnki_id in idx_by_cnki_id:
+            hit_idx = idx_by_cnki_id[cnki_id]
+        elif doi_key and doi_key in idx_by_doi:
+            hit_idx = idx_by_doi[doi_key]
+        elif title_key and title_key in idx_by_title:
+            hit_idx = idx_by_title[title_key]
 
-        if title and title in seen_titles:
-            continue
-        if title:
-            seen_titles.add(title)
-
-        unique.append(r)
+        if hit_idx is not None:
+            _merge_duplicate_paper(unique[hit_idx], r)
+        else:
+            new_idx = len(unique)
+            item_copy = dict(r)
+            unique.append(item_copy)
+            if cnki_id:
+                idx_by_cnki_id[cnki_id] = new_idx
+            if doi_key:
+                idx_by_doi[doi_key] = new_idx
+            if title_key:
+                idx_by_title[title_key] = new_idx
 
     return unique
 

@@ -180,14 +180,20 @@ def build_cnki_expression(
         code = resolve_cnki_field_code(field)
         val, _ = _clean_cnki_value(keyword)
         if val:
-            if code in ("AU", "FI", "RP", "DOI"):
-                clauses.append(f"{code}='{val}'")
-            elif code in ("AF", "FU"):
-                clauses.append(f"{code} % '{val}'")
-            elif fuzzy:
-                clauses.append(f"{code} % '{val}'")
-            else:
-                clauses.append(f"{code}='{val}'")
+            # 中文多关键词以空格分隔时（如 "新质生产力 高质量发展"），在主题/篇关摘/关键词/摘要/全文中拆分为 AND 组合，避免专业检索按字面带空格短语 0 命中
+            has_cjk_kw = any("\u4e00" <= ch <= "\u9fff" for ch in val)
+            terms = (
+                [t for t in re.split(r"[\s\u3000]+", val) if t]
+                if (has_cjk_kw and code in ("SU", "TKA", "KY", "AB", "FT") and re.search(r"[\s\u3000]", val))
+                else [val]
+            )
+            for term in terms:
+                if code in ("AU", "FI", "RP", "DOI"):
+                    clauses.append(f"{code}='{term}'")
+                elif code in ("AF", "FU") or fuzzy:
+                    clauses.append(f"{code} % '{term}'")
+                else:
+                    clauses.append(f"{code}='{term}'")
 
     if author and author.strip():
         val, _ = _clean_cnki_value(author)
@@ -244,7 +250,14 @@ def _build_structured_conditions(
         val, _ = _clean_cnki_value(keyword)
         if val:
             is_f = True if code in ("AF", "FU") else (False if code in ("AU", "FI", "RP", "DOI") else bool(fuzzy))
-            conds.append((code, val, is_f))
+            has_cjk_kw = any("\u4e00" <= ch <= "\u9fff" for ch in val)
+            terms = (
+                [t for t in re.split(r"[\s\u3000]+", val) if t]
+                if (has_cjk_kw and code in ("SU", "TKA", "KY", "AB", "FT") and re.search(r"[\s\u3000]", val))
+                else [val]
+            )
+            for term in terms:
+                conds.append((code, term, is_f))
     if author and author.strip():
         val, _ = _clean_cnki_value(author)
         if val:
@@ -301,11 +314,17 @@ def _capture_results_signature(driver) -> Tuple[Any, str]:
     """捕获当前结果表元素与状态指纹（页码标记 + 首行链接/标题），用于检测 AJAX 实际完成刷新。"""
     table_el = None
     try:
+        driver.implicitly_wait(0)
         tables = driver.find_elements(By.CSS_SELECTOR, "table.result-table-list, .result-table-list, #gridTable")
         if tables:
             table_el = tables[0]
     except Exception:
         pass
+    finally:
+        try:
+            driver.implicitly_wait(3)
+        except Exception:
+            pass
 
     sig = ""
     try:
@@ -626,18 +645,28 @@ def _click_adv_submit_button(driver) -> bool:
         (By.XPATH, "//input[@type='button' and contains(@value,'检索')]"),
         (By.XPATH, "//button[contains(text(),'检索')]"),
     ]
-    for by, selector in btn_selectors:
+    try:
+        driver.implicitly_wait(0)
+    except Exception:
+        pass
+    try:
+        for by, selector in btn_selectors:
+            try:
+                btns = driver.find_elements(by, selector)
+                for btn in btns:
+                    if btn.is_displayed() and btn.is_enabled():
+                        try:
+                            btn.click()
+                        except ElementClickInterceptedException:
+                            driver.execute_script("arguments[0].click();", btn)
+                        return True
+            except Exception:
+                continue
+    finally:
         try:
-            btns = driver.find_elements(by, selector)
-            for btn in btns:
-                if btn.is_displayed() and btn.is_enabled():
-                    try:
-                        btn.click()
-                    except ElementClickInterceptedException:
-                        driver.execute_script("arguments[0].click();", btn)
-                    return True
+            driver.implicitly_wait(3)
         except Exception:
-            continue
+            pass
     return False
 
 
@@ -1326,6 +1355,27 @@ def search_cnki(
         time.sleep(max(1, REQUEST_INTERVAL - 1))
         driver = _handle_captcha(driver)
         _wait_for_results_refresh(driver, prev_snapshot=None, timeout=15.0)
+
+        # 若知网已明确返回 0 条记录，立即短路返回，避免在无结果空页面上反复等待侧边栏与结果表超时（节省 60s+）
+        is_empty_page = False
+        try:
+            is_empty_page = bool(driver.execute_script(r"""
+                var rows = document.querySelectorAll('table.result-table-list tbody tr, .result-table-list tbody tr, #gridTable tbody tr');
+                if (rows && rows.length > 0) return false;
+                var empty = document.querySelector('.no-result, .empty-box, p.no-content');
+                if (empty && empty.offsetParent !== null) return true;
+                var txt = (document.body && document.body.innerText) || '';
+                return txt.indexOf('抱歉，暂无数据') >= 0 || txt.indexOf('未检索到相关记录') >= 0;
+            """))
+        except Exception:
+            is_empty_page = False
+
+        if is_empty_page:
+            _log("[cnki] 知网返回 0 条记录，快速结束检索")
+            if _keep_driver:
+                should_quit = False
+                return [], driver
+            return []
 
         if doc_type and not doctype_done:
             if _switch_to_doc_type(driver, doc_type):
@@ -2111,10 +2161,10 @@ def _extract_pages_from_gbt7714(ref: str) -> str:
     if not ref:
         return ""
     patterns = (
-        r"[,，]\s*(\d+(?:[-–—]\d+)?)\s*\[(?:19|20)\d{2}",
-        r"\)\s*[:：]\s*(\d+(?:[-–—]\d+)?)",
-        r"(?:19|20)\d{2}[^.。]*[:：]\s*(\d+(?:[-–—]\d+)?)",
-        r"[,，]\s*(\d+[-–—]\d+)(?=\.|。|$)",
+        r"[,，]\s*(\d+(?:[-–—]\d+)?(?:\+\d+)?)\s*\[(?:19|20)\d{2}",
+        r"\)\s*[:：]\s*(\d+(?:[-–—]\d+)?(?:\+\d+)?)",
+        r"(?:19|20)\d{2}[^.。]*[:：]\s*(\d+(?:[-–—]\d+)?(?:\+\d+)?)",
+        r"[,，]\s*(\d+[-–—]\d+(?:\+\d+)?)(?=\.|。|$)",
     )
     for pattern in patterns:
         matches = re.findall(pattern, ref)
@@ -2126,27 +2176,150 @@ def _extract_pages_from_gbt7714(ref: str) -> str:
 # ── 结果解析 ────────────────────────────────────────────────────────────
 
 def _parse_search_results(driver, cite_enrich: int = 0) -> list[dict]:
-    results = []
-    rows = []
-    for selector in CNKI_SELECTORS["results"]["rows"]:
-        rows = driver.find_elements(By.CSS_SELECTOR, selector)
-        if rows:
-            break
+    """单次 JS 批量提取整页 20~50 条结果（避免逐行 find_elements 触发 3s 隐式等待导致每页耗时 60s+）。"""
+    results: list[dict] = []
+    try:
+        driver.implicitly_wait(0)
+    except Exception:
+        pass
+    try:
+        raw_rows = driver.execute_script(r"""
+            var selectors = [
+                'table.result-table-list tbody tr',
+                '.result-table-list tbody tr',
+                '#gridTable tbody tr'
+            ];
+            var trs = [];
+            for (var s = 0; s < selectors.length; s++) {
+                var found = document.querySelectorAll(selectors[s]);
+                if (found && found.length > 0) { trs = found; break; }
+            }
+            var out = [];
+            for (var i = 0; i < trs.length; i++) {
+                var tr = trs[i];
+                var a = tr.querySelector('td.name a, .fz14');
+                if (!a) continue;
+                var aClone = a.cloneNode(true);
+                aClone.querySelectorAll('.marktip, .online-mark, span[class*="icon"], i, sup').forEach(function(n){ n.remove(); });
+                var title = (aClone.textContent || '').trim();
+                var url = a.href || a.getAttribute('href') || '';
+                var auEl = tr.querySelector('td.author, .author');
+                var srcEl = tr.querySelector('td.source, .source');
+                var dtEl = tr.querySelector('td.date, .date');
+                var dataEl = tr.querySelector('td.data, .data');
+                var qtEl = tr.querySelector('td.quote, .quote, td.count');
+                var dlEl = tr.querySelector('td.download, .download');
 
-    for idx, row in enumerate(rows):
-        try:
-            result = _parse_single_row(row)
-            if result and result.get("title"):
-                if idx < cite_enrich:
+                var onlineFirst = false;
+                tr.querySelectorAll('td.name .marktip, td.name span').forEach(function(m){
+                    if ((m.textContent || '').indexOf('网络首发') >= 0) onlineFirst = true;
+                });
+
+                var cores = [];
+                tr.querySelectorAll('span[class*="icon"], em[class*="icon"], i[class*="icon"], .badge, .tag').forEach(function(b){
+                    var cls = (b.getAttribute('class') || '').toLowerCase();
+                    var txt = (b.textContent || '').trim();
+                    if (cls.indexOf('cssci') >= 0 || txt === 'CSSCI' || txt.indexOf('南大核心') >= 0) cores.push('CSSCI');
+                    else if (cls.indexOf('pku') >= 0 || txt.indexOf('北大核心') >= 0 || txt === '核心') cores.push('北大核心');
+                    else if (cls.indexOf('cscd') >= 0 || txt === 'CSCD') cores.push('CSCD');
+                    else if (cls.indexOf('sci') >= 0 || txt === 'SCI') cores.push('SCI');
+                    else if (cls.indexOf('ei') >= 0 || txt === 'EI') cores.push('EI');
+                    else if (txt.indexOf('科技核心') >= 0 || txt.indexOf('统计源') >= 0) cores.push('科技核心');
+                });
+
+                out.push({
+                    rowIndex: i,
+                    title: title,
+                    url: url,
+                    authors: auEl ? (auEl.innerText || auEl.textContent || '').trim() : '',
+                    journal: srcEl ? (srcEl.innerText || srcEl.textContent || '').trim() : '',
+                    date: dtEl ? (dtEl.innerText || dtEl.textContent || '').trim() : '',
+                    data_txt: dataEl ? (dataEl.innerText || dataEl.textContent || '').trim() : '',
+                    cite_txt: qtEl ? (qtEl.innerText || qtEl.textContent || '').trim() : '',
+                    dl_txt: dlEl ? (dlEl.innerText || dlEl.textContent || '').trim() : '',
+                    online_first: onlineFirst,
+                    cores: cores
+                });
+            }
+            return out;
+        """)
+
+        if isinstance(raw_rows, list) and raw_rows:
+            dom_rows = None
+            if cite_enrich > 0:
+                for selector in CNKI_SELECTORS["results"]["rows"]:
+                    dom_rows = driver.find_elements(By.CSS_SELECTOR, selector)
+                    if dom_rows:
+                        break
+
+            for idx, item in enumerate(raw_rows):
+                clean_t = _clean_scraped_cnki_title(item.get("title") or "")
+                if not clean_t:
+                    continue
+                date_str = item.get("date") or ""
+                data_txt = item.get("data_txt") or ""
+                cite_digits = re.sub(r"[^\d]", "", item.get("cite_txt") or "")
+                dl_digits = re.sub(r"[^\d]", "", item.get("dl_txt") or "")
+                cores = sorted(set(item.get("cores") or []))
+                entry: Dict[str, Any] = {
+                    "title": clean_t,
+                    "authors": item.get("authors") or "",
+                    "journal": item.get("journal") or "",
+                    "date": date_str,
+                    "cited_by": int(cite_digits) if cite_digits else 0,
+                    "downloads": int(dl_digits) if dl_digits else 0,
+                    "url": item.get("url") or "",
+                    "is_core": bool(cores),
+                    "core_type": ";".join(cores),
+                    "source": "CNKI",
+                }
+                ym = re.search(r"(?:19|20)\d{2}", date_str)
+                if ym:
+                    entry["year"] = int(ym.group(0))
+                # 注意：知网曾网络首发但现已正式排期见刊的论文，td.date 仍保留 HH:MM 时间戳，但 td.data 已变为「期刊」且无网络首发角标！
+                # 仅当存在明确「网络首发」标记，或无 td.data 字段且含时间戳时才标为 is_online_first，避免已见刊论文被跳过补全页码。
+                if item.get("online_first") or "网络首发" in date_str or "网络首发" in data_txt or (
+                    not data_txt and re.search(r"\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}", date_str)
+                ):
+                    entry["is_online_first"] = True
+                for cn_label, dtype in _ROW_DATA_DOCTYPE_MAP.items():
+                    if cn_label in data_txt:
+                        entry["doc_type"] = dtype
+                        break
+
+                if idx < cite_enrich and dom_rows and item.get("rowIndex", idx) < len(dom_rows):
                     try:
-                        _enrich_row_from_quote_popup(driver, row, result)
+                        _enrich_row_from_quote_popup(driver, dom_rows[item.get("rowIndex", idx)], entry)
                     except Exception as e:
                         _log(f"[cnki] 引用补全跳过: {e}")
-                results.append(result)
-        except Exception as e:
-            _log(f"[cnki] 单行解析失败: {e}")
-            continue
-    return results
+                results.append(entry)
+            return results
+
+        # 回退路径（兼容单元测试 mock driver）
+        rows = []
+        for selector in CNKI_SELECTORS["results"]["rows"]:
+            rows = driver.find_elements(By.CSS_SELECTOR, selector)
+            if rows:
+                break
+        for idx, row in enumerate(rows):
+            try:
+                result = _parse_single_row(row)
+                if result and result.get("title"):
+                    if idx < cite_enrich:
+                        try:
+                            _enrich_row_from_quote_popup(driver, row, result)
+                        except Exception as e:
+                            _log(f"[cnki] 引用补全跳过: {e}")
+                    results.append(result)
+            except Exception as e:
+                _log(f"[cnki] 单行解析失败: {e}")
+                continue
+        return results
+    finally:
+        try:
+            driver.implicitly_wait(3)
+        except Exception:
+            pass
 
 
 def _enrich_row_from_quote_popup(driver, row, result: Dict[str, Any]) -> None:

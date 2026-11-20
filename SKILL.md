@@ -13,7 +13,7 @@ description: >-
   知网/CNKI/PubMed, 批量导出/计量分析, or 导出BibTeX/RIS.
   DO NOT USE for general web search, non-academic content, or code documentation lookup.
 metadata:
-  version: 1.18.0
+  version: 1.19.0
   compatibility:
     platform: any
     python: ">=3.9"
@@ -90,11 +90,11 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
 |------|------|----------|
 | `search [词]` | 单次/专业检索 | `--source` (cnki/openalex/semantic/arxiv/pubmed/nssd/dblp/base/all) `--expr`（知网专业检索布尔式） `--field` (主题/篇关摘/篇名/关键词/摘要/全文/...) `--author` `--first-author` `--affiliation` `--journal` `--fund` `--fuzzy` `--core` `--doc-type` `--year-from` `--year-to` `--sort` (relevance/date/citations/downloads/quality) `--pages` `--per-page 50` `--limit` `--bulk-abstract` `--cite-enrich N` `--enrich N` `--author-filter` `--journal-filter` `--field-of-study` `--page` `--enable-fallback` `--async-search` `--download` `--download-fallback-format caj` `--append` `--project` |
 | `batch-search` | 多词知网检索 | `词1 词2` 或 `--query-file`（中文多词推荐） `--core` `--doc-type` `--field` `--year-from` `--year-to` `--sort` `--pages` `--append` `--project` |
-| `read-detail` | 知网/PDF/Zotero 全文 | `--indices 1,3,9`（优先，已下载本地或 Zotero PDF 时秒级提取免滑块） `--top-n` `--fulltext` `--project` |
+| `read-detail` | 知网/PDF/Zotero 全文与章节切片 | `--indices 1,3,9` `--top-n` `--fulltext` `--toc`（硕博长文先看目录页码字数） `--section "研究设计,实证"`（按章/节精准切片免撑爆上下文） `--max-chars` `--project` |
 | `detail "url"` | 单篇知网详情 | |
 | `auth-cnki` / `close-browser` | 认证预热 / 关闭常驻浏览器 | `auth-cnki --auth-url --institution --wait-seconds --direct-domain`；`close-browser` 释放后台热复用浏览器 |
 | `download` / `batch-download` | 单篇 / 批量下载 | `--from-session` `--top-n` `--dir` `--doi` `--file-format pdf/caj` `--fallback-format caj` `--citation-style` `--project` |
-| `cite` / `export` | 引用 / 导出（自动补齐页码） | `cite --style` (gbt7714/footnote/apa/mla/chicago) `--indices 9,2,5` `--keep-numbers`；`export --format` (bibtex[纯ASCII键]/ris/markdown/json/excel/...) `--indices` `--output` `--raw` `--project` |
+| `cite` / `export` | 引用 / 导出（自动补齐页码） | `cite --style` (`gbt7714`顺序编码 / `gbt7714-author-year`国标著者出版年 / `chinese-econ`经管社科顶刊 / `apa` / `mla` / `chicago` / `footnote`) `--in-text`（生成正文内嵌引文） `--indices 9,2,5` `--keep-numbers`；`export --format` (bibtex[纯ASCII键]/ris/markdown/json/excel/...) `--indices` `--output` `--raw` `--project` |
 | `verify-refs` | 题名纠偏与真伪/页码核验 | `verify-refs [--indices 1,3] [--fix-session] [--project <名>]`（专治"作者对但题名曾改名/回译偏差搜不到"及漏页码） |
 | `zotero [词]` | 本机 Zotero 文献库直连 | `zotero [query] [--collection <集合>] [--list-collections] [--save --append --project <名>]` |
 | `import "path"` | 导入题录或 PDF 库 | 支持 NoteExpress / Refworks / BibTeX 及**本地 PDF 文件或文件夹**，`--append` `--project` |
@@ -103,13 +103,13 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
 | `write` | 生成综述证据骨架 | `--project` `--topic` `--mode outline/draft/section` `--section` `--format markdown/docx` `--with-citations` `--validate` |
 | `validate` | 校验正文证据支撑 | `--project` `--topic` `--file draft.md` |
 | `topics` / `trends` / `citations` | 选题 / 趋势 / 深度引文 | `citations <知网URL/中文题名/DOI> --direction citing/cited/both/coref/cocited --limit 20 [--save both --append --project <名>]` |
-| `read-paper` / `pdf-meta` | 读用户文稿 / PDF 元数据 | `read-paper <docx/txt/md/tex> [--numbered] [--output] [--raw]`；`pdf-meta <file.pdf>` |
+| `read-paper` / `pdf-meta` | 读用户文稿 / PDF 元数据 | `read-paper <docx/txt/md/tex/pdf> [--numbered] [--toc] [--section "第3章,4.2"] [--max-chars] [--output] [--raw]`；`pdf-meta <file.pdf>` |
 | `write-docx` / `patch-docx` | 生成 / 修补 Word | `write-docx <md> [--output]`；`patch-docx <docx> --patch patch.json [--dry-run] [--output]` |
 | `workflows` / `check` / `clean-cache` | 模板 / 自检 / 清缓存 | `check [--fix] [--cnki-dom]`（`--cnki-dom` 巡检知网页面改版契约）；`clean-cache [--all] [--dry-run]` |
 
 ## 交互规范
 
-1. **结果展示**：搜索默认展示前 **10 条**表格（序号、标题、作者、来源/期刊、年份、被引）；`read-detail --fulltext` 过长时先给每篇 200 字核心摘要，按需展开；`cite` / `export` 完整展示不截断。
+1. **结果展示**：搜索默认展示前 **10 条**表格（序号、标题、作者、来源/期刊、年份、被引）；阅读知网硕博学位论文或长文时优先先用 `read-detail --indices ... --toc` 查看章节结构，再用 `--section "研究设计,实证"` 按需切片精读（避免十万字全文淹没上下文）；`cite` / `export` 完整展示不截断。
 2. **搜索与下载联动**：
    - 用户未指明偏好时先追问：**下载文件格式**（`pdf` / `caj`，默认推荐 `pdf`）与**下载清单引用格式**（`gbt7714` / `apa` / `mla` / `chicago`）。
    - 明确"搜并下"用 `search ... --download` 一步完成；需先看列表挑选再用 `search` → `batch-download --from-session`。

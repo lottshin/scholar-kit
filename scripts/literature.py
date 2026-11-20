@@ -1,18 +1,19 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.18.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.19.0)
 
 模块职责分层:
   - literature.py : CLI 参数解析、搜索/下载/引文/核验/导出路由编排
   - config.py     : 全局 (~/.scholar-kit) 与工作区 (./.scholar-kit) 状态及配置加载
   - evidence.py   : 会话/课题库（含筛选/去重/批注）、学科中立聚类、研究空白信号、证据骨架与论断核查
-  - docx_tools.py : .docx/.txt/.md/.tex 论文读取（含段落锚点）、本地 PDF 题录导入、Word 排版与补丁预检
+  - docx_tools.py : .docx/.txt/.md/.tex/.pdf 论文读取（含段落锚点与章节切片）、本地 PDF 题录导入、Word 排版与补丁预检
+  - sections.py   : 学术长文与硕博学位论文目录结构识别及按章节精准切片
   - zotero.py     : 本机 Zotero SQLite / 本地 HTTP 零依赖直连与 PDF 附件映射
   - doctor.py     : 环境自检 (`check`)、PEP 668 隔离虚拟环境引导与缓存清理 (`clean-cache`)
 """
 
 from __future__ import annotations
 
-__version__ = "1.18.0"
+__version__ = "1.19.0"
 
 import argparse
 import hashlib
@@ -82,7 +83,8 @@ from evidence import (  # noqa: E402
     cmd_write as _cmd_write,
     parse_indices_spec,
 )
-from formatter import citation_preview, export_papers, generate_reference_list  # noqa: E402
+from formatter import citation_preview, export_papers, generate_in_text_citations, generate_reference_list  # noqa: E402
+from sections import parse_fulltext_sections, public_toc, slice_fulltext_sections  # noqa: E402
 from search import (  # noqa: E402
     analyze_trends,
     calculate_quality_score,
@@ -102,7 +104,12 @@ from search import (  # noqa: E402
 )
 from zotero import query_local_zotero  # noqa: E402
 
-CITATION_STYLE_CHOICES = ["gbt7714", "gb", "apa", "mla", "chicago", "footnote"]
+CITATION_STYLE_CHOICES = [
+    "gbt7714", "gb",
+    "gbt7714-author-year", "author-year",
+    "chinese-econ", "econ",
+    "apa", "mla", "chicago", "footnote",
+]
 
 
 def _output(data: Any) -> None:
@@ -936,7 +943,7 @@ def cmd_export(args) -> None:
     else:
         papers = all_papers
 
-    bib_formats = {"gbt7714", "gb", "apa", "mla", "chicago", "footnote", "bibtex", "ris"}
+    bib_formats = set(CITATION_STYLE_CHOICES) | {"bibtex", "ris"}
     if args.export_format in bib_formats and not getattr(args, "no_enrich", False):
         _enrich_bibliography_subset(papers, all_papers, project)
 
@@ -995,28 +1002,46 @@ def cmd_cite(args) -> None:
         pick_idx = list(range(len(all_papers)))
 
     selected_papers = [all_papers[i] for i in pick_idx]
-    _enrich_bibliography_subset(selected_papers, all_papers, project)
+    if not getattr(args, "no_enrich", False):
+        _enrich_bibliography_subset(selected_papers, all_papers, project)
 
-    enriched = []
+    from formatter import prepare_author_year_papers
+    enriched = [all_papers[orig_i] for orig_i in pick_idx]
     incomplete_indices: List[int] = []
     keep_numbers = bool(getattr(args, "keep_numbers", False))
-    for out_pos, orig_i in enumerate(pick_idx, 1):
-        p = all_papers[orig_i]
+    style = args.style or "gbt7714"
+    check_list = (
+        prepare_author_year_papers(enriched)
+        if style in ("gbt7714-author-year", "author-year", "chinese-econ", "econ")
+        else [dict(p, _orig_pos=pick_idx[pos] + 1) for pos, p in enumerate(enriched)]
+    )
+    for out_pos, p in enumerate(check_list, 1):
         doc_type = str(p.get("doc_type") or "journal")
+        # 中文经管体例（《经济研究》《管理世界》）中文期刊通常只标期号，不强求页码；其余样式检查缺页码
         if (
             doc_type == "journal"
             and not p.get("pages")
             and not p.get("is_online_first")
+            and not (style in ("chinese-econ", "econ") and p.get("issue") and any("\u4e00" <= c <= "\u9fff" for c in str(p.get("title", ""))))
         ):
-            incomplete_indices.append((orig_i + 1) if keep_numbers else out_pos)
-        enriched.append(p)
+            orig_label = pick_idx[p["_orig_index"] - 1] + 1 if "_orig_index" in p else p.get("_orig_pos", out_pos)
+            incomplete_indices.append(orig_label if keep_numbers else out_pos)
 
-    style = args.style or "gbt7714"
     ref_list = generate_reference_list(enriched, style)
-    if keep_numbers and indices_raw:
+    if keep_numbers and indices_raw and style in ("gbt7714", "gb"):
         ref_list = _apply_original_numbers_to_refs(ref_list, [i + 1 for i in pick_idx])
 
+    want_in_text = bool(getattr(args, "in_text", False)) or style in (
+        "gbt7714-author-year", "author-year", "chinese-econ", "econ", "apa", "mla", "chicago"
+    )
+    in_text_info = generate_in_text_citations(enriched, style) if want_in_text else None
+
     if args.raw:
+        if getattr(args, "in_text", False) and in_text_info:
+            print(f"# 正文合并引用: {in_text_info['combined']}")
+            for it in in_text_info["items"]:
+                print(f"# 句中: {it['narrative']} | 句末: {it['parenthetical']}  <- {it['title'][:36]}")
+            print()
         print(ref_list)
     else:
         out: Dict[str, Any] = {
@@ -1026,6 +1051,8 @@ def cmd_cite(args) -> None:
             "count": len(enriched),
             "references": ref_list,
         }
+        if in_text_info is not None:
+            out["in_text"] = in_text_info
         if indices_raw:
             out["selected_indices"] = [i + 1 for i in pick_idx]
         if incomplete_indices:
@@ -1085,7 +1112,10 @@ def cmd_read_detail(args) -> None:
         _output({"status": "error", "code": "NO_SESSION_DATA", "message": "没有可读取的论文，请先执行 search、batch-search 或 import"})
         return
 
-    do_fulltext = args.fulltext
+    toc_only = bool(getattr(args, "toc", False))
+    section_spec = getattr(args, "section", None)
+    max_chars = getattr(args, "max_chars", None)
+    do_fulltext = bool(args.fulltext or toc_only or section_spec)
     indices_raw = getattr(args, "indices", None)
 
     if indices_raw:
@@ -1158,18 +1188,36 @@ def cmd_read_detail(args) -> None:
         if p.get("fulltext_cache"):
             entry["fulltext_cache"] = p["fulltext_cache"]
 
+        ft_content = ""
         if do_fulltext and p.get("fulltext"):
-            entry["fulltext"] = p["fulltext"]
+            ft_content = p["fulltext"]
         elif do_fulltext and p.get("fulltext_cache"):
             try:
                 cache_path = Path(p["fulltext_cache"])
                 if _is_allowed_fulltext_cache(cache_path):
                     cache_data = json.loads(cache_path.resolve().read_text(encoding="utf-8"))
-                    entry["fulltext"] = cache_data.get("fulltext", "")
-                else:
-                    entry["fulltext"] = ""
+                    ft_content = cache_data.get("fulltext", "")
             except Exception:
-                entry["fulltext"] = ""
+                ft_content = ""
+
+        if do_fulltext and ft_content:
+            parsed_secs = parse_fulltext_sections(ft_content)
+            toc = public_toc(parsed_secs)
+            entry["toc"] = toc
+            if toc_only and not section_spec:
+                entry["toc_only"] = True
+            elif section_spec or max_chars:
+                sliced = slice_fulltext_sections(ft_content, section_spec or "", max_chars=max_chars)
+                entry["matched_sections"] = sliced["matched_sections"]
+                entry["sliced_length"] = sliced["chars"]
+                entry["truncated"] = sliced["truncated"]
+                if sliced.get("warning"):
+                    entry["section_warning"] = sliced["warning"]
+                entry["fulltext"] = sliced["text"]
+            else:
+                entry["fulltext"] = ft_content
+        elif do_fulltext:
+            entry["fulltext"] = ""
         results.append(entry)
 
     _output({"status": "success", "count": len(results), "results": results})
@@ -1768,8 +1816,7 @@ def main() -> None:
     # export
     p_export = sub.add_parser("export", help="导出会话或指定序号文献")
     p_export.add_argument("--format", dest="export_format", required=True,
-                          choices=["bibtex", "ris", "markdown", "json", "excel",
-                                   "gbt7714", "footnote", "apa", "mla", "chicago"])
+                          choices=["bibtex", "ris", "markdown", "json", "excel"] + CITATION_STYLE_CHOICES)
     p_export.add_argument("--indices", help="仅导出指定序号文献（按传入顺序，如 '1,3,7' 或 '1-5'）")
     p_export.add_argument("--no-enrich", action="store_true", help="导出引用格式时不自动访问知网/Crossref 补全缺页码")
     p_export.add_argument("--output", help="输出文件路径")
@@ -1794,10 +1841,13 @@ def main() -> None:
     p_library.set_defaults(func=cmd_library)
 
     # cite & import
-    p_cite = sub.add_parser("cite", help="生成引用格式（支持按正文引用顺序指定 --indices 子集）")
-    p_cite.add_argument("--style", default="gbt7714", choices=CITATION_STYLE_CHOICES)
-    p_cite.add_argument("--indices", help="仅格式化指定序号文献（按传入顺序编码为 [1][2]...，如 '9,2,5'）")
+    p_cite = sub.add_parser("cite", help="生成引用格式（支持顺序编码制、著者-出版年制、经管顶刊体例与文内引文）")
+    p_cite.add_argument("--style", default="gbt7714", choices=CITATION_STYLE_CHOICES,
+                        help="引用样式: gbt7714(顺序编码)/gbt7714-author-year(国标著者-出版年)/chinese-econ(经管社科顶刊)/apa/mla/chicago/footnote")
+    p_cite.add_argument("--indices", help="仅格式化指定序号文献（顺序编码制按传入顺序；著者-出版年制自动按中前英后拼音排序）")
     p_cite.add_argument("--keep-numbers", action="store_true", help="配合 --indices 时保留原文献库序号而非从 [1] 重排")
+    p_cite.add_argument("--in-text", action="store_true", help="同时生成正文内嵌引文格式（句中叙述式与句末括号式）")
+    p_cite.add_argument("--no-enrich", action="store_true", help="跳过自动联网补全缺页码")
     p_cite.add_argument("--raw", action="store_true", help="输出纯文本而非 JSON")
     p_cite.add_argument("--project", help="课题文献库名称")
     p_cite.set_defaults(func=cmd_cite)
@@ -1809,9 +1859,12 @@ def main() -> None:
     p_import.set_defaults(func=cmd_import)
 
     # read-paper & pdf-meta
-    p_paper = sub.add_parser("read-paper", help="读取论文文件（.docx/.txt/.md）并输出 UTF-8 文本")
+    p_paper = sub.add_parser("read-paper", help="读取论文文件（.docx/.tex/.md/.txt/.pdf）并支持段落锚点与按章节切片")
     p_paper.add_argument("filepath", help="论文文件路径")
     p_paper.add_argument("--numbered", action="store_true", help="输出带 [P1] / [T1R1] 段落锚点编号的文本，供 patch-docx 精确定位")
+    p_paper.add_argument("--toc", action="store_true", help="仅提取文档章节目录、页码与各章字数概览")
+    p_paper.add_argument("--section", help="按章节标题关键词或 S序号精准切片读取（逗号分隔，如 '研究设计,实证分析'）")
+    p_paper.add_argument("--max-chars", type=int, help="返回文本最大字符数上限")
     p_paper.add_argument("--output", help="输出到文件")
     p_paper.add_argument("--raw", action="store_true", help="输出纯文本而非 JSON")
     p_paper.set_defaults(func=cmd_read_paper)
@@ -1847,10 +1900,13 @@ def main() -> None:
     p_batch.set_defaults(func=cmd_batch_search)
 
     # read-detail
-    p_read = sub.add_parser("read-detail", help="批量获取论文摘要/全文（需先搜索）")
+    p_read = sub.add_parser("read-detail", help="批量获取论文摘要/全文（支持硕博论文 --toc 目录预览与 --section 章节切片）")
     p_read.add_argument("--top-n", type=int, default=5, help="获取前 N 篇论文的详情（默认 5）")
     p_read.add_argument("--indices", type=str, default=None, help="指定论文序号（从1开始），如 '3' '1,3,9' '2-5'")
-    p_read.add_argument("--fulltext", action="store_true", help="抓取 HTML 全文（默认只抓摘要）")
+    p_read.add_argument("--fulltext", action="store_true", help="抓取全文（指定 --toc 或 --section 时自动启用）")
+    p_read.add_argument("--toc", action="store_true", help="仅返回全文目录结构与各章节页码/字数，不输出庞大全文（适合十万字硕博论文）")
+    p_read.add_argument("--section", type=str, default=None, help="按章节标题关键词、章号或 S序号精准切片精读（如 '研究设计,实证分析' 或 '第3章,4.2'）")
+    p_read.add_argument("--max-chars", type=int, default=None, help="单篇返回正文最大字符数上限")
     p_read.add_argument("--project", help="课题文献库名称")
     p_read.set_defaults(func=cmd_read_detail)
 
