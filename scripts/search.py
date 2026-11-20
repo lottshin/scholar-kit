@@ -279,13 +279,12 @@ def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to:
     if year_to is not None:
         filters.append(f"to_publication_date:{year_to}-12-31")
 
-    # 高级过滤：作者（API 支持）
+    # 高级过滤：作者（新版 OpenAlex 使用 raw_author_name.search，旧版 authorships.author.display_name.search 已 400 废弃）
     if author:
-        filters.append(f"authorships.author.display_name.search:{author}")
+        filters.append(f"raw_author_name.search:{author}")
 
-    # 高级过滤：学科领域（API 支持）
     if field_of_study:
-        filters.append(f"concepts.display_name.search:{field_of_study}")
+        params["per_page"] = min(max(limit * 3, 30), 50)
 
     if filters:
         params["filter"] = ",".join(filters)
@@ -374,12 +373,14 @@ def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to:
         cited_cnt = int(w.get("cited_by_count") or 0)
         is_mainstream = any(pub in host_org.lower() for pub in _MAINSTREAM_PUBLISHERS) or cited_cnt >= 15
         venue_tier = "mainstream" if is_mainstream else ("doaj_oa" if src.get("is_in_doaj") else "general")
+        raw_issns = src.get("issn") or ([] if not src.get("issn_l") else [src.get("issn_l")])
 
         entry = {
             "title": w.get("title", ""),
             "authors": authors,
             "year": w.get("publication_year"),
             "journal": src.get("display_name", ""),
+            "issn": raw_issns,
             "publisher": host_org,
             "venue_tier": venue_tier,
             "volume": volume,
@@ -395,12 +396,26 @@ def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to:
             "keywords": keywords,
             "source": "OpenAlex",
         }
+        try:
+            from venues import annotate_venue_quality
+            annotate_venue_quality(entry)
+        except Exception:
+            pass
         results.append(entry)
 
-    # 高级过滤：期刊（客户端过滤，因为 API 过滤不可靠）
+    # 高级过滤：期刊与学科领域（客户端过滤，新版 OpenAlex concepts.display_name.search 已 400 废弃）
     if journal:
         journal_lower = journal.lower()
         results = [r for r in results if journal_lower in r.get("journal", "").lower()]
+    if field_of_study:
+        fos_lower = field_of_study.lower()
+        fos_matched = [
+            r for r in results
+            if any(fos_lower in str(kw).lower() for kw in (r.get("keywords") or []))
+            or fos_lower in str(r.get("title") or "").lower()
+            or fos_lower in str(r.get("abstract") or "").lower()
+        ]
+        results = fos_matched[:limit] if fos_matched else results[:limit]
 
     _cache_set(cache_key, results, source="openalex")
     return results
@@ -852,7 +867,7 @@ def search_dblp(query: str, limit: int = 10, year_from: int = None, year_to: int
         issue = str(info.get("number") or "").strip()
         pages = str(info.get("pages") or "").strip()
 
-        results.append({
+        dblp_entry = {
             "title": info.get("title", ""),
             "authors": authors,
             "year": year,
@@ -869,7 +884,13 @@ def search_dblp(query: str, limit: int = 10, year_from: int = None, year_to: int
             "oa_url": ee if isinstance(ee, str) else "",
             "source": "DBLP",
             "doc_type": doc_type,  # Conference Paper, Journal Article, etc.
-        })
+        }
+        try:
+            from venues import annotate_venue_quality
+            annotate_venue_quality(dblp_entry)
+        except Exception:
+            pass
+        results.append(dblp_entry)
 
     _cache_set(cache_key, results, source="dblp")
     return results
@@ -1070,11 +1091,13 @@ def search_pubmed(
         )
         oa_url = f"https://europepmc.org/articles/{pmcid}?pdf=render" if (is_oa and pmcid) else ""
 
-        results.append({
+        pm_issns = [x for x in (j_obj.get("issn"), j_obj.get("essn")) if x]
+        pm_entry = {
             "title": (item.get("title") or "").strip().rstrip("."),
             "authors": (item.get("authorString") or "").strip().rstrip("."),
             "year": year_val,
             "journal": journal_title,
+            "issn": pm_issns,
             "volume": volume,
             "issue": issue,
             "pages": pages,
@@ -1088,7 +1111,13 @@ def search_pubmed(
             "is_oa": is_oa,
             "oa_url": oa_url,
             "source": "PubMed",
-        })
+        }
+        try:
+            from venues import annotate_venue_quality
+            annotate_venue_quality(pm_entry)
+        except Exception:
+            pass
+        results.append(pm_entry)
 
     _cache_set(cache_key, results, source="pubmed")
     return results
@@ -1464,7 +1493,9 @@ def calculate_quality_score(paper: dict) -> float:
     downloads = int(paper.get("downloads") or 0)
     keywords = paper.get("keywords") or []
     year = paper.get("year")
-    is_cn_source = source in ("CNKI", "CNKI-export", "NSSD") or bool(paper.get("is_core"))
+    is_cn_source = source in ("CNKI", "CNKI-export", "NSSD") or any(
+        k in str(paper.get("core_type") or "") for k in ("北大", "CSSCI", "CSCD", "AMI", "WJCI")
+    )
 
     recency_bonus = 0.0
     if year:
@@ -1527,8 +1558,16 @@ def calculate_quality_score(paper: dict) -> float:
     elif source == "arXiv":
         score += 3
 
+    v_tags = set(paper.get("venue_tags") or [])
+    if paper.get("is_warning"):
+        score -= 25
+    elif v_tags & {"SCI", "SSCI", "AHCI", "CCF-A", "CCF-B"}:
+        score += 15
+    elif v_tags & {"ESCI", "CCF-C"}:
+        score += 6
+
     score += recency_bonus
-    return round(min(100.0, score), 1)
+    return round(max(0.0, min(100.0, score)), 1)
 
 
 # ── 研究趋势分析 ──────────────────────────────────────

@@ -351,7 +351,8 @@ def test_openalex_title_abstract_default_venue_tier_and_doctor_tag_version(monke
     assert len(captured_params) == 1
     assert "title_and_abstract.search:intangible heritage TikTok" in captured_params[0][1].get("filter", "")
     assert "search" not in captured_params[0][1]
-    assert items[0]["venue_tier"] == "mainstream"
+    assert items[0]["venue_tier"] == "core"
+    assert "SSCI" in items[0]["venue_tags"]
     assert items[0]["publisher"] == "Taylor & Francis"
     assert items[1]["venue_tier"] == "general"
 

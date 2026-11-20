@@ -3,6 +3,7 @@ name: scholar-kit
 description: >-
   Search, download, and manage academic papers from CNKI (知网), OpenAlex,
   Semantic Scholar, arXiv, PubMed (Europe PMC), NSSD, DBLP, BASE, and local Zotero libraries;
+  offline-identifies SCI/SSCI/A&HCI/ESCI, CCF-A/B/C (2026), and CAS Early Warning journals;
   enriches metadata via Crossref and resolves OA links via Unpaywall. Generates citations
   (GB/T 7714, APA, MLA, Chicago, pure-ASCII BibTeX, RIS), verifies & reconciles drifted titles,
   writes literature reviews, suggests inline references, analyzes citation networks, and generates research trend reports.
@@ -10,10 +11,10 @@ description: >-
   引用建议/插入文献, 选题分析/研究选题/研究问题, 格式化参考文献, 参考文献/核验引用/题名核对, 引文追踪/引用网络/共引/同被引,
   研究趋势/热点分析, 文献对比/对比矩阵, 阅读笔记, Zotero/LaTeX/BibTeX,
   学术表达优化/论文改写/提升原创性, 查重/降重/降低重复率/重复率,
-  知网/CNKI/PubMed, 批量导出/计量分析, or 导出BibTeX/RIS.
+  知网/CNKI/PubMed/SCI/SSCI/CCF/预警期刊, 批量导出/计量分析, or 导出BibTeX/RIS.
   DO NOT USE for general web search, non-academic content, or code documentation lookup.
 metadata:
-  version: 1.20.0
+  version: 1.21.0
   compatibility:
     platform: any
     python: ">=3.9"
@@ -74,7 +75,7 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
 |----------|----------------------|--------------------------------------------|
 | 单词/高级搜索 | `search "词"`（支持 `--field 篇关摘`、`--author`、`--first-author`、`--affiliation`、`--journal`、`--fund`、`--fuzzy`） | `search "词" --source openalex`（多源用 `--source all --async-search`） |
 | 复杂同义词/布尔搜索 | **优先**单次专业检索式 `search --expr "TKA=('词1' + '词2') AND ..."`（快且不易弹滑块）；确实独立的多主题再用 `batch-search` | 逐组 `search --source openalex --append` |
-| 核心期刊筛选 | 加 `--core`（先读 [core-journals.md](references/core-journals.md)） | API 源不支持中国核心期刊体系筛选，须如实说明 |
+| 核心期刊与预警筛选 | 加 `--core`（知网支持 `北大核心,CSSCI,CSCD,AMI,EI`；英文源离线支持 `SCI,SSCI,AHCI,ESCI,CCF-A,CCF-B`）及 `--exclude-warning`（读 [core-journals.md](references/core-journals.md)） | API 源支持 `SCI/SSCI/AHCI/CCF` 与中科院预警期刊过滤；不支持中国知网核心体系筛选（须如实说明） |
 | 写文献综述 / 完整学术论文 | 核心优先检索入库 (`--project`) → `library --remove/--keep/--dedupe` 去噪 → `review --auto-detail --cluster --gaps` + 重点篇目 `read-detail` → 按 [workflows.md](references/workflows.md#撰写完整学术论文) 撰写（严禁虚构一手数据） → `validate --file` 核验 → `cite --from-file draft.md --rewrite-output final.md` → `write-docx` | 同左，检索改用 API 源（关注 `venue_tier`）或 `import <PDF目录>` |
 | 选题分析 | `topics --project <课题> --topic <方向>` | 同左 |
 | 论文下载 | 先确认格式后 `search --download` 或 `batch-download` | 仅 `download --doi <DOI>`（开放获取 OA） |
@@ -96,7 +97,7 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
 | `auth-cnki` / `close-browser` | 认证预热 / 关闭常驻浏览器 | `auth-cnki --auth-url --institution --wait-seconds --direct-domain`；`close-browser` 释放后台热复用浏览器 |
 | `download` / `batch-download` | 单篇 / 批量下载 | `--from-session` `--top-n` `--dir` `--doi` `--file-format pdf/caj` `--fallback-format caj` `--citation-style` `--project` |
 | `cite` / `export` | 引用 / 导出（自动补齐页码） | `cite --style` (`gbt7714`顺序编码 / `gbt7714-author-year`国标著者出版年 / `chinese-econ`经管社科顶刊 / `apa` / `mla` / `chicago` / `footnote`) `--from-file <draft.md>` `--rewrite-output <final.md>` `--in-text` `--indices 9,2,5` `--keep-numbers`；`export --format` (bibtex[纯ASCII键]/ris/markdown/json/excel/...) `--indices` `--output` `--raw` `--project` |
-| `verify-refs` | 题名纠偏与真伪/页码核验 | `verify-refs [--indices 1,3] [--fix-session] [--project <名>]`（专治"作者对但题名曾改名/回译偏差搜不到"及漏页码） |
+| `verify-refs` | 题名纠偏与真伪/页码核验 | `verify-refs [--from-file <docx/md>] [--indices 1,3] [--fix-session] [--project <名>]`（支持直接提取文稿末尾参考文献，专治"作者对但题名改名/回译偏差搜不到"及漏页码，输出 `formatted_references`） |
 | `zotero [词]` | 本机 Zotero 文献库直连 | `zotero [query] [--collection <集合>] [--list-collections] [--save --append --project <名>]` |
 | `import "path"` | 导入题录或 PDF 库 | 支持 NoteExpress / Refworks / BibTeX 及**本地 PDF 文件或文件夹**，`--append` `--project` |
 | `projects` / `library` | 课题库整理与批注 | `library --project <名> [--keep 1,3,5-8] [--remove 4,9] [--dedupe] [--indices 1,3 --tag "核心实证" --note "批注"]` |
@@ -105,7 +106,7 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
 | `validate` | 校验正文证据支撑 | `--project` `--topic` `--file draft.md` |
 | `topics` / `trends` / `citations` | 选题 / 趋势 / 深度引文 | `citations <知网URL/中文题名/DOI> --direction citing/cited/both/coref/cocited --limit 20 [--save both --append --project <名>]` |
 | `read-paper` / `pdf-meta` | 读用户文稿 / PDF 元数据 | `read-paper <docx/txt/md/tex/pdf> [--numbered] [--toc] [--section "第3章,4.2"] [--max-chars] [--output] [--raw]`；`pdf-meta <file.pdf>` |
-| `write-docx` / `patch-docx` | 生成 / 修补 Word | `write-docx <md> [--output]`；`patch-docx <docx> --patch patch.json [--dry-run] [--output]` |
+| `write-docx` / `patch-docx` | 生成 / 修补 Word | `write-docx <md> [--output] [--no-superscript]`（自动三线表、正文角标原生上标、摘要楷体、表题居中与页脚页码）；`patch-docx <docx> --patch patch.json [--dry-run] [--output]`（支持 `replace_references` 与 `superscript_citations`） |
 | `workflows` / `check` / `clean-cache` | 模板 / 自检 / 清缓存 | `check [--fix] [--cnki-dom]`（`--cnki-dom` 巡检知网页面改版契约）；`clean-cache [--all] [--dry-run]` |
 
 ## 交互规范

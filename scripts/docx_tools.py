@@ -40,32 +40,38 @@ def cmd_read_paper(args, output_fn: Callable[[Any], None] = _default_output) -> 
             doc = Document(str(filepath))
             parts: List[str] = []
             sec_parts: List[str] = []
-            for p_idx, p in enumerate(doc.paragraphs, 1):
-                stripped = p.text.strip()
-                if stripped:
-                    pid = f"P{p_idx}"
-                    parts.append(f"[{pid}] {p.text}" if numbered else p.text)
-                    st_name = str(getattr(p.style, "name", "") or "").lower()
-                    if st_name.startswith("heading 1") or "标题 1" in st_name:
-                        sec_parts.append(f"# {stripped}")
-                    elif st_name.startswith("heading 2") or "标题 2" in st_name:
-                        sec_parts.append(f"## {stripped}")
-                    elif st_name.startswith("heading 3") or "标题 3" in st_name:
-                        sec_parts.append(f"### {stripped}")
-                    else:
-                        sec_parts.append(p.text)
-                    if numbered:
-                        anchors.append({"id": pid, "text": stripped[:120]})
-            for t_idx, table in enumerate(doc.tables, 1):
-                for r_idx, row in enumerate(table.rows, 1):
-                    row_texts = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-                    if row_texts:
-                        tid = f"T{t_idx}R{r_idx}"
-                        joined = " | ".join(row_texts)
-                        parts.append(f"[{tid}] {joined}" if numbered else joined)
-                        sec_parts.append(joined)
+            para_by_el = {p._element: (p_idx, p) for p_idx, p in enumerate(doc.paragraphs, 1)}
+            tbl_by_el = {tbl._tbl: (t_idx, tbl) for t_idx, tbl in enumerate(doc.tables, 1)}
+
+            for child in doc.element.body.iterchildren():
+                if child in para_by_el:
+                    p_idx, p = para_by_el[child]
+                    stripped = p.text.strip()
+                    if stripped:
+                        pid = f"P{p_idx}"
+                        parts.append(f"[{pid}] {p.text}" if numbered else p.text)
+                        st_name = str(getattr(p.style, "name", "") or "").lower()
+                        if st_name.startswith("heading 1") or "标题 1" in st_name:
+                            sec_parts.append(f"# {stripped}")
+                        elif st_name.startswith("heading 2") or "标题 2" in st_name:
+                            sec_parts.append(f"## {stripped}")
+                        elif st_name.startswith("heading 3") or "标题 3" in st_name:
+                            sec_parts.append(f"### {stripped}")
+                        else:
+                            sec_parts.append(p.text)
                         if numbered:
-                            anchors.append({"id": tid, "text": joined[:120]})
+                            anchors.append({"id": pid, "text": stripped[:120]})
+                elif child in tbl_by_el:
+                    t_idx, table = tbl_by_el[child]
+                    for r_idx, row in enumerate(table.rows, 1):
+                        row_texts = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                        if row_texts:
+                            tid = f"T{t_idx}R{r_idx}"
+                            joined = " | ".join(row_texts)
+                            parts.append(f"[{tid}] {joined}" if numbered else joined)
+                            sec_parts.append(joined)
+                            if numbered:
+                                anchors.append({"id": tid, "text": joined[:120]})
             text = "\n\n".join(parts)
             raw_for_sections = "\n\n".join(sec_parts)
         except Exception as e:
@@ -664,10 +670,109 @@ def _find_run_containing(paragraph, text):
     return runs[-1]._element
 
 
-def _write_docx_from_markdown(md_text: str, output_path: Path) -> Dict[str, Any]:
-    """Markdown 文本 → 学术格式 .docx"""
+_SEQ_CITE_IN_DOCX_RE = re.compile(r"(?<!\^)\[(\d+(?:\s*[,，\-–—]\s*\d+)*)\](?!\()")
+
+
+def _is_seq_cite_bracket(spec: str) -> bool:
+    """判断方括号内是否为顺序编码文献序号（1..500），排除年份如 [2024]。"""
+    tokens = [t.strip() for t in re.split(r"[,，\-–—]", spec) if t.strip()]
+    if not tokens or not all(t.isdigit() for t in tokens):
+        return False
+    vals = [int(t) for t in tokens]
+    return all(1 <= v <= 500 for v in vals)
+
+
+def _promote_bracket_superscript_in_para(paragraph) -> None:
+    """将段落各 run 中的 [1]、[1-3] 顺序编码角标原位拆分为原生上标 run，保留原字体样式。"""
+    from copy import deepcopy
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    for run in list(paragraph.runs):
+        txt = run.text or ""
+        matches = [m for m in _SEQ_CITE_IN_DOCX_RE.finditer(txt) if _is_seq_cite_bracket(m.group(1))]
+        if not matches:
+            continue
+        r_el = run._r
+        base_rpr = r_el.rPr
+        pieces: List[tuple[str, bool]] = []
+        last = 0
+        for m in matches:
+            if m.start() > last:
+                pieces.append((txt[last:m.start()], False))
+            pieces.append((m.group(0), True))
+            last = m.end()
+        if last < len(txt):
+            pieces.append((txt[last:], False))
+
+        # 复用首段作为原 run，后续片段依次插在其后
+        first_txt, first_sup = pieces[0]
+        run.text = first_txt
+        if first_sup:
+            run.font.superscript = True
+        anchor_el = r_el
+        for seg_txt, is_sup in pieces[1:]:
+            new_r = OxmlElement("w:r")
+            if base_rpr is not None:
+                new_rpr = deepcopy(base_rpr)
+            else:
+                new_rpr = OxmlElement("w:rPr")
+            if is_sup:
+                for old_va in new_rpr.findall(qn("w:vertAlign")):
+                    new_rpr.remove(old_va)
+                va = OxmlElement("w:vertAlign")
+                va.set(qn("w:val"), "superscript")
+                new_rpr.append(va)
+            new_r.append(new_rpr)
+            t_el = OxmlElement("w:t")
+            if seg_txt.startswith(" ") or seg_txt.endswith(" "):
+                t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            t_el.text = seg_txt
+            new_r.append(t_el)
+            anchor_el.addnext(new_r)
+            anchor_el = new_r
+
+
+def _add_footer_page_number(section) -> None:
+    """在页面页脚居中插入 Word 动态页码域（PAGE）。"""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Cm, Pt
+
+    footer = section.footer
+    p = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.first_line_indent = Cm(0)
+    run = p.add_run()
+    run.font.name = "Times New Roman"
+    run.font.size = Pt(10.5)
+
+    fld_begin = OxmlElement("w:fldChar")
+    fld_begin.set(qn("w:fldCharType"), "begin")
+    instr = OxmlElement("w:instrText")
+    instr.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    instr.text = " PAGE "
+    fld_sep = OxmlElement("w:fldChar")
+    fld_sep.set(qn("w:fldCharType"), "separate")
+    fld_end = OxmlElement("w:fldChar")
+    fld_end.set(qn("w:fldCharType"), "end")
+    run._r.append(fld_begin)
+    run._r.append(instr)
+    run._r.append(fld_sep)
+    run._r.append(fld_end)
+
+
+def _write_docx_from_markdown(
+    md_text: str,
+    output_path: Path,
+    superscript_citations: bool = True,
+) -> Dict[str, Any]:
+    """Markdown 文本 → 交稿级学术格式 .docx（含标题居中、摘要楷体、表题黑体、原生三线表、正文上标角标与页脚页码）"""
     try:
         from docx import Document
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml import OxmlElement
         from docx.oxml.ns import qn
         from docx.shared import Cm, Pt
     except ImportError:
@@ -683,6 +788,7 @@ def _write_docx_from_markdown(md_text: str, output_path: Path) -> Dict[str, Any]
     section.bottom_margin = Cm(2.54)
     section.left_margin = Cm(3.17)
     section.right_margin = Cm(3.17)
+    _add_footer_page_number(section)
 
     style = doc.styles["Normal"]
     font = style.font
@@ -707,6 +813,7 @@ def _write_docx_from_markdown(md_text: str, output_path: Path) -> Dict[str, Any]
     ref_section_lines: List[str] = []
     in_ref_section = False
     warnings: List[str] = []
+    superscript_count = [0]
 
     for line in lines:
         fn_def = re.match(r"^\[\^(\d+)\]:\s*(.+)$", line)
@@ -725,16 +832,67 @@ def _write_docx_from_markdown(md_text: str, output_path: Path) -> Dict[str, Any]
     ftn_element, max_id = _get_or_create_footnotes_part(doc)
     fn_counter = [max_id]
 
-    def _parse_inline(paragraph, text):
+    def _set_run_east_asia(run, font_cn: Optional[str]) -> None:
+        if not font_cn:
+            return
+        rpr = run._r.get_or_add_rPr()
+        rfonts = rpr.get_or_add_rFonts()
+        rfonts.set(qn("w:eastAsia"), font_cn)
+
+    def _emit_plain_or_sup(paragraph, chunk: str, allow_sup: bool, bold: bool = False, italic: bool = False, font_cn: Optional[str] = None, pt_size: Optional[float] = None):
+        if not chunk:
+            return
+        if not (allow_sup and superscript_citations):
+            r = paragraph.add_run(chunk)
+            if bold:
+                r.bold = True
+            if italic:
+                r.italic = True
+            if pt_size:
+                r.font.size = Pt(pt_size)
+            _set_run_east_asia(r, font_cn)
+            return
+
+        pos = 0
+        for cm in _SEQ_CITE_IN_DOCX_RE.finditer(chunk):
+            if not _is_seq_cite_bracket(cm.group(1)):
+                continue
+            if cm.start() > pos:
+                r_pre = paragraph.add_run(chunk[pos:cm.start()])
+                if bold:
+                    r_pre.bold = True
+                if italic:
+                    r_pre.italic = True
+                if pt_size:
+                    r_pre.font.size = Pt(pt_size)
+                _set_run_east_asia(r_pre, font_cn)
+            r_sup = paragraph.add_run(cm.group(0))
+            r_sup.font.name = "Times New Roman"
+            r_sup.font.superscript = True
+            if pt_size:
+                r_sup.font.size = Pt(pt_size)
+            superscript_count[0] += 1
+            pos = cm.end()
+        if pos < len(chunk):
+            r_tail = paragraph.add_run(chunk[pos:])
+            if bold:
+                r_tail.bold = True
+            if italic:
+                r_tail.italic = True
+            if pt_size:
+                r_tail.font.size = Pt(pt_size)
+            _set_run_east_asia(r_tail, font_cn)
+
+    def _parse_inline(paragraph, text, allow_sup: bool = True, font_cn: Optional[str] = None, pt_size: Optional[float] = None):
         pattern = re.compile(r"(\*\*(.+?)\*\*|\*(.+?)\*|\[\^(\d+)\])")
         last = 0
         for m in pattern.finditer(text):
             if m.start() > last:
-                paragraph.add_run(text[last:m.start()])
+                _emit_plain_or_sup(paragraph, text[last:m.start()], allow_sup=allow_sup, font_cn=font_cn, pt_size=pt_size)
             if m.group(2):
-                paragraph.add_run(m.group(2)).bold = True
+                _emit_plain_or_sup(paragraph, m.group(2), allow_sup=allow_sup, bold=True, font_cn=font_cn, pt_size=pt_size)
             elif m.group(3):
-                paragraph.add_run(m.group(3)).italic = True
+                _emit_plain_or_sup(paragraph, m.group(3), allow_sup=allow_sup, italic=True, font_cn=font_cn, pt_size=pt_size)
             elif m.group(4):
                 fn_id = m.group(4)
                 fn_text_content = footnotes_map.get(fn_id, "")
@@ -744,12 +902,10 @@ def _write_docx_from_markdown(md_text: str, output_path: Path) -> Dict[str, Any]
                 _add_footnote_to_element(ftn_element, fn_counter, r._element, fn_text_content)
             last = m.end()
         if last < len(text):
-            paragraph.add_run(text[last:])
+            _emit_plain_or_sup(paragraph, text[last:], allow_sup=allow_sup, font_cn=font_cn, pt_size=pt_size)
 
     def _set_three_line_table_borders(table):
-        """为 Word 原生表格设置标准中文学术三线表边框（顶底 1.5pt 粗线，表头下 0.75pt 细线，无竖线与内部横线）。"""
-        from docx.oxml import OxmlElement
-
+        """为 Word 原生表格设置标准中文学术三线表边框（顶底 1.5pt 粗线，表头下 0.75pt 细线，跨页重复表头与防拆行）。"""
         tbl_pr = table._tbl.tblPr
         borders = OxmlElement("w:tblBorders")
         for edge, val, sz in (
@@ -768,18 +924,21 @@ def _write_docx_from_markdown(md_text: str, output_path: Path) -> Dict[str, Any]
             borders.append(el)
         tbl_pr.append(borders)
 
-        # 表头首行底边加 0.75pt (sz=6) 分隔细线
-        if len(table.rows) >= 1:
-            for cell in table.rows[0].cells:
-                tc_pr = cell._tc.get_or_add_tcPr()
-                tc_borders = OxmlElement("w:tcBorders")
-                bot = OxmlElement("w:bottom")
-                bot.set(qn("w:val"), "single")
-                bot.set(qn("w:sz"), "6")
-                bot.set(qn("w:space"), "0")
-                bot.set(qn("w:color"), "000000")
-                tc_borders.append(bot)
-                tc_pr.append(tc_borders)
+        for r_idx, row in enumerate(table.rows):
+            tr_pr = row._tr.get_or_add_trPr()
+            tr_pr.append(OxmlElement("w:cantSplit"))
+            if r_idx == 0:
+                tr_pr.append(OxmlElement("w:tblHeader"))
+                for cell in row.cells:
+                    tc_pr = cell._tc.get_or_add_tcPr()
+                    tc_borders = OxmlElement("w:tcBorders")
+                    bot = OxmlElement("w:bottom")
+                    bot.set(qn("w:val"), "single")
+                    bot.set(qn("w:sz"), "6")
+                    bot.set(qn("w:space"), "0")
+                    bot.set(qn("w:color"), "000000")
+                    tc_borders.append(bot)
+                    tc_pr.append(tc_borders)
 
     def _is_md_table_sep(row_cells: List[str]) -> bool:
         return bool(row_cells) and all(re.match(r"^:?-{2,}:?$", c.strip()) for c in row_cells)
@@ -793,6 +952,7 @@ def _write_docx_from_markdown(md_text: str, output_path: Path) -> Dict[str, Any]
         return [c.strip() for c in s.split("|")]
 
     table_count = 0
+    seen_doc_title = False
     idx_ln = 0
     while idx_ln < len(body_lines):
         line = body_lines[idx_ln]
@@ -822,10 +982,9 @@ def _write_docx_from_markdown(md_text: str, output_path: Path) -> Dict[str, Any]
                             cp = cell.paragraphs[0]
                             cp.paragraph_format.first_line_indent = Cm(0)
                             cp.paragraph_format.line_spacing = 1.25
-                            _parse_inline(cp, val_txt)
-                            for run in cp.runs:
-                                run.font.size = Pt(10.5)
-                                if r_i == 0:
+                            _parse_inline(cp, val_txt, allow_sup=(r_i > 0), pt_size=10.5)
+                            if r_i == 0:
+                                for run in cp.runs:
                                     run.bold = True
                     _set_three_line_table_borders(tbl)
                     table_count += 1
@@ -838,8 +997,63 @@ def _write_docx_from_markdown(md_text: str, output_path: Path) -> Dict[str, Any]
             p = doc.add_paragraph()
             p.style = doc.styles[f"Heading {level}"]
             p.paragraph_format.first_line_indent = Cm(0)
-            _parse_inline(p, heading.group(2).strip())
+            if level == 1 and not seen_doc_title:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                p.paragraph_format.space_before = Pt(6)
+                p.paragraph_format.space_after = Pt(12)
+                seen_doc_title = True
+            _parse_inline(p, heading.group(2).strip(), allow_sup=False)
             continue
+
+        # 中文「摘要 / 关键词」独立学术样式：黑体加粗引导词 + 小四号楷体正文（无首行缩进）
+        m_cn_meta = re.match(r"^(?:\*{0,2})(摘\s*要|关\s*键\s*词|关键词)(?:\*{0,2})\s*[：:]\s*(.+)$", stripped_ln)
+        if m_cn_meta:
+            raw_lbl = re.sub(r"\s+", "", m_cn_meta.group(1))
+            body_val = m_cn_meta.group(2).strip()
+            p = doc.add_paragraph()
+            p.paragraph_format.first_line_indent = Cm(0)
+            p.paragraph_format.space_before = Pt(3)
+            p.paragraph_format.space_after = Pt(3)
+            r_lbl = p.add_run(f"{raw_lbl}：")
+            r_lbl.bold = True
+            r_lbl.font.size = Pt(12)
+            _set_run_east_asia(r_lbl, "黑体")
+            _parse_inline(p, body_val, allow_sup=False, font_cn="楷体", pt_size=12)
+            continue
+
+        # 英文「Abstract / Keywords」独立学术样式：Times New Roman 加粗引导词 + 正文（无首行缩进）
+        m_en_meta = re.match(r"^(?:\*{0,2})(Abstract|Keywords|Key\s*words)(?:\*{0,2})\s*[：:]\s*(.+)$", stripped_ln, re.I)
+        if m_en_meta:
+            lbl_en = "Abstract" if m_en_meta.group(1).lower().startswith("abstract") else "Keywords"
+            p = doc.add_paragraph()
+            p.paragraph_format.first_line_indent = Cm(0)
+            p.paragraph_format.space_before = Pt(3)
+            p.paragraph_format.space_after = Pt(3)
+            r_lbl = p.add_run(f"{lbl_en}: ")
+            r_lbl.bold = True
+            r_lbl.font.name = "Times New Roman"
+            r_lbl.font.size = Pt(12)
+            _parse_inline(p, m_en_meta.group(2).strip(), allow_sup=False, pt_size=12)
+            continue
+
+        # 表题 / 图题（如「表1 ...」「图1 ...」「Table 1 ...」）：五号黑体居中，表题开启与下段同页防孤行
+        m_caption = re.match(r"^(?:\*{0,2})((?:表|图|Table|Figure|Fig\.)\s*\d+(?:[\s:：.．、—\-].*)?)(?:\*{0,2})$", stripped_ln, re.I)
+        if m_caption and len(stripped_ln) <= 90:
+            cap_txt = re.sub(r"\*{1,2}", "", m_caption.group(1)).strip()
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.paragraph_format.first_line_indent = Cm(0)
+            p.paragraph_format.space_before = Pt(6)
+            p.paragraph_format.space_after = Pt(3)
+            if re.match(r"^(?:表|Table\b)", cap_txt, re.I):
+                p.paragraph_format.keep_with_next = True
+            r_cap = p.add_run(cap_txt)
+            r_cap.bold = True
+            r_cap.font.name = "Times New Roman"
+            r_cap.font.size = Pt(10.5)
+            _set_run_east_asia(r_cap, "黑体")
+            continue
+
         ul_match = re.match(r"^[-*]\s+(.+)$", line)
         if ul_match:
             try:
@@ -880,6 +1094,7 @@ def _write_docx_from_markdown(md_text: str, output_path: Path) -> Dict[str, Any]
         "message": f"已生成: {output_path}",
         "output": str(output_path),
         "tables": table_count,
+        "superscript_citations": superscript_count[0],
         "footnotes": fn_counter[0] - max_id,
         "references": len(ref_section_lines),
     }
@@ -907,7 +1122,8 @@ def cmd_write_docx(args, output_fn: Callable[[Any], None] = _default_output) -> 
         return
 
     output_path = Path(args.output) if args.output else md_path.with_suffix(".docx")
-    output_fn(_write_docx_from_markdown(md_text, output_path))
+    sup = not bool(getattr(args, "no_superscript", False))
+    output_fn(_write_docx_from_markdown(md_text, output_path, superscript_citations=sup))
 
 
 def _resolve_target_paragraphs(doc, anchor: Any) -> List[Any]:
@@ -975,13 +1191,20 @@ def cmd_patch_docx(args, output_fn: Callable[[Any], None] = _default_output) -> 
     patches = patch_data.get("patches", [])
     footnotes_list = patch_data.get("footnotes", [])
     append_refs = patch_data.get("append_references", [])
+    replace_refs = patch_data.get("replace_references", [])
+    global_sup = bool(patch_data.get("superscript_citations", False))
     dry_run = bool(getattr(args, "dry_run", False))
 
-    if not isinstance(patches, list) or not isinstance(footnotes_list, list) or not isinstance(append_refs, list):
+    if (
+        not isinstance(patches, list)
+        or not isinstance(footnotes_list, list)
+        or not isinstance(append_refs, list)
+        or not isinstance(replace_refs, list)
+    ):
         output_fn({
             "status": "error",
             "code": "PATCH_PARSE_FAILED",
-            "message": "patches / footnotes / append_references 必须是数组",
+            "message": "patches / footnotes / append_references / replace_references 必须是数组",
         })
         return
 
@@ -990,7 +1213,14 @@ def cmd_patch_docx(args, output_fn: Callable[[Any], None] = _default_output) -> 
     )
 
     doc = Document(str(docx_path))
-    stats = {"replaced": 0, "not_found": 0, "ambiguous": 0, "footnotes_added": 0, "references_appended": 0}
+    stats = {
+        "replaced": 0,
+        "not_found": 0,
+        "ambiguous": 0,
+        "footnotes_added": 0,
+        "references_appended": 0,
+        "references_replaced": 0,
+    }
     warnings: List[str] = []
 
     ftn_element, max_id = _get_or_create_footnotes_part(doc)
@@ -1000,6 +1230,7 @@ def cmd_patch_docx(args, output_fn: Callable[[Any], None] = _default_output) -> 
         find_text = patch.get("find", "")
         replace_text = patch.get("replace", "")
         anchor = patch.get("paragraph")
+        want_sup = bool(patch.get("superscript_citations", global_sup))
         if not find_text:
             continue
         candidates = _resolve_target_paragraphs(doc, anchor)
@@ -1012,6 +1243,8 @@ def cmd_patch_docx(args, output_fn: Callable[[Any], None] = _default_output) -> 
         found = False
         for para in matching_paras:
             if _para_replace_text(para, find_text, replace_text):
+                if want_sup and not dry_run:
+                    _promote_bracket_superscript_in_para(para)
                 stats["replaced"] += 1
                 found = True
                 break
@@ -1043,6 +1276,48 @@ def cmd_patch_docx(args, output_fn: Callable[[Any], None] = _default_output) -> 
             warnings.append(
                 f'脚注定位失败: "{after_text[:30]}"' if len(after_text) > 30 else f'脚注定位失败: "{after_text}"'
             )
+
+    if replace_refs:
+        if not dry_run:
+            ref_h_idx = None
+            for idx_p, para in enumerate(doc.paragraphs):
+                st_nm = str(getattr(para.style, "name", "") or "")
+                txt_clean = para.text.strip()
+                if txt_clean in ("参考文献", "References", "Bibliography") and (
+                    st_nm.startswith("Heading") or "标题" in st_nm or any(r.bold for r in para.runs)
+                ):
+                    ref_h_idx = idx_p
+                    break
+            if ref_h_idx is not None:
+                # 删除参考文献标题后直到下一个标题（或文末）之间的旧条目段落
+                to_remove = []
+                for sub_p in doc.paragraphs[ref_h_idx + 1:]:
+                    sub_st = str(getattr(sub_p.style, "name", "") or "")
+                    if sub_st.startswith("Heading") or "标题" in sub_st:
+                        break
+                    to_remove.append(sub_p)
+                for old_p in to_remove:
+                    old_p._element.getparent().remove(old_p._element)
+                insert_anchor = doc.paragraphs[ref_h_idx]._element
+                for ref_text in replace_refs:
+                    new_p = doc.add_paragraph(ref_text)
+                    new_p.paragraph_format.first_line_indent = Cm(-0.74)
+                    new_p.paragraph_format.left_indent = Cm(0.74)
+                    insert_anchor.addnext(new_p._element)
+                    insert_anchor = new_p._element
+            else:
+                doc.add_paragraph()
+                try:
+                    ref_heading = doc.add_paragraph("参考文献")
+                    ref_heading.style = doc.styles["Heading 1"]
+                except KeyError:
+                    ref_heading = doc.add_paragraph("参考文献")
+                    ref_heading.runs[0].bold = True
+                for ref_text in replace_refs:
+                    p = doc.add_paragraph(ref_text)
+                    p.paragraph_format.first_line_indent = Cm(-0.74)
+                    p.paragraph_format.left_indent = Cm(0.74)
+        stats["references_replaced"] = len(replace_refs)
 
     if append_refs:
         if not dry_run:

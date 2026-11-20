@@ -1,19 +1,20 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.20.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.21.0)
 
 模块职责分层:
   - literature.py : CLI 参数解析、搜索/下载/引文/核验/导出路由编排
   - config.py     : 全局 (~/.scholar-kit) 与工作区 (./.scholar-kit) 状态及配置加载
   - evidence.py   : 会话/课题库（含筛选/去重/批注）、学科中立聚类、研究空白信号、证据骨架与论断核查
-  - docx_tools.py : .docx/.txt/.md/.tex/.pdf 论文读取（含段落锚点与章节切片）、本地 PDF 题录导入、Word 排版与补丁预检
+  - docx_tools.py : .docx/.txt/.md/.tex/.pdf 论文读取（含段落锚点与章节切片）、本地 PDF 题录导入、Word 交稿排版与补丁预检
   - sections.py   : 学术长文与硕博学位论文目录结构识别及按章节精准切片
+  - venues.py     : 国际期刊与会议质量离线识别（SCI/SSCI/A&HCI/ESCI、CCF 2026 推荐目录、中科院预警期刊）
   - zotero.py     : 本机 Zotero SQLite / 本地 HTTP 零依赖直连与 PDF 附件映射
   - doctor.py     : 环境自检 (`check`)、PEP 668 隔离虚拟环境引导与缓存清理 (`clean-cache`)
 """
 
 from __future__ import annotations
 
-__version__ = "1.20.0"
+__version__ = "1.21.0"
 
 import argparse
 import hashlib
@@ -280,9 +281,16 @@ def cmd_search(args) -> None:
                 cnki_kw["per_page"] = req_per_page
             if bulk_abs:
                 cnki_kw["bulk_abstract"] = True
+            cnki_core_only = None
+            if args.core:
+                cn_parts = [
+                    c.strip() for c in str(args.core).split(",")
+                    if c.strip() in ("北大核心", "CSSCI", "AMI", "WJCI", "CSCD", "EI")
+                ]
+                cnki_core_only = ",".join(cn_parts) if cn_parts else None
             cnki_ret = search_cnki(
                 keyword=args.query or "",
-                core=args.core,
+                core=cnki_core_only,
                 year_from=args.year_from,
                 year_to=args.year_to,
                 author=args.author,
@@ -317,11 +325,16 @@ def cmd_search(args) -> None:
                 cnki_error = cnki_results[0]
 
     try:
+        from venues import annotate_venue_quality, matches_international_core, parse_international_core_tokens
+        intl_core_tokens = parse_international_core_tokens(args.core)
+        exclude_warning = bool(getattr(args, "exclude_warning", False)) or bool(intl_core_tokens)
+
         has_keyword = bool(args.query and args.query.strip())
         if source != "cnki" and not has_keyword:
             _output({"status": "error", "code": "NO_KEYWORDS", "message": "API 数据源检索须提供搜索关键词 query"})
             return
-        api_limit = args.limit if args.limit is not None else 10
+        base_api_limit = args.limit if args.limit is not None else 10
+        api_limit = min(max(base_api_limit * 3, 40), 50) if (intl_core_tokens or exclude_warning) else base_api_limit
 
         field_param = "default"
         if getattr(args, "field", None):
@@ -432,7 +445,23 @@ def cmd_search(args) -> None:
 
         deduped = deduplicate_results(results)
         for paper in deduped:
+            if not _is_cnki_paper(paper):
+                annotate_venue_quality(paper)
             paper["quality_score"] = calculate_quality_score(paper)
+
+        if intl_core_tokens or exclude_warning:
+            filtered_deduped = []
+            for p in deduped:
+                if _is_cnki_paper(p):
+                    filtered_deduped.append(p)
+                elif intl_core_tokens:
+                    if matches_international_core(p, intl_core_tokens):
+                        filtered_deduped.append(p)
+                elif exclude_warning and p.get("is_warning"):
+                    continue
+                else:
+                    filtered_deduped.append(p)
+            deduped = filtered_deduped
 
         if args.sort == "citations":
             deduped.sort(key=lambda x: x.get("cited_by", 0), reverse=True)
@@ -1072,6 +1101,18 @@ def _rewrite_doc_with_sequential_refs(
     return f"{rewritten_body}\n\n## 参考文献\n\n{ref_list}\n"
 
 
+def _read_any_doc_text(fp: Path) -> str:
+    """读取 .md/.txt/.docx/.tex/.pdf 纯文本内容。"""
+    if fp.suffix.lower() in (".md", ".markdown", ".txt"):
+        return fp.read_text(encoding="utf-8")
+    captured: Dict[str, Any] = {}
+    fake_args = argparse.Namespace(
+        filepath=str(fp), numbered=False, toc=False, section=None, max_chars=None, output=None, raw=False
+    )
+    _cmd_read_paper(fake_args, output_fn=lambda payload: captured.update(payload if isinstance(payload, dict) else {}))
+    return str(captured.get("text") or "")
+
+
 def cmd_cite(args) -> None:
     project = _session_project(args)
     all_papers = _load_session(project)
@@ -1089,11 +1130,7 @@ def cmd_cite(args) -> None:
         if not fp.exists():
             _output({"status": "error", "code": "FILE_NOT_FOUND", "message": f"未找到文稿文件: {from_file}"})
             return
-        if fp.suffix.lower() in (".md", ".markdown", ".txt"):
-            source_doc_text = fp.read_text(encoding="utf-8")
-        else:
-            paper_res = read_paper(str(fp))
-            source_doc_text = str(paper_res.get("text") or "")
+        source_doc_text = _read_any_doc_text(fp)
         pick_idx = _extract_pick_indices_from_doc(source_doc_text, len(all_papers))
         if not pick_idx:
             _output({
@@ -1502,15 +1539,168 @@ def cmd_zotero(args) -> None:
     _output(res)
 
 
+def _parse_single_reference_line(raw_line: str) -> Optional[Dict[str, Any]]:
+    """解析单行 GB/T 7714、中文经管书名号体例或 APA 格式的参考文献文本为结构化字典。"""
+    import re as _re
+    s = raw_line.strip()
+    if not s or len(s) < 10:
+        return None
+    s = _re.sub(r"^(?:\[\d+\]|\(\d+\)|\d+[.、)）])\s*", "", s).strip()
+    if not s:
+        return None
+
+    doi = ""
+    m_doi = _re.search(r"(?:https?://(?:dx\.)?doi\.org/|DOI\s*[:：]\s*)(10\.\d{4,9}/[^\s,，。；]+)", s, _re.I)
+    if m_doi:
+        doi = m_doi.group(1).rstrip(".。;；)")
+        s = (s[:m_doi.start()] + " " + s[m_doi.end():]).strip()
+    s = _re.sub(r"https?://\S+", "", s).strip().rstrip(".。")
+
+    def _clean_authors_field(au_str: str) -> str:
+        au_str = _re.sub(r"[,，;；、\s]*(?:等|et\s+al\.?)\s*$", "", au_str.strip(), flags=_re.I)
+        if any("\u4e00" <= c <= "\u9fff" for c in au_str):
+            parts = [p.strip() for p in _re.split(r"[,，;；、]+", au_str) if p.strip()]
+            return "; ".join(parts)
+        return au_str
+
+    # 1. GB/T 7714 带 [J] / [D] / [M] / [C] / [J/OL] 文献类型标识
+    m_gb = _re.match(r"^([^.。]+?)\s*[.．]\s*(.+?)\s*\[([A-Z]{1,2}(?:/[A-Z]{2})?)\]\s*[.．,，]?\s*(.*)$", s)
+    if m_gb:
+        authors = _clean_authors_field(m_gb.group(1))
+        title = m_gb.group(2).strip()
+        tag = m_gb.group(3).upper()
+        tail = m_gb.group(4).strip()
+        dtype = "thesis" if tag.startswith("D") else ("book" if tag.startswith("M") else ("conference" if tag.startswith("C") else "journal"))
+        year = None
+        ym = _re.search(r"\b((?:19|20)\d{2})\b", tail)
+        if ym:
+            year = int(ym.group(1))
+        vol = ""
+        iss = ""
+        pages = ""
+        m_vip = _re.search(r"(?:19|20)\d{2}\s*(?:[,，]\s*(\d+))?\s*(?:[(（]([0-9A-Za-z]{1,6})[)）])?\s*(?:[:：]\s*([0-9A-Za-z]+(?:[-–—][0-9A-Za-z]+(?:\+\d+)?)?))?", tail)
+        if m_vip:
+            vol = m_vip.group(1) or ""
+            iss = m_vip.group(2) or ""
+            pages = (m_vip.group(3) or "").replace("–", "-").replace("—", "-")
+        venue = _re.split(r"[,，]\s*(?:19|20)\d{2}|[(（](?:19|20)\d{2}", tail, maxsplit=1)[0].strip().rstrip(".。,，")
+        rec: Dict[str, Any] = {
+            "title": title,
+            "authors": authors,
+            "year": year,
+            "doc_type": dtype,
+            "volume": vol,
+            "issue": iss,
+            "pages": pages,
+            "doi": doi,
+            "source": "CNKI" if any("\u4e00" <= c <= "\u9fff" for c in title) else "OpenAlex",
+        }
+        if dtype == "thesis":
+            rec["school"] = venue
+        else:
+            rec["journal"] = venue
+        return rec
+
+    # 2. 中文经管书名号体例：赵涛、张智，2020：《数字经济...》，《管理世界》第10期
+    m_econ = _re.match(
+        r"^([^，,：:]+?)[，,\s]+((?:19|20)\d{2})[a-z]?\s*[：:]\s*[《“\"](.+?)[》”\"][，,\s]*[《]?([^》，,。]+?)[》]?(?:[，,\s]*第?\s*(\d+)\s*期)?",
+        s,
+    )
+    if m_econ:
+        return {
+            "title": m_econ.group(3).strip(),
+            "authors": _clean_authors_field(m_econ.group(1)),
+            "journal": m_econ.group(4).strip(),
+            "year": int(m_econ.group(2)),
+            "issue": m_econ.group(5) or "",
+            "doi": doi,
+            "doc_type": "journal",
+            "source": "CNKI",
+        }
+
+    # 3. APA / 著者(年份) 体例：Author (2021). Title. Journal, 33(2), 402-425
+    m_apa = _re.match(r"^(.+?)\s*[(（]((?:19|20)\d{2})[a-z]?[)）]\s*[.．]\s*(.+?)\s*[.．]\s*(.+)$", s)
+    if m_apa:
+        tail_apa = m_apa.group(4).strip()
+        j_parts = [p.strip() for p in tail_apa.split(",")]
+        j_name = j_parts[0] if j_parts else tail_apa
+        vol_a, iss_a, pg_a = "", "", ""
+        if len(j_parts) >= 2:
+            mv = _re.match(r"^(\d+)(?:\(([^)]+)\))?$", j_parts[1])
+            if mv:
+                vol_a = mv.group(1) or ""
+                iss_a = mv.group(2) or ""
+        if len(j_parts) >= 3 and _re.match(r"^\d+(?:[-–—]\d+)?$", j_parts[2]):
+            pg_a = j_parts[2].replace("–", "-")
+        title_apa = m_apa.group(3).strip()
+        return {
+            "title": title_apa,
+            "authors": _clean_authors_field(m_apa.group(1)),
+            "journal": j_name,
+            "year": int(m_apa.group(2)),
+            "volume": vol_a,
+            "issue": iss_a,
+            "pages": pg_a,
+            "doi": doi,
+            "doc_type": "journal",
+            "source": "CNKI" if any("\u4e00" <= c <= "\u9fff" for c in title_apa) else "OpenAlex",
+        }
+
+    return None
+
+
+def _extract_bibliography_from_doc_text(doc_text: str) -> List[Dict[str, Any]]:
+    """从文稿全文中定位参考文献节（或纯参考文献列表）并逐行解析为待核验条目。"""
+    import re as _re
+    lines = doc_text.splitlines()
+    ref_start = None
+    for idx, ln in enumerate(lines):
+        clean_ln = _re.sub(r"^[#\s*]+|[\s*:：]+$", "", ln.strip())
+        if clean_ln in ("参考文献", "References", "Bibliography") and len(ln.strip()) <= 24:
+            ref_start = idx + 1
+            break
+
+    cand_lines = lines[ref_start:] if ref_start is not None else lines
+    parsed: List[Dict[str, Any]] = []
+    for ln in cand_lines:
+        stripped = ln.strip()
+        if not stripped:
+            continue
+        if ref_start is not None and _re.match(r"^#{1,3}\s+\S+", stripped):
+            break
+        item = _parse_single_reference_line(stripped)
+        if item and item.get("title"):
+            parsed.append(item)
+    return parsed
+
+
 def cmd_verify_refs(args) -> None:
-    """真伪核验与『作者对但题名改名/回译偏差』自动纠偏 + 缺页码补全。"""
+    """真伪核验与『作者对但题名改名/回译偏差』自动纠偏 + 缺页码补全（支持直接传 --from-file <docx/md/txt>）。"""
     from cnki.search import _extract_first_author_clean, _title_similarity
 
     project = _session_project(args)
-    all_papers = _load_session(project)
-    if not all_papers:
-        _output({"status": "error", "code": "NO_SESSION_DATA", "message": "会话中没有待核验文献，请先执行 search 或 import"})
-        return
+    from_file = getattr(args, "from_file", None)
+    fix_session = bool(getattr(args, "fix_session", False))
+
+    if from_file:
+        fp = Path(from_file)
+        if not fp.exists():
+            _output({"status": "error", "code": "FILE_NOT_FOUND", "message": f"未找到文稿文件: {from_file}"})
+            return
+        doc_txt = _read_any_doc_text(fp)
+        all_papers = _extract_bibliography_from_doc_text(doc_txt)
+        if not all_papers:
+            _output({
+                "status": "error",
+                "code": "NO_REFERENCES_FOUND",
+                "message": f"未能在 {from_file} 中识别到可解析的参考文献条目",
+            })
+            return
+    else:
+        all_papers = _load_session(project)
+        if not all_papers:
+            _output({"status": "error", "code": "NO_SESSION_DATA", "message": "会话中没有待核验文献，请先执行 search、import 或传入 --from-file"})
+            return
 
     indices_raw = getattr(args, "indices", None)
     if indices_raw:
@@ -1561,7 +1751,7 @@ def cmd_verify_refs(args) -> None:
                     if changed:
                         p["original_unverified_title"] = title
                         p["title"] = matched_p.get("title", title)
-                    for k in ("url", "journal", "year", "authors", "is_core", "core_type", "cited_by", "downloads"):
+                    for k in ("url", "journal", "year", "authors", "is_core", "core_type", "cited_by", "downloads", "volume", "issue", "pages", "doc_type"):
                         if matched_p.get(k) and (changed or not p.get(k)):
                             p[k] = matched_p[k]
                     p["source"] = p.get("source") or "CNKI"
@@ -1588,12 +1778,31 @@ def cmd_verify_refs(args) -> None:
                     sim_en = _title_similarity(title, cr["title"]) if title else 1.0
                     matched_en = cr
             if matched_en is None and title:
+                import re as _re
                 first_au = _extract_first_author_clean(authors)
-                oa_hits = search_openalex(title, limit=5, author=first_au or None)
-                if not oa_hits and first_au:
-                    # 英文题名若被改写，按作者 + 题名前几个实词回查
-                    core_words = " ".join(w for w in title.split() if len(w) > 3)[:40]
-                    oa_hits = search_openalex(core_words or first_au, limit=10, author=first_au)
+                # 将 GB/T 7714 / APA 缩写形式（如 'Pietrobruno S'、'Feng D W'、'Pietrobruno, S.'）收敛为纯姓氏以匹配 OpenAlex 全名
+                au_query = first_au
+                if au_query and not any("\u4e00" <= ch <= "\u9fff" for ch in au_query):
+                    if "," in au_query:
+                        au_query = au_query.split(",", 1)[0].strip()
+                    else:
+                        au_query = _re.sub(r"\s+(?:[A-Z]\.?\s*)+$", "", au_query).strip()
+                oa_hits = search_openalex(title, limit=5, author=au_query or None)
+                if not oa_hits and au_query:
+                    # 英文题名若被改写，按作者姓氏 + 题名中最具区分度的 2 个长实词回查
+                    sig_words = sorted(
+                        {_re.sub(r"[^A-Za-z0-9]", "", w) for w in title.split() if len(w) > 4},
+                        key=len,
+                        reverse=True,
+                    )[:2]
+                    yr_int = int(year) if str(year or "").isdigit() else None
+                    oa_hits = search_openalex(
+                        " ".join(sig_words) if sig_words else au_query,
+                        limit=15,
+                        author=au_query,
+                        year_from=(yr_int - 1) if yr_int else None,
+                        year_to=(yr_int + 1) if yr_int else None,
+                    )
                 for cand in oa_hits:
                     sc = _title_similarity(title, cand.get("title", ""))
                     if sc > sim_en:
@@ -1601,15 +1810,19 @@ def cmd_verify_refs(args) -> None:
                         matched_en = cand
 
             if matched_en and sim_en >= 0.45:
-                changed = sim_en < 0.90
+                import re as _re
+                got_en_title = str(matched_en.get("title") or "").strip()
+                changed = bool(got_en_title) and (
+                    _re.sub(r"\W+", "", title).lower() != _re.sub(r"\W+", "", got_en_title).lower()
+                )
                 st = "title_reconciled" if changed else "verified"
                 counts[st] += 1
                 if fix_session:
                     if changed:
                         p["original_unverified_title"] = title
                         p["title"] = matched_en.get("title", title)
-                    for k in ("volume", "issue", "pages", "doi", "journal", "year"):
-                        if matched_en.get(k) and not p.get(k):
+                    for k in ("volume", "issue", "pages", "doi", "journal", "year", "authors"):
+                        if matched_en.get(k) and (changed or not p.get(k)):
                             p[k] = matched_en[k]
                     dirty = True
                 report_items.append({
@@ -1638,17 +1851,21 @@ def cmd_verify_refs(args) -> None:
                 item_rep["pages"] = orig_p["pages"]
         dirty = True
 
-    if dirty:
+    if dirty or (from_file and fix_session):
         _save_session(all_papers, project=project)
 
     overall = "warning" if (counts["not_found"] > 0 or counts["title_reconciled"] > 0) else "success"
-    _output({
+    out_payload: Dict[str, Any] = {
         "status": overall,
         "project": project,
-        "fixed_session": fix_session and dirty,
+        "fixed_session": fix_session and (dirty or bool(from_file)),
         "summary": counts,
         "results": report_items,
-    })
+    }
+    if fix_session:
+        subset_for_fmt = [all_papers[i] for i in pick_idx]
+        out_payload["formatted_references"] = generate_reference_list(subset_for_fmt, "gbt7714").splitlines()
+    _output(out_payload)
 
 
 def cmd_close_browser(_args) -> None:
@@ -1866,7 +2083,8 @@ def main() -> None:
     p_search.add_argument("--source", default="cnki",
                           help="数据源: cnki/openalex/semantic/arxiv/pubmed/nssd/dblp/base/all (默认 cnki)")
     p_search.add_argument("--limit", type=int, default=None, help="结果数量限制（默认 20，多页时自动扩展）")
-    p_search.add_argument("--core", help="知网侧边栏来源类别，逗号分隔: 北大核心,CSSCI,AMI,WJCI,CSCD,EI")
+    p_search.add_argument("--core", help="核心/索引筛选（逗号分隔）：知网支持 北大核心,CSSCI,AMI,WJCI,CSCD,EI；英文源支持 SCI,SSCI,AHCI,ESCI,CCF,CCF-A,CCF-B,CCF-C")
+    p_search.add_argument("--exclude-warning", action="store_true", help="自动剔除中科院《国际期刊预警名单》在榜风险期刊")
     p_search.add_argument("--doc-type",
                           choices=["journal", "master", "doctor", "thesis", "conference", "newspaper"],
                           help="文献类型筛选: journal/master/doctor/thesis/conference/newspaper")
@@ -2062,9 +2280,10 @@ def main() -> None:
     p_bdl.set_defaults(func=cmd_batch_download)
 
     # write-docx & patch-docx
-    p_wdocx = sub.add_parser("write-docx", help="Markdown → 学术格式 Word 文档")
+    p_wdocx = sub.add_parser("write-docx", help="Markdown → 学术格式 Word 文档（原生三线表、上标角标、摘要楷体与页脚页码）")
     p_wdocx.add_argument("filepath", help="Markdown 文件路径")
     p_wdocx.add_argument("--output", help="输出 .docx 路径")
+    p_wdocx.add_argument("--no-superscript", action="store_true", help="关闭正文顺序编码 [1] 自动转 Word 原生上标")
     p_wdocx.set_defaults(func=cmd_write_docx)
 
     p_pdocx = sub.add_parser("patch-docx", help="在现有 .docx 上打补丁（支持段落锚点、表格替换与 --dry-run 预检）")
@@ -2104,9 +2323,10 @@ def main() -> None:
     p_zotero.add_argument("--project", help="课题文献库名称")
     p_zotero.set_defaults(func=cmd_zotero)
 
-    p_vrefs = sub.add_parser("verify-refs", help="核验会话文献真伪，自动找回『作者正确但题名改名/回译偏差』的真实题名并补全页码")
+    p_vrefs = sub.add_parser("verify-refs", help="核验会话或文稿参考文献真伪，自动找回『作者正确但题名改名/回译偏差』的真实题名并补全页码")
+    p_vrefs.add_argument("--from-file", help="直接从 .docx/.md/.txt 文稿末尾提取参考文献节逐条核验")
     p_vrefs.add_argument("--indices", help="仅核验指定序号（如 '1,3,5-8'，默认全部）")
-    p_vrefs.add_argument("--fix-session", action="store_true", help="自动将会话中的偏差题名修正为官方真实题名并补齐缺失卷期页码")
+    p_vrefs.add_argument("--fix-session", action="store_true", help="自动将偏差题名修正为官方真实题名、补齐缺失卷期页码并输出 formatted_references")
     p_vrefs.add_argument("--project", help="课题文献库名称")
     p_vrefs.set_defaults(func=cmd_verify_refs)
 

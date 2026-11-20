@@ -1139,36 +1139,42 @@ def reconcile_cnki_paper(
 
         # 第二级：作者锚定 + 题名相似度纠偏（解决工作论文正式发表改名、英文回译词差、大模型记忆微偏）
         if first_au:
+            def _pick_best(rows: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], float]:
+                b_row = None
+                b_sc = 0.0
+                for r_cand in rows:
+                    if not r_cand.get("title"):
+                        continue
+                    sim_v = _title_similarity(clean_title, r_cand["title"]) if clean_title else 0.5
+                    bon = 0.0
+                    if year and r_cand.get("year"):
+                        try:
+                            if abs(int(r_cand["year"]) - int(year)) <= 2:
+                                bon += 0.05
+                        except (TypeError, ValueError):
+                            pass
+                    if clean_j and r_cand.get("journal") and (clean_j in r_cand["journal"] or r_cand["journal"] in clean_j):
+                        bon += 0.05
+                    tot = min(1.0, sim_v + bon)
+                    if tot > b_sc:
+                        b_sc = tot
+                        b_row = r_cand
+                return b_row, b_sc
+
             candidate_rows: List[Dict[str, Any]] = []
             cjk_chunks = re.findall(r"[\u4e00-\u9fff]{2,}", clean_title)
             anchor_term = cjk_chunks[0][:4] if cjk_chunks else ""
 
             if anchor_term and len(anchor_term) >= 2:
                 candidate_rows.extend(_run_expr_once(f"AU='{first_au}' AND TKA % '{anchor_term}'", use_50=False))
-            if not candidate_rows and clean_j:
-                candidate_rows.extend(_run_expr_once(f"AU='{first_au}' AND LY % '{clean_j}'", use_50=False))
-            if not candidate_rows:
-                candidate_rows.extend(_run_expr_once(f"AU='{first_au}'", use_50=True))
+            best_row, best_score = _pick_best(candidate_rows)
 
-            best_row = None
-            best_score = 0.0
-            for row in candidate_rows:
-                if not row.get("title"):
-                    continue
-                sim = _title_similarity(clean_title, row["title"]) if clean_title else 0.5
-                bonus = 0.0
-                if year and row.get("year"):
-                    try:
-                        if abs(int(row["year"]) - int(year)) <= 2:
-                            bonus += 0.05
-                    except (TypeError, ValueError):
-                        pass
-                if clean_j and row.get("journal") and (clean_j in row["journal"] or row["journal"] in clean_j):
-                    bonus += 0.05
-                total_sc = min(1.0, sim + bonus)
-                if total_sc > best_score:
-                    best_score = total_sc
-                    best_row = row
+            if best_score < 0.42 and clean_j:
+                candidate_rows.extend(_run_expr_once(f"AU='{first_au}' AND LY % '{clean_j}'", use_50=False))
+                best_row, best_score = _pick_best(candidate_rows)
+            if best_score < 0.42 and not clean_j:
+                candidate_rows.extend(_run_expr_once(f"AU='{first_au}'", use_50=True))
+                best_row, best_score = _pick_best(candidate_rows)
 
             if best_row and best_score >= 0.42:
                 got_norm = re.sub(r"\W+", "", best_row.get("title", "")).lower()

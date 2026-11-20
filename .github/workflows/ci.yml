@@ -6,16 +6,23 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
+    name: Pytest (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.9", "3.12"]
-
-    runs-on: ${{ matrix.os }}
+        python-version: ["3.12"]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.9"
 
     steps:
       - name: Checkout repository
@@ -25,13 +32,18 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: "pip"
+          cache: pip
           cache-dependency-path: scripts/requirements.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r scripts/requirements.txt pytest pytest-asyncio
+          python -m pip install -r scripts/requirements.txt pytest
 
-      - name: Run unit & workflow regression tests
-        run: python -m pytest -v tests
+      - name: Run unit & integration test suite
+        env:
+          SCHOLAR_SKIP_NETWORK_CHECK: "1"
+        run: |
+          python -m pytest -v tests
+          python scripts/literature.py --help
+          python scripts/literature.py workflows --list

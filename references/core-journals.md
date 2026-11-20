@@ -29,11 +29,17 @@ Agent 将用户自然语言翻译为 `--core` 参数时使用此文档。
    - 人文社科宽口径 → `--core 北大核心,CSSCI,AMI`
    - 全部国内核心 → `--core 北大核心,CSSCI,AMI,CSCD`
 
-4. **EI / WJCI / SCI** → 不属于传统"核心期刊"：
-   - "EI期刊" → `--core EI`
-   - "SCI期刊" → 知网可能无此选项，建议用 Web of Science
+4. **国际核心索引、CCF 目录与预警期刊过滤（英文 API 源原生支持）** →
+   - 知网侧边栏仅支持 `EI` / `WJCI`；当使用 `--source openalex / pubmed / semantic / dblp / all` 检索英文文献时，`--core` 原生支持按内置离线 ISSN/刊名库（30,300+ 条）精准筛选：
+     - 理工医英文核心 → `--core SCI`
+     - 人文社科英文核心 → `--core SSCI,AHCI`
+     - 计算机顶会顶刊 → `--core CCF-A,CCF-B`（或宽口径 `--core CCF`）
+     - 预备库扩展 → `--core SCI,SSCI,ESCI`
+   - **中科院《国际期刊预警名单》防踩雷**：检索结果自动标记在榜风险期刊（`is_warning: true` 及 `cas_warning.label`，如 `中科院预警(2025:论文工厂)`，对 2023 曾列但后续已调出期刊仅标 `cas_warning_history` 不误杀）；指定任意英文 `--core` 或显式加 `--exclude-warning` 时自动剔除在榜预警刊。
 
-5. **用户未提及核心** → 不传 `--core`
+5. **撰写正式学术论文 / 综述 vs 普通泛搜** →
+   - 普通泛搜且用户未提核心要求 → 不传 `--core`（但仍须留意返回条目是否有 `is_warning: true` 预警标记）
+   - 撰写正式学术论文或文献综述 → 中文优先传 `--core 北大核心,CSSCI`（理工医 `北大核心,CSCD`），英文优先传 `--core SCI,SSCI,AHCI` 或 `--core CCF-A,CCF-B`
 
 ## 注意
 
