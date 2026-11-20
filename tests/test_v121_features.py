@@ -253,3 +253,111 @@ def test_verify_refs_from_file_parses_docx_and_reconciles_english_via_raw_author
     assert out["results"][0]["authentic_title"] == "YouTube and the social archiving of intangible heritage"
     assert out["results"][0]["pages"] == "1259-1276"
     assert "YouTube and the social archiving of intangible heritage[J]. New Media & Society, 2013, 15(8): 1259-1276." in out["formatted_references"][0]
+
+
+def test_cite_latex_rewrite_and_bibtex_output(tmp_path, monkeypatch):
+    ws = tmp_path / "tex_ws"
+    proj_dir = ws / ".scholar-kit" / "projects" / "tex_demo"
+    proj_dir.mkdir(parents=True)
+
+    papers = [
+        {
+            "title": "未被引用的无关文献一",
+            "authors": "张三",
+            "journal": "经济研究",
+            "year": 2021,
+            "pages": "1-10",
+            "doc_type": "journal",
+        },
+        {
+            "title": "数字经济、创业活跃度与高质量发展",
+            "authors": "赵涛; 张智; 梁上坤",
+            "journal": "管理世界",
+            "year": 2020,
+            "volume": "36",
+            "issue": "10",
+            "pages": "65-76",
+            "doc_type": "journal",
+        },
+        {
+            "title": "Deep Residual Learning for Image Recognition",
+            "authors": "Kaiming He; Xiangyu Zhang; Shaoqing Ren; Jian Sun",
+            "journal": "CVPR",
+            "year": 2016,
+            "pages": "770-778",
+            "doi": "10.1109/CVPR.2016.90",
+            "doc_type": "conference",
+        },
+    ]
+    (proj_dir / "session.json").write_text(json.dumps(papers, ensure_ascii=False), encoding="utf-8")
+
+    draft_tex = (
+        "\\documentclass[12pt]{article}\n"
+        "% 注释中的序号 [1] 绝不能被提取或改写\n"
+        "\\begin{document}\n"
+        "\\begin{enumerate}\n"
+        "\\item[1] 列表项可选参数不应当作引文；数字经济推动高质量发展[2]，残差网络提升了视觉表征[2, 3]。\n"
+        "\\end{enumerate}\n"
+        "\\bibliographystyle{plain}\n"
+        "\\bibliography{refs}\n"
+        "\\end{document}\n"
+    )
+    draft_p = ws / "draft.tex"
+    final_p = ws / "main.tex"
+    bib_p = ws / "refs.bib"
+    draft_p.write_text(draft_tex, encoding="utf-8")
+
+    monkeypatch.chdir(ws)
+    out = {}
+    monkeypatch.setattr(literature, "_output", out.update)
+    literature.cmd_cite(
+        argparse.Namespace(
+            style="gbt7714",
+            indices=None,
+            from_file=str(draft_p),
+            rewrite_output=str(final_p),
+            bibtex_output=str(bib_p),
+            keep_numbers=False,
+            in_text=False,
+            no_enrich=True,
+            raw=False,
+            project="tex_demo",
+        )
+    )
+
+    assert out["status"] == "success"
+    assert out["selected_indices"] == [2, 3]
+    keys = out["cite_keys"]
+    assert len(keys) == 2
+    assert all(k.isascii() for k in keys)
+
+    rewritten_tex = final_p.read_text(encoding="utf-8")
+    assert "\\documentclass[12pt]{article}" in rewritten_tex
+    assert "% 注释中的序号 [1] 绝不能被提取或改写" in rewritten_tex
+    assert "\\item[1] 列表项可选参数不应当作引文" in rewritten_tex
+    assert f"推动高质量发展\\cite{{{keys[0]}}}" in rewritten_tex
+    assert f"提升了视觉表征\\cite{{{keys[0]}, {keys[1]}}}" in rewritten_tex
+
+    bib_txt = bib_p.read_text(encoding="utf-8")
+    assert f"@article{{{keys[0]}," in bib_txt
+    assert f"@inproceedings{{{keys[1]}," in bib_txt
+    assert "未被引用的无关文献一" not in bib_txt
+
+
+def test_smoke_upstream_probes_and_dblp_bot_gate_graceful_handling(monkeypatch):
+    import smoke_upstream
+
+    monkeypatch.setattr(search_mod, "search_openalex", lambda *a, **k: [{"title": "Deep Learning"}])
+    monkeypatch.setattr(search_mod, "search_pubmed", lambda *a, **k: [{"title": "CRISPR-Cas9"}])
+    monkeypatch.setattr(search_mod, "resolve_crossref", lambda *a, **k: {"title": "Deep learning", "pages": "436-444"})
+    monkeypatch.setattr(search_mod, "search_arxiv", lambda *a, **k: [{"title": "Attention Is All You Need"}])
+
+    rep = smoke_upstream.run_all_probes()
+    assert rep["status"] == "success"
+    assert rep["passed"] == 4
+    assert rep["failed"] == 0
+
+    # 当 DBLP 返回含 "result" 字样的非 JSON HTML 验证页时不得抛出 AttributeError
+    monkeypatch.setattr(search_mod, "_http_get", lambda *a, **k: "<html>Making sure you're not a bot! result</html>")
+    monkeypatch.setattr(search_mod, "_cache_get", lambda *a, **k: None)
+    assert search_mod.search_dblp("ResNet", limit=2) == []

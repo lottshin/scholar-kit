@@ -14,7 +14,7 @@ description: >-
   知网/CNKI/PubMed/SCI/SSCI/CCF/预警期刊, 批量导出/计量分析, or 导出BibTeX/RIS.
   DO NOT USE for general web search, non-academic content, or code documentation lookup.
 metadata:
-  version: 1.21.0
+  version: 1.22.0
   compatibility:
     platform: any
     python: ">=3.9"
@@ -96,7 +96,7 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
 | `detail "url"` | 单篇知网详情 | |
 | `auth-cnki` / `close-browser` | 认证预热 / 关闭常驻浏览器 | `auth-cnki --auth-url --institution --wait-seconds --direct-domain`；`close-browser` 释放后台热复用浏览器 |
 | `download` / `batch-download` | 单篇 / 批量下载 | `--from-session` `--top-n` `--dir` `--doi` `--file-format pdf/caj` `--fallback-format caj` `--citation-style` `--project` |
-| `cite` / `export` | 引用 / 导出（自动补齐页码） | `cite --style` (`gbt7714`顺序编码 / `gbt7714-author-year`国标著者出版年 / `chinese-econ`经管社科顶刊 / `apa` / `mla` / `chicago` / `footnote`) `--from-file <draft.md>` `--rewrite-output <final.md>` `--in-text` `--indices 9,2,5` `--keep-numbers`；`export --format` (bibtex[纯ASCII键]/ris/markdown/json/excel/...) `--indices` `--output` `--raw` `--project` |
+| `cite` / `export` | 引用 / 导出（自动补齐页码） | `cite --style` (`gbt7714`顺序编码 / `gbt7714-author-year`国标著者出版年 / `chinese-econ`经管社科顶刊 / `apa` / `mla` / `chicago` / `footnote`) `--from-file <draft.md/tex>` `--rewrite-output <final.md/tex>` `--bibtex-output <refs.bib>` `--in-text` `--indices 9,2,5` `--keep-numbers`；`export --format` (bibtex[纯ASCII键]/ris/markdown/json/excel/...) `--indices` `--output` `--raw` `--project` |
 | `verify-refs` | 题名纠偏与真伪/页码核验 | `verify-refs [--from-file <docx/md>] [--indices 1,3] [--fix-session] [--project <名>]`（支持直接提取文稿末尾参考文献，专治"作者对但题名改名/回译偏差搜不到"及漏页码，输出 `formatted_references`） |
 | `zotero [词]` | 本机 Zotero 文献库直连 | `zotero [query] [--collection <集合>] [--list-collections] [--save --append --project <名>]` |
 | `import "path"` | 导入题录或 PDF 库 | 支持 NoteExpress / Refworks / BibTeX 及**本地 PDF 文件或文件夹**，`--append` `--project` |

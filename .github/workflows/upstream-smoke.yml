@@ -1,0 +1,81 @@
+name: Upstream API Smoke
+
+on:
+  schedule:
+    # 每周一 09:17 (UTC+8) 自动巡检外部学术 API 契约是否变动
+    - cron: "17 1 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  smoke:
+    name: Live Academic API Contract Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r scripts/requirements.txt
+
+      - name: Run live upstream contract probes
+        id: probe
+        run: |
+          python scripts/smoke_upstream.py | tee smoke_report.json
+
+      - name: Open or update alert issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let report = 'No JSON report generated.';
+            if (fs.existsSync('smoke_report.json')) {
+              report = fs.readFileSync('smoke_report.json', 'utf8');
+            }
+            const title = '[Upstream Alert] 外部学术 API 契约巡检异常';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              '每周定时线上契约巡检检测到上游学术接口返回异常（可能是过滤参数废弃、限流策略变更或字段改名）：',
+              '',
+              `- Workflow Run: ${runUrl}`,
+              '',
+              '```json',
+              report,
+              '```'
+            ].join('\n');
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 30
+            });
+            const found = existing.data.find(i => i.title === title);
+            if (found) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: found.number,
+                body
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body
+              });
+            }

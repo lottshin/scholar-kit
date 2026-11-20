@@ -1,8 +1,21 @@
 # Scholar Kit
 
+[![CI](https://github.com/lottshin/scholar-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/lottshin/scholar-kit/actions/workflows/ci.yml)
+[![Upstream API Smoke](https://github.com/lottshin/scholar-kit/actions/workflows/upstream-smoke.yml/badge.svg)](https://github.com/lottshin/scholar-kit/actions/workflows/upstream-smoke.yml)
+[![Release](https://img.shields.io/github/v/release/lottshin/scholar-kit)](https://github.com/lottshin/scholar-kit/releases)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 面向科研全流程的学术文献检索与写作辅助 AI Skill。覆盖 **中英文检索 → 全文下载与本地库联动 → 引文追踪与文献综述 → 参考文献核验与排版 → 学术表达润色与文稿回填**，由确定性 Python 脚本负责检索、解析、核验与排版，Agent 负责学术理解与写作。
 
 兼容 **Claude Code**、**Codex**、**Cursor**、**Antigravity**、**Gemini CLI** 等支持 `SKILL.md` 规范的 AI Agent。
+
+```mermaid
+flowchart LR
+    A["1. 多源检索与选刊把关\nCNKI / OpenAlex / PubMed / DBLP\n北大核心·CSSCI·SCI·SSCI·CCF·防预警"] --> B["2. 文献库与精读切片\n本机 Zotero / 本地 PDF 直连\n十万字硕博目录预览与按章切片"]
+    B --> C["3. 综述/长文撰稿与核验\n动态主题聚类 + 空白检索证明\nvalidate 逐句证据校验 + verify-refs 题名纠偏"]
+    C --> D["4. 交稿级排版与无损回填\nGB/T 7714 顺序编码·著者出版年·经管体例\nWord 原生三线表/上标 · LaTeX cite+bib 联动"]
+```
 
 ---
 
@@ -97,7 +110,7 @@ python3 <安装路径>/scripts/literature.py check --fix
 
 ### 4. 标准引用排版与错漏题录修复
 - **顺序编码、著者-出版年制与经管顶刊体例**：脚本确定性输出 **GB/T 7714**（顺序编码制与**著者-出版年制**，支持中前英后汉语拼音排序、同作者同年 `2020a/2020b` 自动标引及正文内嵌引文生成）、**中文经管/社科顶刊体例**（《经济研究》《管理世界》书名号风格）、APA、MLA、Chicago、中文脚注、RIS、Excel，以及 **100% 纯 ASCII Citekey 的 BibTeX**（如 `zhao2020_glsj`，完美兼容传统 `pdflatex / bibtex`）。
-- **卷期页码自动补齐与文稿角标一键重排**：开放源原生保留卷期页码与出版商层级（`venue_tier`）；知网与 DOI 文献在导出或生成引用时自动单会话补全缺失页码（兼容单页短文与 `+` 转页页码），支持 `cite --from-file draft.md --rewrite-output final.md` 按正文首次出现顺序单遍原子重排全文 `[序号]` 为 `[1]..[N]` 并自动附上参考文献。
+- **卷期页码自动补齐与 Markdown / LaTeX 角标一键重排**：开放源原生保留卷期页码与出版商层级（`venue_tier`）；知网与 DOI 文献在导出或生成引用时自动单会话补全缺失页码（兼容单页短文与 `+` 转页页码）。支持 `cite --from-file draft.md --rewrite-output final.md` 单遍原子重排 `[序号]` 为 `[1]..[N]` 并附参考文献；支持 `cite --from-file draft.tex --rewrite-output main.tex --bibtex-output refs.bib` 自动替换为 `\cite{zhao2020_glsj}` 并导出精简 `.bib`。
 - **二级题名真伪与改名核验（`verify-refs`）**：支持直接读取 `.docx / .md` 文稿末尾参考文献（`--from-file`），针对「英文回译词差」或「工作论文正式发表改名」导致按篇名搜不到的痛点，自动回退按**第一作者 + 核心词/期刊**检索作者真实成果并做相似度比对，一键修复真实发表题名与页码。
 
 ### 5. 学术表达优化与 Word / LaTeX 无损辅助
@@ -159,8 +172,9 @@ scholar-kit/
 │   ├── docx_tools.py         ← Word/LaTeX/PDF 文稿读取、交稿级排版与 OOXML 安全补丁
 │   ├── doctor.py             ← 环境自检、PEP 668 引导与缓存清理
 │   ├── workflows.py          ← 标准化流水线模板
+│   ├── smoke_upstream.py     ← 外部学术 API 每周线上契约巡检探针
 │   └── cnki/                 ← 知网自动化模块（双引擎检索/详情/防风控下载/DOM 契约探针）
-└── tests/                    ← pytest 自动化回归测试套件（83 项用例）
+└── tests/                    ← pytest 自动化回归测试套件（85 项用例）
 ```
 
 </details>

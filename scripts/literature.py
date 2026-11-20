@@ -1,5 +1,5 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.21.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.22.0)
 
 模块职责分层:
   - literature.py : CLI 参数解析、搜索/下载/引文/核验/导出路由编排
@@ -14,7 +14,7 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.21.0)
 
 from __future__ import annotations
 
-__version__ = "1.21.0"
+__version__ = "1.22.0"
 
 import argparse
 import hashlib
@@ -1063,20 +1063,59 @@ def _format_sequential_bracket(nums: List[int]) -> str:
     return f"[{', '.join(map(str, dedup))}]"
 
 
-def _extract_pick_indices_from_doc(doc_text: str, total_papers: int) -> List[int]:
-    """按正文首次出现顺序提取 0-based 课题库文献索引列表（自动剥离文末已有参考文献节）。"""
+def _extract_pick_indices_from_doc(doc_text: str, total_papers: int, *, is_tex: bool = False) -> List[int]:
+    """按正文首次出现顺序提取 0-based 课题库文献索引列表（自动剥离文末已有参考文献节，兼容 LaTeX 注释与可选宏参数）。"""
     import re as _re
     body = _strip_trailing_bibliography(doc_text)
     seen: List[int] = []
-    for m in _re.finditer(_DOC_CITE_BRACKET_RE, body):
-        expanded = _expand_bracket_tokens(m.group(1), total_papers)
-        if not expanded:
-            continue
-        for one_based in expanded:
-            idx0 = one_based - 1
-            if idx0 not in seen:
-                seen.append(idx0)
+    lines = body.splitlines() if is_tex else [body]
+    for ln in lines:
+        scan_txt = _re.split(r"(?<!\\)%", ln, maxsplit=1)[0] if is_tex else ln
+        for m in _re.finditer(_DOC_CITE_BRACKET_RE, scan_txt):
+            if is_tex and _re.search(r"\\[A-Za-z@]+\s*$", scan_txt[:m.start()]):
+                continue
+            expanded = _expand_bracket_tokens(m.group(1), total_papers)
+            if not expanded:
+                continue
+            for one_based in expanded:
+                idx0 = one_based - 1
+                if idx0 not in seen:
+                    seen.append(idx0)
     return seen
+
+
+def _rewrite_tex_with_citekeys(
+    tex_text: str,
+    pick_idx: List[int],
+    cite_keys: List[str],
+    total_papers: int,
+) -> str:
+    """单遍原子将 LaTeX 正文中的课题库 [序号] 替换为 \\cite{key1, key2}（自动保护 % 注释行与 \\item[1] 等可选宏参数）。"""
+    import re as _re
+    key_map = {orig_0based + 1: ck for orig_0based, ck in zip(pick_idx, cite_keys)}
+    out_lines: List[str] = []
+    for ln in tex_text.splitlines():
+        parts = _re.split(r"((?<!\\)%.*$)", ln, maxsplit=1)
+        code_part = parts[0]
+        comment_part = parts[1] if len(parts) > 1 else ""
+
+        def _repl_tex(m) -> str:
+            if _re.search(r"\\[A-Za-z@]+\s*$", code_part[:m.start()]):
+                return m.group(0)
+            expanded = _expand_bracket_tokens(m.group(1), total_papers)
+            if not expanded or any(x not in key_map for x in expanded):
+                return m.group(0)
+            dedup_keys: List[str] = []
+            for x in expanded:
+                k = key_map[x]
+                if k not in dedup_keys:
+                    dedup_keys.append(k)
+            return f"\\cite{{{', '.join(dedup_keys)}}}"
+
+        rewritten_code = _re.sub(_DOC_CITE_BRACKET_RE, _repl_tex, code_part)
+        out_lines.append(rewritten_code + comment_part)
+    trailing_nl = "\n" if tex_text.endswith("\n") else ""
+    return "\n".join(out_lines) + trailing_nl
 
 
 def _rewrite_doc_with_sequential_refs(
@@ -1102,8 +1141,8 @@ def _rewrite_doc_with_sequential_refs(
 
 
 def _read_any_doc_text(fp: Path) -> str:
-    """读取 .md/.txt/.docx/.tex/.pdf 纯文本内容。"""
-    if fp.suffix.lower() in (".md", ".markdown", ".txt"):
+    """读取 .md/.txt/.tex/.docx/.pdf 纯文本内容（.tex 原样读取以完整保留 LaTeX 导言区与注释）。"""
+    if fp.suffix.lower() in (".md", ".markdown", ".txt", ".tex"):
         return fp.read_text(encoding="utf-8")
     captured: Dict[str, Any] = {}
     fake_args = argparse.Namespace(
@@ -1122,7 +1161,9 @@ def cmd_cite(args) -> None:
 
     from_file = getattr(args, "from_file", None)
     rewrite_output = getattr(args, "rewrite_output", None)
+    bibtex_output = getattr(args, "bibtex_output", None)
     source_doc_text: Optional[str] = None
+    is_tex_source = False
     indices_raw = getattr(args, "indices", None)
 
     if from_file:
@@ -1130,8 +1171,9 @@ def cmd_cite(args) -> None:
         if not fp.exists():
             _output({"status": "error", "code": "FILE_NOT_FOUND", "message": f"未找到文稿文件: {from_file}"})
             return
+        is_tex_source = fp.suffix.lower() == ".tex"
         source_doc_text = _read_any_doc_text(fp)
-        pick_idx = _extract_pick_indices_from_doc(source_doc_text, len(all_papers))
+        pick_idx = _extract_pick_indices_from_doc(source_doc_text, len(all_papers), is_tex=is_tex_source)
         if not pick_idx:
             _output({
                 "status": "error",
@@ -1159,7 +1201,7 @@ def cmd_cite(args) -> None:
     if not getattr(args, "no_enrich", False):
         _enrich_bibliography_subset(selected_papers, all_papers, project)
 
-    from formatter import prepare_author_year_papers
+    from formatter import prepare_author_year_papers, to_bibtex_with_keys
     enriched = [all_papers[orig_i] for orig_i in pick_idx]
     incomplete_indices: List[int] = []
     keep_numbers = bool(getattr(args, "keep_numbers", False))
@@ -1185,14 +1227,27 @@ def cmd_cite(args) -> None:
     if keep_numbers and indices_raw and style in ("gbt7714", "gb"):
         ref_list = _apply_original_numbers_to_refs(ref_list, [i + 1 for i in pick_idx])
 
+    bibtex_path: Optional[str] = None
+    cite_keys: Optional[List[str]] = None
+    is_tex_rewrite = bool(rewrite_output and (is_tex_source or Path(rewrite_output).suffix.lower() == ".tex"))
+    if bibtex_output or is_tex_rewrite:
+        bib_content, cite_keys = to_bibtex_with_keys(enriched)
+        if bibtex_output:
+            bib_p = Path(bibtex_output)
+            bib_p.parent.mkdir(parents=True, exist_ok=True)
+            bib_p.write_text(bib_content + "\n", encoding="utf-8")
+            bibtex_path = str(bib_p)
+
     rewritten_path: Optional[str] = None
     if rewrite_output:
         if source_doc_text is None:
-            _output({"status": "error", "code": "MISSING_FROM_FILE", "message": "--rewrite-output 需配合 --from-file <draft.md> 使用"})
+            _output({"status": "error", "code": "MISSING_FROM_FILE", "message": "--rewrite-output 需配合 --from-file <draft.md/tex> 使用"})
             return
         out_p = Path(rewrite_output)
         out_p.parent.mkdir(parents=True, exist_ok=True)
-        if style in ("gbt7714", "gb") and not keep_numbers:
+        if is_tex_rewrite and cite_keys is not None:
+            final_doc = _rewrite_tex_with_citekeys(source_doc_text, pick_idx, cite_keys, len(all_papers))
+        elif style in ("gbt7714", "gb") and not keep_numbers:
             final_doc = _rewrite_doc_with_sequential_refs(source_doc_text, pick_idx, len(all_papers), ref_list)
         else:
             final_doc = f"{_strip_trailing_bibliography(source_doc_text)}\n\n## 参考文献\n\n{ref_list}\n"
@@ -1224,9 +1279,16 @@ def cmd_cite(args) -> None:
         if indices_raw:
             out["selected_indices"] = [i + 1 for i in pick_idx]
         if from_file:
-            out["index_mapping"] = {str(orig_i + 1): new_no for new_no, orig_i in enumerate(pick_idx, 1)}
+            if is_tex_rewrite and cite_keys is not None:
+                out["citekey_mapping"] = {str(orig_i + 1): ck for orig_i, ck in zip(pick_idx, cite_keys)}
+            else:
+                out["index_mapping"] = {str(orig_i + 1): new_no for new_no, orig_i in enumerate(pick_idx, 1)}
         if rewritten_path:
             out["rewritten_file"] = rewritten_path
+        if bibtex_path:
+            out["bibtex_file"] = bibtex_path
+        if cite_keys is not None:
+            out["cite_keys"] = cite_keys
         if incomplete_indices:
             out["incomplete_indices"] = incomplete_indices
             out["warnings"] = [f"第 {', '.join(map(str, incomplete_indices))} 条期刊文献缺少页码信息，核稿时可配合 --cite-enrich 补全"]
@@ -2198,8 +2260,9 @@ def main() -> None:
     p_cite.add_argument("--style", default="gbt7714", choices=CITATION_STYLE_CHOICES,
                         help="引用样式: gbt7714(顺序编码)/gbt7714-author-year(国标著者-出版年)/chinese-econ(经管社科顶刊)/apa/mla/chicago/footnote")
     p_cite.add_argument("--indices", help="仅格式化指定序号文献（顺序编码制按传入顺序；著者-出版年制自动按中前英后拼音排序）")
-    p_cite.add_argument("--from-file", help="从文稿正文自动按首次出现顺序提取 [序号] 文献子集（自动跳过文末已有参考文献节）")
-    p_cite.add_argument("--rewrite-output", help="配合 --from-file 使用：单遍原子重排正文 [序号] 为 [1]..[N] 并自动追加 ## 参考文献写入目标文件")
+    p_cite.add_argument("--from-file", help="从 .md/.tex/.docx 正文自动按首次出现顺序提取 [序号] 文献子集（自动跳过文末已有参考文献节）")
+    p_cite.add_argument("--rewrite-output", help="配合 --from-file：Markdown 单遍原子重排 [序号] 为 [1]..[N] 并附参考文献；LaTeX (.tex) 自动替换为 \\cite{key}")
+    p_cite.add_argument("--bibtex-output", help="同步导出所选文献子集的纯 ASCII Citekey BibTeX 文件（如 refs.bib，完美搭配 .tex 写作）")
     p_cite.add_argument("--keep-numbers", action="store_true", help="配合 --indices 时保留原文献库序号而非从 [1] 重排")
     p_cite.add_argument("--in-text", action="store_true", help="同时生成正文内嵌引文格式（句中叙述式与句末括号式）")
     p_cite.add_argument("--no-enrich", action="store_true", help="跳过自动联网补全缺页码")

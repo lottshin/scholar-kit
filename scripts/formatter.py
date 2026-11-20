@@ -910,8 +910,9 @@ def _to_ascii_slug(raw: str, fallback: str = "ref") -> str:
     return slug[:20] or fallback
 
 
-def to_bibtex(papers: List[Dict[str, Any]]) -> str:
+def to_bibtex_with_keys(papers: List[Dict[str, Any]]) -> tuple[str, List[str]]:
     entries = []
+    ordered_keys: List[str] = []
     used_keys: set[str] = set()
     for i, p in enumerate(papers):
         base_key = p.get("citekey") or _bibtex_key(p, i)
@@ -923,6 +924,7 @@ def to_bibtex(papers: List[Dict[str, Any]]) -> str:
             key = f"{clean_key}_{suffix_n}"
             suffix_n += 1
         used_keys.add(key)
+        ordered_keys.append(key)
 
         doc_type = _detect_doc_type(p)
         deg_kind = _thesis_degree_kind(p) if doc_type == "thesis" else ""
@@ -974,7 +976,11 @@ def to_bibtex(papers: List[Dict[str, Any]]) -> str:
         entry = "@{}{{{},\n".format(bib_type, key) + ",\n".join(fields) + "\n}"
         entries.append(entry)
 
-    return "\n\n".join(entries)
+    return "\n\n".join(entries), ordered_keys
+
+
+def to_bibtex(papers: List[Dict[str, Any]]) -> str:
+    return to_bibtex_with_keys(papers)[0]
 
 
 def _bibtex_key(paper: dict, index: int) -> str:

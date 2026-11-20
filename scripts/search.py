@@ -820,7 +820,10 @@ def search_dblp(query: str, limit: int = 10, year_from: int = None, year_to: int
     }
 
     data = _http_get("https://dblp.org/search/publ/api", params=params)
-    if not data or "result" not in data:
+    if not isinstance(data, dict) or "result" not in data:
+        if isinstance(data, str) and ("not a bot" in data.lower() or "anubis" in data.lower()):
+            import sys as _sys
+            print("[dblp] dblp.org 当前开启了人机验证网关拦截，建议改用 --source openalex --core CCF-A,CCF-B", file=_sys.stderr)
         return []
 
     hits = data.get("result", {}).get("hits", {}).get("hit", [])
