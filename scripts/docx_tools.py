@@ -746,12 +746,98 @@ def _write_docx_from_markdown(md_text: str, output_path: Path) -> Dict[str, Any]
         if last < len(text):
             paragraph.add_run(text[last:])
 
-    for line in body_lines:
-        heading = re.match(r"^(#{1,3})\s+(.+)$", line)
+    def _set_three_line_table_borders(table):
+        """为 Word 原生表格设置标准中文学术三线表边框（顶底 1.5pt 粗线，表头下 0.75pt 细线，无竖线与内部横线）。"""
+        from docx.oxml import OxmlElement
+
+        tbl_pr = table._tbl.tblPr
+        borders = OxmlElement("w:tblBorders")
+        for edge, val, sz in (
+            ("top", "single", "12"),
+            ("bottom", "single", "12"),
+            ("left", "none", "0"),
+            ("right", "none", "0"),
+            ("insideH", "none", "0"),
+            ("insideV", "none", "0"),
+        ):
+            el = OxmlElement(f"w:{edge}")
+            el.set(qn("w:val"), val)
+            el.set(qn("w:sz"), sz)
+            el.set(qn("w:space"), "0")
+            el.set(qn("w:color"), "000000")
+            borders.append(el)
+        tbl_pr.append(borders)
+
+        # 表头首行底边加 0.75pt (sz=6) 分隔细线
+        if len(table.rows) >= 1:
+            for cell in table.rows[0].cells:
+                tc_pr = cell._tc.get_or_add_tcPr()
+                tc_borders = OxmlElement("w:tcBorders")
+                bot = OxmlElement("w:bottom")
+                bot.set(qn("w:val"), "single")
+                bot.set(qn("w:sz"), "6")
+                bot.set(qn("w:space"), "0")
+                bot.set(qn("w:color"), "000000")
+                tc_borders.append(bot)
+                tc_pr.append(tc_borders)
+
+    def _is_md_table_sep(row_cells: List[str]) -> bool:
+        return bool(row_cells) and all(re.match(r"^:?-{2,}:?$", c.strip()) for c in row_cells)
+
+    def _split_md_table_row(raw_ln: str) -> List[str]:
+        s = raw_ln.strip()
+        if s.startswith("|"):
+            s = s[1:]
+        if s.endswith("|"):
+            s = s[:-1]
+        return [c.strip() for c in s.split("|")]
+
+    table_count = 0
+    idx_ln = 0
+    while idx_ln < len(body_lines):
+        line = body_lines[idx_ln]
+        stripped_ln = line.strip()
+
+        # 识别连续 Markdown 管道表格块并渲染为 Word 原生学术三线表
+        if stripped_ln.startswith("|") and stripped_ln.count("|") >= 2:
+            tbl_raw_lines: List[str] = []
+            while idx_ln < len(body_lines) and body_lines[idx_ln].strip().startswith("|") and body_lines[idx_ln].strip().count("|") >= 2:
+                tbl_raw_lines.append(body_lines[idx_ln].strip())
+                idx_ln += 1
+            parsed_rows = [_split_md_table_row(r) for r in tbl_raw_lines]
+            data_rows = [r for r in parsed_rows if not _is_md_table_sep(r)]
+            if len(data_rows) >= 2:
+                col_cnt = max(len(r) for r in data_rows)
+                if col_cnt >= 1:
+                    tbl = doc.add_table(rows=len(data_rows), cols=col_cnt)
+                    try:
+                        from docx.enum.table import WD_TABLE_ALIGNMENT
+                        tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+                    except Exception:
+                        pass
+                    for r_i, row_vals in enumerate(data_rows):
+                        for c_i in range(col_cnt):
+                            val_txt = row_vals[c_i] if c_i < len(row_vals) else ""
+                            cell = tbl.cell(r_i, c_i)
+                            cp = cell.paragraphs[0]
+                            cp.paragraph_format.first_line_indent = Cm(0)
+                            cp.paragraph_format.line_spacing = 1.25
+                            _parse_inline(cp, val_txt)
+                            for run in cp.runs:
+                                run.font.size = Pt(10.5)
+                                if r_i == 0:
+                                    run.bold = True
+                    _set_three_line_table_borders(tbl)
+                    table_count += 1
+                    continue
+
+        idx_ln += 1
+        heading = re.match(r"^(#{1,4})\s+(.+)$", line)
         if heading:
-            level = len(heading.group(1))
+            level = min(len(heading.group(1)), 3)
             p = doc.add_paragraph()
             p.style = doc.styles[f"Heading {level}"]
+            p.paragraph_format.first_line_indent = Cm(0)
             _parse_inline(p, heading.group(2).strip())
             continue
         ul_match = re.match(r"^[-*]\s+(.+)$", line)
@@ -770,15 +856,15 @@ def _write_docx_from_markdown(md_text: str, output_path: Path) -> Dict[str, Any]
                 p = doc.add_paragraph()
             _parse_inline(p, ol_match.group(1).strip())
             continue
-        if not line.strip():
+        if not stripped_ln:
             continue
         p = doc.add_paragraph()
-        _parse_inline(p, line.strip())
+        _parse_inline(p, stripped_ln)
 
     if ref_section_lines:
-        doc.add_heading("参考文献", level=1)
+        h_ref = doc.add_heading("参考文献", level=1)
+        h_ref.paragraph_format.first_line_indent = Cm(0)
         for ref_line in ref_section_lines:
-            ref_line = re.sub(r"^\[\d+\]\s*", "", ref_line)
             ref_line = re.sub(r"^[-•]\s*", "", ref_line)
             p = doc.add_paragraph(ref_line)
             p.paragraph_format.first_line_indent = Cm(-0.74)
@@ -793,6 +879,7 @@ def _write_docx_from_markdown(md_text: str, output_path: Path) -> Dict[str, Any]
         "status": "success" if not warnings else "warning",
         "message": f"已生成: {output_path}",
         "output": str(output_path),
+        "tables": table_count,
         "footnotes": fn_counter[0] - max_id,
         "references": len(ref_section_lines),
     }

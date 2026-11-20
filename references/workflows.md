@@ -24,7 +24,8 @@ Agent 执行具体任务时按需读取本文档。决策入口见 [SKILL.md 决
   - `--fund "国家社会科学基金"`（`FU % '国家社会科学基金'`）
   - `--fuzzy`：对主题/篇关摘/篇名启用 `%` 模糊包含匹配
 - **单次布尔专业检索 `--expr`（强烈推荐替代同义词多轮 `batch-search`）**：
-  - 语法：字段代码（`SU` / `TKA` / `TI` / `KY` / `AB` / `AU` / `FI` / `AF` / `LY` / `FU`）+ `=`（精确）或 `%`（模糊）+ **英文单引号**包裹词项；同字段内并列用 `+`、交集用 `*`、排除用 `-`；跨字段用 `AND` / `OR` / `NOT`（注意 `AND` 后必须带字段代码，如 `AND TKA=(...)`）。
+  - 语法：字段代码（`SU` / `TKA` / `TI` / `KY` / `AB` / `AU` / `FI` / `AF` / `LY` / `FU`）+ `=`（精确词边界）或 `%`（模糊子串包含）+ **英文单引号**包裹词项；同字段内并列用 `+`、交集用 `*`、排除用 `-`；跨字段用 `AND` / `OR` / `NOT`（注意 `AND` 后必须带字段代码，如 `AND TKA=(...)`）。
+  - **防 `0` 结果技巧**：知网 `TKA='跨文化'`（`=`）要求词项精确命中分词边界，不会自动匹配 `'跨文化传播'`；当检索式包含 **3 组及以上 `AND`** 或包含 `'跨文化'`、`'出海'`、`'奇观'` 等词根时，**优先使用 `%` 模糊包含**（如 `TKA % '非遗' AND (TKA % '跨文化' OR TKA % '国际传播' OR TKA % '出海')`），检全率远高于多重 `=`。
   - 注意：年份直接搭配 `--year-from` / `--year-to` 即可（知网 KNS8S 专业检索式不支持 `YE` 字段）。
 
 ```bash
@@ -129,9 +130,29 @@ python scripts\literature.py workflows --execute literature_review_classic --var
    - 运行 `review --project <课题名> --topic "<综述主题>" --auto-detail --detail-top-n 6 --cluster --gaps`（自动单会话补全知网摘要、输出动态聚类与覆盖度空白提示）；
    - 对需要深挖论证细节的 3–5 篇代表作运行 `read-detail --project <课题名> --indices 1,2,5 --fulltext`（本地已下载 PDF 时秒级提取免滑块）。
 4. **撰写综述与证据支撑核验（`validate`）**
-   - Agent 基于证据包撰写综述正文（先按正文引用先后保留课题库证据序号用于核查，运行 `validate --project <课题名> --file draft.md` 检查是否存在无支撑断言或仅题录强断言）。
-5. **按正文引用顺序生成标准参考文献（`cite --indices`）**
-   - 按正文最终首次出现顺序传入 `--indices`（如正文依次引了课题库第 5、1、8 篇，则运行 `cite --project <课题名> --indices 5,1,8 --style gbt7714`），脚本仅对被选文献补全卷期页码并自动重编为 `[1][2][3]`，严禁手拼参考文献。
+   - Agent 基于证据包撰写综述正文（先按课题库 `[序号]` 标注角标以便追溯，运行 `validate --project <课题名> --file draft.md` 检查是否存在无支撑经验断言或仅题录强断言；著者-出版年制文稿同样支持自动映射核查）。
+5. **一键原子重排角标并生成标准参考文献（`cite --from-file`）**
+   - 顺序编码制长文优先运行 `cite --project <课题名> --from-file draft.md --rewrite-output final.md --style gbt7714`：脚本自动按正文首次出现顺序提取文献子集、联网补齐缺漏卷期页码、单遍原子重排全文 `[序号]` 为 `[1]..[N]`（杜绝级联替换错乱）并在文末附上 `## 参考文献`。
+   - 经管社科著者-出版年制可运行 `cite --project <课题名> --indices 5,1,8 --style chinese-econ --in-text`（或 `gbt7714-author-year`），自动按中前英后、汉字拼音与同姓同年 `a/b` 排序。
+
+## 撰写完整学术论文（万字长文闭环）
+
+当用户给出研究题目、核心问题、地方/行业个案与写作框架（如 10,000–20,000 字专题学术论文）时，严格按以下六步执行：
+
+1. **分层检索建库（理论主干 + 个案核心优先 + 国际主流英文文献）**
+   - **理论主干**：用 `--expr`（词根用 `%`）加 `--core 北大核心,CSSCI`（理工医用 `CSCD`）检索学科核心理论与前沿文献，存入 `--project <课题名>`。
+   - **地方/行业个案**：**同样先加 `--core 北大核心,CSSCI` 检索个案本体研究**（例如搜湘绣、滩头年画、花鼓戏时先查《民族艺术》《装饰》《中国戏剧》等核心刊个案研究，不必强绑新媒体热词以免漏掉核心文献而掉入普刊），再视需要补充 `--doc-type master,doctor` 高校学位论文；仅当核心与学位论文确无覆盖时才补充普刊并向用户说明。
+   - **英文国际对话**：用 `search "<简洁英文短语>" --source openalex --append --project <课题名>`（`search` 默认匹配标题+摘要避免泛化噪音），核查返回的 `venue_tier` 与 `publisher`，保留 `mainstream` 主流学术期刊与高被引文献，运行 `library --remove ...` 剔除零被引低门槛 OA 水刊，再运行 `library --dedupe` 跨语种去重。
+2. **证据提取与精读（`review` + `read-detail`）**
+   - 运行 `review --project <课题名> --topic "<论文题目>" --auto-detail --detail-top-n 12 --cluster --gaps`；对拟高频引用的核心文献与硕博长文补充 `read-detail --indices ...`（硕博论文先加 `--toc` 再用 `--section` 切片精读），完成后可运行 `close-browser` 释放浏览器。
+3. **证据纪律与结构化撰稿**
+   - 撰写初稿 `draft.md`，正文中暂用课题库原始 `[序号]` 标注出处，Markdown 表格按标准管道表语法书写（导出 Word 时自动转为学术**三线表**）。
+   - **严禁捏造一手抽样数据**：若用户未提供问卷、实验或平台抓取数据集，禁止虚构 `N=...` 样本量、百分比或显著性检验，须采用质性案例/文本符号学/理论演绎写法。
+4. **论断与引文核验（`validate` + `verify-refs`）**
+   - 运行 `validate --project <课题名> --file draft.md` 检查 `unsupported` 句子（重点排查无引文的“研究表明/数据显示”及 `title_only` 条目）；如有外部导入文献可加跑 `verify-refs --fix-session`。
+5. **一键重排参考文献与导出三线表 Word（`cite` + `write-docx`）**
+   - 运行 `cite --project <课题名> --from-file draft.md --rewrite-output final.md --style gbt7714` 完成角标 `[1]..[N]` 重映射与国标参考文献生成；
+   - 运行 `write-docx final.md --output 论文定稿.docx` 生成含标题层级、首行缩进、原生学术三线表与悬挂缩进参考文献的正式 Word 文档。
 
 ## 引用建议
 

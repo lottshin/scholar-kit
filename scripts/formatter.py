@@ -35,9 +35,21 @@ def _first_value(paper: dict, *keys: str) -> str:
     return ""
 
 
+def _clean_container_title(raw: str) -> str:
+    """清洗 OpenAlex 等外部源中带有斜杠大小写双份重复（A/a）或末尾多余句点的脏刊名。"""
+    s = _as_text(raw).strip().rstrip(". ．。")
+    if not s:
+        return ""
+    if "/" in s:
+        left, right = [part.strip().rstrip(". ．。") for part in s.split("/", 1)]
+        if left and right and left.lower() == right.lower():
+            s = left
+    return s.rstrip(". ．。").strip()
+
+
 def _bibliographic_container(paper: dict) -> str:
     """Return a publication/container title, never the data-source marker."""
-    return _first_value(
+    val = _first_value(
         paper,
         "journal",
         "journal_title",
@@ -48,6 +60,7 @@ def _bibliographic_container(paper: dict) -> str:
         "periodical",
         "container_title",
     )
+    return _clean_container_title(val)
 
 
 def _analytic_container(paper: dict) -> str:
@@ -68,14 +81,24 @@ def _has_cjk(text: str) -> bool:
 
 
 def _clean_person_name(name: str) -> str:
-    """剥离知网/PDF 提取时黏连在作者姓名末尾的机构角标数字、星号与通讯作者标注（如 '赵涛1,2*' -> '赵涛'）。"""
+    """剥离知网/PDF 提取时黏连在作者姓名末尾的机构角标数字、星号与通讯作者标注，并修正 OpenAlex 倒置中文名（如 '子萱 廖' -> '廖子萱'）。"""
     s = name.strip()
     if not s:
         return ""
     s = re.sub(r"[（(]\s*(?:通讯作者|通信作者|corresponding\s*author)\s*[)）]", "", s, flags=re.I)
     s = re.sub(r"(?<=[\u4e00-\u9fffA-Za-z.\-])(?:\d+(?:\s*[,，、]\s*\d+)*)?[*†‡§¶]+$", "", s)
     s = re.sub(r"(?<=[\u4e00-\u9fffA-Za-z.\-])\d+(?:\s*[,，、]\s*\d+)*$", "", s)
-    return s.strip()
+    s = s.strip()
+    # 修正西文库把中文作者按 'Given Family' 空格倒置存储的情况（如 '子萱 廖' -> '廖子萱'，'烽 杨' -> '杨烽'）
+    m_cjk_rev = re.match(r"^([\u4e00-\u9fff]{1,2})\s+([\u4e00-\u9fff]{1,2})$", s)
+    if m_cjk_rev:
+        p1, p2 = m_cjk_rev.group(1), m_cjk_rev.group(2)
+        p2_is_sur = p2 in _COMMON_CJK_PINYIN or p2 in _COMPOUND_CJK_SURNAMES
+        p1_is_sur = p1 in _COMMON_CJK_PINYIN or p1 in _COMPOUND_CJK_SURNAMES
+        if (len(p1) == 2 and len(p2) == 1 and p2_is_sur) or (p2_is_sur and not p1_is_sur):
+            return f"{p2}{p1}"
+        return f"{p1}{p2}"
+    return s
 
 
 _WESTERN_PARTICLES = {"van", "von", "de", "del", "della", "di", "da", "du", "la", "le", "der", "den", "ter", "ten"}
@@ -278,7 +301,7 @@ def _renumber_raw_reference(raw: str, index: int) -> str:
     if not raw:
         return raw
     if re.match(r"^\[\d+\]", raw):
-        return re.sub(r"^\[\d+\]", f"[{index}]", raw, count=1)
+        return re.sub(r"^\[\d+\]\s*", f"[{index}] ", raw, count=1)
     return f"[{index}] {raw}"
 
 
@@ -287,14 +310,6 @@ def _detect_doc_type(paper: dict) -> str:
         paper, "doc_type", "document_type", "type", "resource_type",
         "literature_type", "category"
     ).lower()
-    combined = " ".join(
-        _first_value(paper, key).lower()
-        for key in (
-            "doc_type", "document_type", "type", "literature_type",
-            "category", "journal", "venue", "publication", "source_title",
-            "title", "url"
-        )
-    )
 
     aliases = {
         "journal": "journal", "article": "journal", "periodical": "journal", "期刊": "journal",
@@ -304,7 +319,7 @@ def _detect_doc_type(paper: dict) -> str:
         "doctor": "thesis", "硕士": "thesis", "博士": "thesis", "学位": "thesis",
         "conference": "conference", "proceedings": "conference", "会议": "conference",
         "chapter": "chapter", "incollection": "chapter", "析出": "chapter",
-        "report": "report", "technical report": "report", "报告": "report",
+        "report": "report", "technical report": "report", "研究报告": "report",
         "standard": "standard", "标准": "standard",
         "patent": "patent", "专利": "patent",
         "webpage": "webpage", "website": "webpage", "online": "webpage", "网页": "webpage",
@@ -315,9 +330,15 @@ def _detect_doc_type(paper: dict) -> str:
     for key, value in aliases.items():
         if key in explicit:
             return value
-    for key, value in aliases.items():
-        if key in combined:
-            return value
+
+    # 切勿拿 "report" / "book" / "online" 在刊名或篇名上做宽泛子串匹配（否则 Scientific Reports /《纺织报告》会被误判为 [R] 报告！）
+    venue_and_url = " ".join(_first_value(paper, k).lower() for k in ("journal", "venue", "publication", "source_title", "url"))
+    if "arxiv" in venue_and_url or "preprint" in venue_and_url:
+        return "preprint"
+    if any(k in venue_and_url for k in ("conference", "proceedings", "symposium", "workshop", "会议")):
+        return "conference"
+    if any(k in venue_and_url for k in ("dissertation", "学位论文")):
+        return "thesis"
 
     if _first_value(paper, "patent_no", "patent_number"):
         return "patent"
@@ -327,6 +348,8 @@ def _detect_doc_type(paper: dict) -> str:
         return "chapter"
     if _bibliographic_container(paper):
         return "journal"
+    if _first_value(paper, "school", "degree", "thesis_type"):
+        return "thesis"
     if _first_value(paper, "publisher"):
         return "book"
     if _first_value(paper, "url"):
@@ -403,7 +426,7 @@ def format_gbt7714(paper: dict, index: int = 1) -> str:
     if raw and (_raw_gbt_has_pages(raw) or not pages):
         return _renumber_raw_reference(raw, index)
 
-    authors = _format_authors_gbt(paper.get("authors"))
+    authors = _format_authors_gbt(paper.get("authors"), western_initials=True)
     title = _first_value(paper, "title")
     journal = _bibliographic_container(paper)
     container = _analytic_container(paper)

@@ -249,9 +249,13 @@ def _extract_pub_info(driver, detail: Dict[str, Any]):
         if vol_m and not detail.get("volume"):
             detail["volume"] = vol_m.group(1)
 
-        issue_m = re.search(r'\((\w+)\)', pub_text) or \
-                  re.search(r'第\s*(\w+)\s*期', pub_text) or \
-                  re.search(r'No\.?\s*(\d+)', pub_text)
+        # 期号仅匹配数字或英文增刊代号（如 09 / S1 / Z1），严禁匹配刊名括号中的汉字副标题如 (中国传媒大学学报) / (人文社会科学版)
+        issue_m = (
+            re.search(r'(?:(?:19|20)\d{2}\s*(?:[,，]\s*\d+\s*)?)[(（]\s*([0-9A-Za-z]{1,6})\s*[)）]', pub_text)
+            or re.search(r'[(（]\s*([0-9]{1,3}|[SZsz][0-9]{1,2})\s*[)）]', pub_text)
+            or re.search(r'第\s*([0-9A-Za-z]{1,6})\s*期', pub_text)
+            or re.search(r'No\.?\s*(\d+)', pub_text)
+        )
         if issue_m and not detail.get("issue"):
             raw_iss = issue_m.group(1)
             detail["issue"] = (raw_iss.lstrip("0") or "0") if raw_iss.isdigit() else raw_iss
@@ -344,6 +348,9 @@ def _extract_pub_info(driver, detail: Dict[str, Any]):
                 detail["filename"] = fn
 
             abs_hidden = hidden_info.get("abstract_text", "")
+            if abs_hidden:
+                import html as _html
+                abs_hidden = re.sub(r"^\s*<正>\s*", "", _html.unescape(abs_hidden)).strip()
             if abs_hidden and len(abs_hidden) > len(detail.get("abstract", "")):
                 detail["abstract"] = abs_hidden
 
@@ -361,6 +368,11 @@ def _extract_pub_info(driver, detail: Dict[str, Any]):
                 detail["volume"] = hidden_info["volume"]
             if hidden_info.get("issue") and not detail.get("issue"):
                 detail["issue"] = str(hidden_info["issue"]).lstrip("0") or "0"
+            if not detail.get("issue") and fn and str(dbc).upper().startswith("CJF"):
+                m_fn = re.match(r"^[A-Za-z]{4}(?:19|20)\d{2}(\d{2}|[SZsz]\d)[0-9A-Za-z]+$", str(fn))
+                if m_fn:
+                    iss_code = m_fn.group(1).upper()
+                    detail["issue"] = (iss_code.lstrip("0") or "0") if iss_code.isdigit() else iss_code
             if not detail.get("pages"):
                 if hidden_info.get("pages"):
                     detail["pages"] = str(hidden_info["pages"]).replace("–", "-").replace("—", "-")
@@ -1060,6 +1072,16 @@ def batch_read_detail(
                 paper["fulltext"] = local_ft
                 paper["fulltext_length"] = len(local_ft)
                 paper["fulltext_cache"] = str(saved)
+                continue
+        else:
+            # 非全文模式下，若会话中该文献已具备完整摘要与页码（或属学位论文/真网络首发），直接跳过重复打开网页
+            has_valid_issue = bool(paper.get("issue")) and not any("\u4e00" <= ch <= "\u9fff" for ch in str(paper.get("issue", "")))
+            if paper.get("abstract") and (
+                (paper.get("pages") and (has_valid_issue or not paper.get("issue")))
+                or paper.get("doc_type") in ("thesis", "master", "doctor")
+                or (paper.get("is_online_first") and not paper.get("pages"))
+            ):
+                _log(f"[cnki-detail] 会话已含完整摘要与题录，跳过重复请求: {paper.get('title', '')[:35]}")
                 continue
         need_web_targets.append(paper)
 

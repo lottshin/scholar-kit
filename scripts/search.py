@@ -253,17 +253,18 @@ def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to:
         "mailto": _get_mailto(),
     }
 
-    # 根据 field 参数调整搜索方式
+    # 根据 field 参数调整搜索方式（默认检索标题+摘要而非全文，彻底杜绝 --sort citations 时无关万引长综述霸榜）
     filters = []
+    used_ta_filter = False
     if field == "title":
-        # 标题搜索使用 display_name.search filter
         filters.append(f"display_name.search:{query}")
     elif field == "abstract":
-        # 摘要搜索使用 abstract.search filter
         filters.append(f"abstract.search:{query}")
-    else:
-        # 默认全文搜索使用 search 参数
+    elif field == "fulltext":
         params["search"] = query
+    else:
+        filters.append(f"title_and_abstract.search:{query}")
+        used_ta_filter = True
 
     # 添加排序参数
     if sort == "citations":
@@ -290,9 +291,26 @@ def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to:
         params["filter"] = ",".join(filters)
 
     data = _http_get("https://api.openalex.org/works", params=params)
+    # 若标题+摘要无结果，自动回退一次全文 search 参数以兼顾检全率
+    if used_ta_filter and (not data or not data.get("results")):
+        fallback_filters = [f for f in filters if not f.startswith("title_and_abstract.search:")]
+        fb_params = dict(params, search=query)
+        if fallback_filters:
+            fb_params["filter"] = ",".join(fallback_filters)
+        else:
+            fb_params.pop("filter", None)
+        data = _http_get("https://api.openalex.org/works", params=fb_params)
     if not data or "results" not in data:
         return []
 
+    _MAINSTREAM_PUBLISHERS = (
+        "elsevier", "springer", "nature", "wiley", "taylor & francis", "routledge",
+        "sage", "oxford university press", "cambridge university press", "ieee",
+        "association for computing machinery", "emerald", "johns hopkins",
+        "university of chicago", "mit press", "american psychological", "american economic",
+        "american sociological", "public library of science", "plos", "frontiers", "mdpi",
+    )
+    crossref_budget = 2
     results = []
     for w in data["results"]:
         authors = ", ".join(
@@ -333,8 +351,9 @@ def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to:
         lp = str(biblio.get("last_page") or "").strip()
         pages = f"{fp}-{lp}" if (fp and lp and fp != lp) else (fp or lp)
 
-        # 摘要与卷期增强：如果摘要或页码为空且有 DOI，尝试从 Crossref 补全
-        if (not abstract or not pages) and doi:
+        # 摘要增强：仅对前 2 条缺失摘要的条目尝试一次 Crossref，其余页码补全留给 cite/export 阶段按需执行（避免串行阻塞 30s+）
+        if not abstract and doi and crossref_budget > 0:
+            crossref_budget -= 1
             try:
                 crossref_data = resolve_crossref(doi)
                 if crossref_data:
@@ -349,14 +368,20 @@ def search_openalex(query: str, limit: int = 10, year_from: int = None, year_to:
             except Exception:
                 pass  # 静默失败，不影响主流程
 
-        # 添加摘要质量标记
+        # 添加摘要质量与英文刊物出版方层级标记
         abstract_quality = "full" if len(abstract) > 200 else "partial" if abstract else "none"
+        host_org = str(src.get("host_organization_name") or "").strip()
+        cited_cnt = int(w.get("cited_by_count") or 0)
+        is_mainstream = any(pub in host_org.lower() for pub in _MAINSTREAM_PUBLISHERS) or cited_cnt >= 15
+        venue_tier = "mainstream" if is_mainstream else ("doaj_oa" if src.get("is_in_doaj") else "general")
 
         entry = {
             "title": w.get("title", ""),
             "authors": authors,
             "year": w.get("publication_year"),
             "journal": src.get("display_name", ""),
+            "publisher": host_org,
+            "venue_tier": venue_tier,
             "volume": volume,
             "issue": issue,
             "pages": pages,

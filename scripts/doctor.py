@@ -338,27 +338,23 @@ def check_update(current_version: str, fetch_fn: Callable[..., Any] = fetch_json
     ]
 
     try:
-        latest = None
+        candidates: List[str] = []
         for url in urls:
-            if latest:
-                break
             try:
                 data = fetch_fn(url, timeout=3)
                 if data is None:
                     continue
-                if isinstance(data, list):
-                    latest = data[0].get("name", "") if data else ""
-                else:
-                    latest = data.get("tag_name", "")
+                cand = (data[0].get("name", "") if data else "") if isinstance(data, list) else data.get("tag_name", "")
+                cand = (cand or "").removeprefix("v")
+                if cand and semver_re.match(cand):
+                    candidates.append(cand)
             except Exception:
                 continue
 
-        if not latest:
+        if not candidates:
             return None
 
-        latest = latest.removeprefix("v")
-        if not semver_re.match(latest):
-            return None
+        latest = max(candidates, key=_version_key)
 
         if use_cache:
             try:
@@ -564,6 +560,26 @@ def run_check(
                 "available": True,
                 "features": ["search", "chinese_social_science"],
                 "recommended_for": ["中文社科开放文献"],
+            },
+            "pubmed": {
+                "available": True,
+                "features": ["search", "sort_citations", "sort_date", "pmid_pmcid", "full_abstract"],
+                "recommended_for": ["生物医学", "生命科学", "临床研究"],
+            },
+            "dblp": {
+                "available": True,
+                "features": ["search", "cs_conferences_journals"],
+                "recommended_for": ["计算机科学顶会与期刊"],
+            },
+            "base": {
+                "available": True,
+                "features": ["search", "oa_repositories"],
+                "recommended_for": ["开放获取机构知识库"],
+            },
+            "zotero": {
+                "available": (Path.home() / "Zotero" / "zotero.sqlite").is_file(),
+                "features": ["local_sqlite_snapshot", "collections", "pdf_attachments"],
+                "recommended_for": ["本机个人文献库直连"],
             },
         },
         "performance": {

@@ -455,55 +455,185 @@ def _hide_browser(driver: "webdriver.Remote"):
 
 
 def _show_browser(driver: "webdriver.Remote"):
-    """将浏览器移回屏幕可见区域并置顶到前台。"""
+    """将浏览器解除最小化、移回屏幕可见区域并强制置顶到系统最前台（兼容 macOS / Windows / Linux）。"""
+    # 1. 优先通过 CDP 强制解除最小化（Browser.setWindowBounds windowState='normal'）并激活当前标签页
+    #    解决 Chrome 被 minimize_window() 收进 macOS 程序坞 / Windows 任务栏后 set_window_position 报错或仍在后台的问题
+    unminimized_by_cdp = False
     try:
-        driver.set_window_position(*_VISIBLE_POS)
-        driver.set_window_size(1200, 900)
-    except Exception as e:
-        _log(f"[cnki] 无法移动窗口: {e}")
+        win_info = driver.execute_cdp_cmd("Browser.getWindowForTarget", {})
+        wid = win_info.get("windowId") if isinstance(win_info, dict) else None
+        if wid is not None:
+            driver.execute_cdp_cmd("Browser.setWindowBounds", {
+                "windowId": wid,
+                "bounds": {"windowState": "normal"},
+            })
+            driver.execute_cdp_cmd("Browser.setWindowBounds", {
+                "windowId": wid,
+                "bounds": {
+                    "left": _VISIBLE_POS[0],
+                    "top": _VISIBLE_POS[1],
+                    "width": 1200,
+                    "height": 900,
+                    "windowState": "normal",
+                },
+            })
+            unminimized_by_cdp = True
+    except Exception:
+        pass
+
+    try:
+        driver.execute_cdp_cmd("Page.bringToFront", {})
+    except Exception:
+        pass
+
+    if not unminimized_by_cdp:
+        try:
+            driver.set_window_position(*_VISIBLE_POS)
+            driver.set_window_size(1200, 900)
+        except Exception as e:
+            _log(f"[cnki] 无法移动窗口: {e}")
 
     try:
         driver.switch_to.window(driver.current_window_handle)
     except Exception:
         pass
 
+    try:
+        driver.execute_script("window.focus();")
+    except Exception:
+        pass
+
+    # 2. 操作系统级窗口强制置顶（突破 IDE / 终端前台焦点遮挡）
     if sys.platform == "win32":
         _win32_bring_to_front(driver)
+    elif sys.platform == "darwin":
+        _macos_bring_to_front(driver)
+    elif sys.platform.startswith("linux"):
+        _linux_bring_to_front(driver)
+
+
+def _find_scholar_browser_pid_macos() -> Optional[int]:
+    """在 macOS 上精确定位当前 Scholar Kit 浏览器主进程 PID（避免误激活用户日常打开的另一个 Chrome）。"""
+    import subprocess
+    port = str(os.environ.get("SCHOLAR_DEBUG_PORT", _DEFAULT_DEBUG_PORT))
+    prof = str(_profile_dir(create=False))
+    try:
+        out = subprocess.check_output(["ps", "-ax", "-o", "pid=,command="], text=True, timeout=3)
+    except Exception:
+        return None
+
+    for marker in (f"--remote-debugging-port={port}", f"--user-data-dir={prof}"):
+        for line in out.splitlines():
+            s = line.strip()
+            if not s or marker not in s or "--type=" in s or "chromedriver" in s or "msedgedriver" in s:
+                continue
+            parts = s.split(None, 1)
+            if parts and parts[0].isdigit():
+                return int(parts[0])
+    return None
+
+
+def _macos_bring_to_front(driver: "webdriver.Remote"):
+    """macOS 专用：通过 AppKit NSRunningApplication 按精确 PID 抢占前台焦点（无需辅助功能 TCC 授权）。"""
+    import subprocess
+    pid = _find_scholar_browser_pid_macos()
+    if pid:
+        jxa = (
+            'ObjC.import("AppKit"); '
+            f'var app = $.NSRunningApplication.runningApplicationWithProcessIdentifier({pid}); '
+            'if (app && !app.isNil()) { app.unhide; app.activateWithOptions(3); "ok"; } else { "miss"; }'
+        )
+        try:
+            r = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa], capture_output=True, text=True, timeout=4)
+            if r.returncode == 0 and "ok" in (r.stdout or ""):
+                _log(f"[cnki] macOS: 浏览器窗口已强制置顶 (pid={pid})")
+                return
+        except Exception as e:
+            _log(f"[cnki] macOS JXA 按 PID 置顶异常: {e}")
+
+    # 兜底：按浏览器应用名激活
+    caps_name = ""
+    try:
+        caps_name = str((getattr(driver, "capabilities", None) or {}).get("browserName", "")).lower()
+    except Exception:
+        pass
+    app_name = "Microsoft Edge" if "edge" in caps_name else "Google Chrome"
+    try:
+        subprocess.run(["osascript", "-e", f'tell application "{app_name}" to activate'], capture_output=True, timeout=4)
+        _log(f"[cnki] macOS: 已激活 {app_name} 到前台")
+    except Exception as e:
+        _log(f"[cnki] macOS 置顶失败: {e}，请点击程序坞中的浏览器图标完成验证")
+
+
+def _linux_bring_to_front(driver: "webdriver.Remote"):
+    """Linux 专用：优先尝试 wmctrl / xdotool 将验证窗口切到最前。"""
+    import subprocess
+    title = ""
+    try:
+        title = (driver.title or "").strip()
+    except Exception:
+        pass
+    if not title:
+        return
+    for cmd in (
+        ["wmctrl", "-a", title],
+        ["xdotool", "search", "--name", title, "windowactivate"],
+    ):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=3)
+                _log(f"[cnki] Linux: 已通过 {cmd[0]} 置顶浏览器窗口")
+                return
+            except Exception:
+                continue
 
 
 def _win32_bring_to_front(driver: "webdriver.Remote"):
-    """Windows 专用：通过 Win32 API 将浏览器窗口置顶到最前面。"""
+    """Windows 专用：通过 Win32 API 解除最小化并用 TOPMOST->NOTOPMOST 突破后台进程焦点锁置顶窗口。"""
     try:
         import ctypes
         import ctypes.wintypes as wt
 
         user32 = ctypes.windll.user32
-        page_title = driver.title
-        if not page_title:
-            return
+        page_title = (driver.title or "").strip()
 
         WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
         found_hwnd = [None]
+        fallback_hwnd = [None]
 
         def _enum_cb(hwnd, _):
-            if not user32.IsWindowVisible(hwnd):
+            if not user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
                 return True
             length = user32.GetWindowTextLengthW(hwnd)
             if length > 0:
                 buf = ctypes.create_unicode_buffer(length + 1)
                 user32.GetWindowTextW(hwnd, buf, length + 1)
-                if page_title in buf.value:
+                title_val = buf.value
+                if page_title and page_title in title_val:
                     found_hwnd[0] = hwnd
                     return False
+                if ("Chrome" in title_val or "Edge" in title_val) and any(
+                    k in title_val for k in ("知网", "安全验证", "CNKI")
+                ):
+                    fallback_hwnd[0] = hwnd
             return True
 
         user32.EnumWindows(WNDENUMPROC(_enum_cb), 0)
+        target_hwnd = found_hwnd[0] or fallback_hwnd[0]
 
-        if found_hwnd[0]:
+        if target_hwnd:
             SW_RESTORE = 9
-            user32.ShowWindow(found_hwnd[0], SW_RESTORE)
-            user32.SetForegroundWindow(found_hwnd[0])
-            _log("[cnki] Win32: 浏览器窗口已置顶")
+            HWND_TOPMOST = -1
+            HWND_NOTOPMOST = -2
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_SHOWWINDOW = 0x0040
+            user32.ShowWindow(target_hwnd, SW_RESTORE)
+            user32.SetWindowPos(target_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+            user32.SetWindowPos(target_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+            user32.BringWindowToTop(target_hwnd)
+            user32.SetForegroundWindow(target_hwnd)
+            _log("[cnki] Win32: 浏览器窗口已强制置顶")
         else:
             _log("[cnki] Win32: 未找到匹配窗口，请在任务栏查找浏览器")
     except Exception as e:

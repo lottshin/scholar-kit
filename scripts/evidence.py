@@ -422,16 +422,18 @@ def _review_gaps(papers: List[Dict[str, Any]], topic: str) -> List[Dict[str, Any
             "basis": f"当前文献库 {total} 篇中，近 3 年（>={current_year - 2}）文献仅 {len(recent_indices)} 篇，建议叠加 --year-from {current_year - 2} 补检最新进展。",
         })
 
-    # 3. 实证/实验/数据集评估线索
+    # 3. 实证/田野/质性与量化研究方法线索（兼顾理工实验与人文社科田野/文本/符号/多模态方法）
     empirical_terms = (
-        "实证", "实验", "数据集", "问卷", "调研", "访谈", "田野", "回归", "样本", "临床",
+        "实证", "实验", "数据集", "问卷", "调研", "访谈", "田野", "民族志", "扎根", "个案", "案例",
+        "多模态", "话语分析", "文本分析", "符号", "回归", "样本", "临床",
         "empirical", "experiment", "dataset", "benchmark", "survey", "trial", "cohort", "evaluation",
+        "ethnography", "case study", "multimodal", "discourse", "grounded theory",
     )
     empirical_hits = []
-    # 4. 比较/跨情境/综述与元分析线索
+    # 4. 比较/跨文化/跨情境与系统整合线索
     comparative_terms = (
-        "比较", "对比", "跨国", "跨区域", "元分析", "系统综述", "消融",
-        "comparative", "comparison", "cross-national", "meta-analysis", "systematic review", "ablation",
+        "比较", "对比", "跨国", "跨区域", "跨文化", "跨媒介", "元分析", "系统综述", "组态", "消融",
+        "comparative", "comparison", "cross-national", "cross-cultural", "meta-analysis", "systematic review", "ablation",
     )
     comparative_hits = []
     cjk_count = 0
@@ -447,22 +449,22 @@ def _review_gaps(papers: List[Dict[str, Any]], topic: str) -> List[Dict[str, Any
 
     if len(empirical_hits) <= max(1, total // 8):
         gaps.append({
-            "title": "实证数据或实验评估文献偏少",
-            "dimension": "实证/评估",
+            "title": "实证调研或深描个案文献偏少",
+            "dimension": "方法支撑",
             "matched_count": len(empirical_hits),
             "total": total,
             "evidence_indices": empirical_hits[:10],
-            "basis": f"当前文献库 {total} 篇中，明确包含实验、样本、数据集或调研线索的文献约 {len(empirical_hits)} 篇。",
+            "basis": f"当前文献库 {total} 篇中，明确包含实证、田野、多模态文本分析或实验样本线索的文献约 {len(empirical_hits)} 篇。",
         })
 
     if len(comparative_hits) <= max(1, total // 10):
         gaps.append({
-            "title": "横向比较或系统评估视角较少",
+            "title": "跨情境比较或系统整合视角较少",
             "dimension": "比较/整合",
             "matched_count": len(comparative_hits),
             "total": total,
             "evidence_indices": comparative_hits[:10],
-            "basis": f"当前文献库 {total} 篇中，涉及对比实验、跨情境比较或元分析的文献约 {len(comparative_hits)} 篇。",
+            "basis": f"当前文献库 {total} 篇中，涉及跨文化/跨情境比较、组态分析或系统综述的文献约 {len(comparative_hits)} 篇。",
         })
 
     if total >= 5 and (cjk_count == 0 or cjk_count == total):
@@ -719,7 +721,8 @@ def _auto_detail_for_review(
     if not targets:
         return {"attempted": 0, "updated": 0, "indices": []}
 
-    selected = [item["paper"] for item in targets]
+    # 传入浅拷贝，防止 batch_read_detail 原地修改字典后导致 before_had_abstract 误判为 True（修复 updated=0 失真）
+    selected = [dict(item["paper"]) for item in targets]
     enriched = batch_read_detail(papers=selected, top_n=len(selected), fulltext=False)
     enriched_map = {p.get("url", ""): p for p in enriched if isinstance(p, dict) and p.get("url")}
     updated = list(papers)
@@ -826,6 +829,14 @@ def _validation_body(markdown: str) -> str:
     return body
 
 
+# 需要强制挂引文的典型文献/经验指称提示词（若句子含此类词却未挂任何引文，属于真正的无出处指称，必须标 unsupported）
+_UNATTRIBUTED_EMPIRICAL_MARKERS = (
+    "研究表明", "研究发现", "实证表明", "实证显示", "调查显示", "数据显示", "实验表明",
+    "学者指出", "已有研究", "既有研究", "学界普遍认为", "文献表明",
+    "studies show", "research indicates", "empirical results show", "previous studies",
+)
+
+
 def _claim_sentences(
     markdown: str,
     evidence_by_index: Optional[Dict[int, Dict[str, Any]]] = None,
@@ -840,23 +851,35 @@ def _claim_sentences(
         if stripped.startswith("#"):
             section = stripped.lstrip("#").strip()
             continue
+        # 跳过摘要、关键词、Markdown 表格行与图表题注（避免结构性元数据被误判为无证据论断）
+        if stripped.startswith("|") or re.match(r"^(?:\*{0,2})(?:摘\s*要|关键词|关\s*键\s*词|Abstract|Keywords)\s*(?:\*{0,2})\s*[：:]", stripped, re.I):
+            continue
+        if re.match(r"^(?:表|图|Table|Figure|Fig\.)\s*\d", stripped, re.I):
+            continue
         if stripped.startswith("-"):
             stripped = stripped.lstrip("- ").strip()
-        # 保护西文常见缩写点（如 et al., e.g., i.e., vs.）不被误切句
+
+        para_has_citation = bool(_sentence_evidence_indices(stripped, evidence_by_index))
+        # 保护西文常见缩写点（如 et al., e.g., i.e., vs.）与小数点（如 87.6%、p<0.01）不被误切句
         protected = re.sub(
             r"\b(et\s+al|e\.g|i\.e|vs|cf|fig|eq|vol|no|pp)\.",
             lambda m: m.group(1) + "\u2024",
             stripped,
             flags=re.IGNORECASE,
         )
+        protected = re.sub(r"(?<=\d)\.(?=\d)", "\u2024", protected)
         for raw in re.split(r"(?<=[。！？.!?])\s*", protected):
             sentence = raw.replace("\u2024", ".").strip()
             if len(sentence) < 12:
                 continue
+            ev_idx = _sentence_evidence_indices(sentence, evidence_by_index)
+            needs_strict_cite = any(m in sentence.lower() for m in _UNATTRIBUTED_EMPIRICAL_MARKERS)
             claims.append({
                 "section": section,
                 "claim": sentence[:260],
-                "evidence_indices": _sentence_evidence_indices(sentence, evidence_by_index),
+                "evidence_indices": ev_idx,
+                "_para_has_citation": para_has_citation,
+                "_needs_strict_cite": needs_strict_cite,
             })
     return claims
 
@@ -898,32 +921,54 @@ def _claim_terms(claim: str) -> List[str]:
     stopwords = {
         "研究", "文献", "相关", "现有", "显示", "因此", "这一", "进行", "通过",
         "围绕", "当前", "方面", "中的", "需要", "判断", "证据", "分支", "本轮",
+        "以及", "可以", "成为", "具有", "不仅", "而且", "如果", "其中", "对于",
     }
     for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", claim.lower()):
         if token not in _GENERIC_STOPWORDS and token not in terms:
             terms.append(token)
-    for phrase in re.findall(r"[一-鿿]{2,}", claim):
-        if phrase in stopwords:
-            continue
-        for size in (6, 5, 4, 3, 2):
+    phrases = [p for p in re.findall(r"[一-鿿]{2,}", claim) if p not in stopwords]
+    # 外层按词长 (3, 2, 4) 轮询全句各分句，避免首个长分句的 5/6-gram 耗尽配额而漏掉句中/句末核心术语
+    for size in (3, 2, 4):
+        for phrase in phrases:
             if len(phrase) < size:
                 continue
-            for i in range(0, len(phrase) - size + 1):
+            step = 1 if size <= 3 else 2
+            for i in range(0, len(phrase) - size + 1, step):
                 token = phrase[i:i + size]
                 if token in stopwords:
                     continue
                 if token not in terms:
                     terms.append(token)
-                if len(terms) >= 24:
+                if len(terms) >= 96:
                     return terms
-    return terms[:24]
+    return terms[:96]
+
+
+_SIGNPOST_MARKERS = (
+    "本文", "本章", "本节", "笔者", "见表", "见图", "如下表", "如下图",
+    "研究脉络", "理论缝隙", "如下四", "如下三", "大体形成了", "呈现出以下",
+)
 
 
 def _support_for_claim(claim: Dict[str, Any], evidence_by_index: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+    clean_claim = {k: v for k, v in claim.items() if not k.startswith("_")}
     indices = claim.get("evidence_indices", [])
     if not indices:
+        # 兼容 style-audit.md：同段已有引文支撑的作者评述句、章节导引/图表引出句（如“本文首先…”“见表1”）及结语对策推论句，只要不含“研究表明/数据显示”等无出处经验指称，记为 commentary 不扣分
+        sec_name = str(claim.get("section") or "")
+        claim_txt_plain = str(claim.get("claim") or "")
+        is_synthesis_sec = any(k in sec_name for k in ("结语", "结论", "路径", "对策", "建议", "启示", "讨论"))
+        is_signpost = any(m in claim_txt_plain for m in _SIGNPOST_MARKERS)
+        if not claim.get("_needs_strict_cite") and (claim.get("_para_has_citation") or is_synthesis_sec or is_signpost):
+            return {
+                **clean_claim,
+                "support_level": "commentary",
+                "matched_indices": [],
+                "matched_terms": [],
+                "note": "章节导引、同段作者评述或路径推论句",
+            }
         return {
-            **claim,
+            **clean_claim,
             "support_level": "unsupported",
             "matched_indices": [],
             "matched_terms": [],
@@ -934,7 +979,7 @@ def _support_for_claim(claim: Dict[str, Any], evidence_by_index: Dict[int, Dict[
     retracted = [i for i in indices if i in evidence_by_index and "retracted" in evidence_by_index[i].get("flags", [])]
     if invalid or retracted:
         return {
-            **claim,
+            **clean_claim,
             "support_level": "invalid",
             "matched_indices": [],
             "matched_terms": [],
@@ -943,17 +988,24 @@ def _support_for_claim(claim: Dict[str, Any], evidence_by_index: Dict[int, Dict[
             "note": "存在越界编号或疑似撤稿文献",
         }
 
-    c_terms = _claim_terms(claim["claim"])
+    claim_txt = claim["claim"]
+    claim_is_cjk = any("\u4e00" <= c <= "\u9fff" for c in claim_txt)
+    c_terms = _claim_terms(claim_txt)
     matched_terms: List[str] = []
     matched_indices: List[int] = []
     has_abstract = False
+    has_cross_lingual_abstract = False
 
     for idx in indices:
         ev = evidence_by_index[idx]
         paper = ev["paper"]
         p_text = _paper_validation_text(paper)
-        if paper.get("abstract") or paper.get("fulltext") or paper.get("fulltext_cache"):
+        paper_has_abs = bool(paper.get("abstract") or paper.get("fulltext") or paper.get("fulltext_cache"))
+        if paper_has_abs:
             has_abstract = True
+            paper_is_cjk = any("\u4e00" <= c <= "\u9fff" for c in str(paper.get("title") or "") + str(paper.get("abstract") or ""))
+            if claim_is_cjk != paper_is_cjk:
+                has_cross_lingual_abstract = True
         hits = [t for t in c_terms if _term_in_text(t, p_text)]
         if hits:
             matched_indices.append(idx)
@@ -967,11 +1019,15 @@ def _support_for_claim(claim: Dict[str, Any], evidence_by_index: Dict[int, Dict[
         level = "strong"
     elif len(matched_terms) == 1:
         level = "medium"
+    elif has_cross_lingual_abstract:
+        # 中文正文引用已获取英文摘要的外文文献时，跨语种字面词块不重合属正常现象，避免误判 weak
+        level = "medium"
+        matched_indices = list(indices)
     else:
         level = "weak"
 
     return {
-        **claim,
+        **clean_claim,
         "support_level": level,
         "matched_indices": matched_indices,
         "matched_terms": matched_terms[:8],
@@ -1025,6 +1081,7 @@ def _validate_writing(
     if unused_usable:
         issues.append({
             "type": "unused_relevant_evidence",
+            "count": len(unused_usable),
             "indices": unused_usable[:12],
             "message": "部分高相关证据未进入正文论证，可按需补充",
         })
@@ -1299,14 +1356,35 @@ def _dedupe_library_papers(papers: List[Dict[str, Any]]) -> tuple[List[Dict[str,
         cid = str(p.get("cnki_id") or "").upper().strip()
         doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", str(p.get("doi") or "").lower().strip())
         raw_t = str(p.get("title") or "").lower().strip()
-        if any("\u4e00" <= c <= "\u9fff" for c in raw_t):
+        is_cjk_t = any("\u4e00" <= c <= "\u9fff" for c in raw_t)
+        if is_cjk_t:
             norm_title = re.sub(r"\W+", "", raw_t)
         else:
             norm_title = re.sub(r"[^\w\s]", "", re.sub(r"\s+", " ", raw_t)).strip()
 
+        # 双语同篇去重键：若中英文双语同篇（如中文期刊同时被 OpenAlex 收录英文题录），第一作者姓名汉字相同 + 第二作者汉字相同 + 同年
+        au_list = _split_authors(p.get("authors"))
+        cjk_authors_sig = "|".join(
+            "".join(sorted(c for c in a if "\u4e00" <= c <= "\u9fff"))
+            for a in au_list[:2]
+            if any("\u4e00" <= c <= "\u9fff" for c in a)
+        )
+        yr_str = str(_paper_year(p) or "")
+        bilingual_key = f"bi_au:{cjk_authors_sig}:{yr_str}" if (len(cjk_authors_sig) >= 4 and yr_str) else ""
+
         hit_idx = None
-        for k in (f"cid:{cid}" if cid else "", f"doi:{doi}" if doi else "", f"title:{norm_title}" if norm_title else ""):
+        for k in (
+            f"cid:{cid}" if cid else "",
+            f"doi:{doi}" if doi else "",
+            f"title:{norm_title}" if norm_title else "",
+            bilingual_key,
+        ):
             if k and k in index_by_key:
+                # bilingual_key 仅在一中一英时触发合并，避免同作者同年发表的两篇不同中文论文被误合并！
+                if k == bilingual_key:
+                    prev_is_cjk = any("\u4e00" <= c <= "\u9fff" for c in str(merged_list[index_by_key[k]].get("title") or ""))
+                    if prev_is_cjk == is_cjk_t:
+                        continue
                 hit_idx = index_by_key[k]
                 break
 
@@ -1330,7 +1408,12 @@ def _dedupe_library_papers(papers: List[Dict[str, Any]]) -> tuple[List[Dict[str,
         else:
             new_idx = len(merged_list)
             merged_list.append(dict(p))
-            for k in (f"cid:{cid}" if cid else "", f"doi:{doi}" if doi else "", f"title:{norm_title}" if norm_title else ""):
+            for k in (
+                f"cid:{cid}" if cid else "",
+                f"doi:{doi}" if doi else "",
+                f"title:{norm_title}" if norm_title else "",
+                bilingual_key,
+            ):
                 if k:
                     index_by_key[k] = new_idx
 

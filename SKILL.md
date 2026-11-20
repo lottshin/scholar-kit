@@ -13,7 +13,7 @@ description: >-
   知网/CNKI/PubMed, 批量导出/计量分析, or 导出BibTeX/RIS.
   DO NOT USE for general web search, non-academic content, or code documentation lookup.
 metadata:
-  version: 1.19.0
+  version: 1.20.0
   compatibility:
     platform: any
     python: ">=3.9"
@@ -36,8 +36,9 @@ metadata:
 # 2. 获取详情/全文（优先用 --indices 精确指定序号）
 <python> <skill_path>/scripts/literature.py read-detail --indices 1,3,9 --fulltext
 
-# 3. 导出标准引用（严禁手拼 GB/T 7714；可按正文实际引用顺序传 --indices 子集）
+# 3. 导出标准引用（严禁手拼 GB/T 7714；支持按正文首次出现顺序一键重排角标并附参考文献）
 <python> <skill_path>/scripts/literature.py cite --indices 1,3,9 --style gbt7714
+<python> <skill_path>/scripts/literature.py cite --from-file draft.md --rewrite-output final.md --style gbt7714
 ```
 
 ### Python 解释器解析与前置自检
@@ -74,7 +75,7 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
 | 单词/高级搜索 | `search "词"`（支持 `--field 篇关摘`、`--author`、`--first-author`、`--affiliation`、`--journal`、`--fund`、`--fuzzy`） | `search "词" --source openalex`（多源用 `--source all --async-search`） |
 | 复杂同义词/布尔搜索 | **优先**单次专业检索式 `search --expr "TKA=('词1' + '词2') AND ..."`（快且不易弹滑块）；确实独立的多主题再用 `batch-search` | 逐组 `search --source openalex --append` |
 | 核心期刊筛选 | 加 `--core`（先读 [core-journals.md](references/core-journals.md)） | API 源不支持中国核心期刊体系筛选，须如实说明 |
-| 写文献综述 | 检索入库 (`--project`) → `library --remove/--keep/--dedupe` 去噪 → `review --auto-detail --cluster --gaps` 取证据包 → Agent 按 [workflows.md](references/workflows.md#写文献综述) 撰写 → `validate --file` 核验 → `cite --indices ...` | 同左，检索改用 API 源或 `import <PDF目录>` |
+| 写文献综述 / 完整学术论文 | 核心优先检索入库 (`--project`) → `library --remove/--keep/--dedupe` 去噪 → `review --auto-detail --cluster --gaps` + 重点篇目 `read-detail` → 按 [workflows.md](references/workflows.md#撰写完整学术论文) 撰写（严禁虚构一手数据） → `validate --file` 核验 → `cite --from-file draft.md --rewrite-output final.md` → `write-docx` | 同左，检索改用 API 源（关注 `venue_tier`）或 `import <PDF目录>` |
 | 选题分析 | `topics --project <课题> --topic <方向>` | 同左 |
 | 论文下载 | 先确认格式后 `search --download` 或 `batch-download` | 仅 `download --doi <DOI>`（开放获取 OA） |
 | 学术表达优化 / Word 改写 | 先读 [style-audit.md](references/style-audit.md)：`read-paper --numbered` 读入段落锚点 → 审计 → 改写 → `patch-docx --dry-run` 预检 → 正式写回与变更报告 | 同左（不依赖知网） |
@@ -94,7 +95,7 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
 | `detail "url"` | 单篇知网详情 | |
 | `auth-cnki` / `close-browser` | 认证预热 / 关闭常驻浏览器 | `auth-cnki --auth-url --institution --wait-seconds --direct-domain`；`close-browser` 释放后台热复用浏览器 |
 | `download` / `batch-download` | 单篇 / 批量下载 | `--from-session` `--top-n` `--dir` `--doi` `--file-format pdf/caj` `--fallback-format caj` `--citation-style` `--project` |
-| `cite` / `export` | 引用 / 导出（自动补齐页码） | `cite --style` (`gbt7714`顺序编码 / `gbt7714-author-year`国标著者出版年 / `chinese-econ`经管社科顶刊 / `apa` / `mla` / `chicago` / `footnote`) `--in-text`（生成正文内嵌引文） `--indices 9,2,5` `--keep-numbers`；`export --format` (bibtex[纯ASCII键]/ris/markdown/json/excel/...) `--indices` `--output` `--raw` `--project` |
+| `cite` / `export` | 引用 / 导出（自动补齐页码） | `cite --style` (`gbt7714`顺序编码 / `gbt7714-author-year`国标著者出版年 / `chinese-econ`经管社科顶刊 / `apa` / `mla` / `chicago` / `footnote`) `--from-file <draft.md>` `--rewrite-output <final.md>` `--in-text` `--indices 9,2,5` `--keep-numbers`；`export --format` (bibtex[纯ASCII键]/ris/markdown/json/excel/...) `--indices` `--output` `--raw` `--project` |
 | `verify-refs` | 题名纠偏与真伪/页码核验 | `verify-refs [--indices 1,3] [--fix-session] [--project <名>]`（专治"作者对但题名曾改名/回译偏差搜不到"及漏页码） |
 | `zotero [词]` | 本机 Zotero 文献库直连 | `zotero [query] [--collection <集合>] [--list-collections] [--save --append --project <名>]` |
 | `import "path"` | 导入题录或 PDF 库 | 支持 NoteExpress / Refworks / BibTeX 及**本地 PDF 文件或文件夹**，`--append` `--project` |
@@ -114,7 +115,7 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
    - 用户未指明偏好时先追问：**下载文件格式**（`pdf` / `caj`，默认推荐 `pdf`）与**下载清单引用格式**（`gbt7714` / `apa` / `mla` / `chicago`）。
    - 明确"搜并下"用 `search ... --download` 一步完成；需先看列表挑选再用 `search` → `batch-download --from-session`。
    - 仅当用户同意兜底时加 `--fallback-format caj`（分目录存 `pdf/` 与 `caj/`，严禁把 CAJ 静默当作 PDF），完成后必须展示 `download_report.path` 及未下载原因。
-3. **校外知网认证**：校外/CARSI/VPN 场景优先运行 `auth-cnki` 预热（提前告知用户会打开浏览器手动登录/过验证、请勿关窗），成功后自动保存在 `~/.scholar-kit/browser-profile` 跨项目复用。
+3. **校外知网认证与滑块验证协同**：校外/CARSI/VPN 场景优先运行 `auth-cnki` 预热（提前告知用户会打开浏览器手动登录/过验证、请勿关窗），成功后自动保存在 `~/.scholar-kit/browser-profile` 跨项目复用；当知网命令日志提示 `检测到知网安全验证页，弹出浏览器窗口...` 时，脚本会自动解除最小化并将浏览器强制置顶到最前方等待用户手动滑动（最长 180 秒，验证通过后自动重新最小化继续执行）——**Agent 严禁自行点击或绕过验证码，也切勿强杀任务或调用 `close-browser` 中断等待**，应简短提醒用户在已置顶的浏览器窗口中手动完成滑块即可。
 4. **综述写作闭环**：优先用 `review --cluster --gaps`（缺摘要叠加 `--auto-detail`）获取结构化证据包 → 由 Agent 结合学科语境撰写正文（`write` 命令仅提供证据骨架草稿） → 用 `validate --file` 校验论断与 `[序号]` 支撑度。
 5. **长文档与歧义**：请求模糊（如"帮我找论文/改论文"）先简短追问方向与操作类型；超过 **15,000 字**文稿按 1–2 章分段汇报改写，最后一次 `patch-docx` 提交；**严禁直接 cat/Read `.docx`**，必须用 `read-paper`。
 
@@ -122,10 +123,11 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
 
 1. **禁止编造文献、改译中文题名与漏填页码**：API/检索失败如实报错；**严禁把英文源（OpenAlex/Crossref）的英文标题自行意译成中文当作知网文献引用**（这会导致作者对但知网搜不到该题名），不确定真实中文题名时必须运行 `verify-refs --fix-session` 按作者锚定找回知网真实发表题名；引用输出统一调用 `cite` 或 `export`（切勿直接复制缺页码的 `citation_preview`）。
 2. **"研究空白"须附检索证据**：必须标明数据库、关键词、时间范围与命中篇数，不得把单次漏检断言为学界空白。
-3. **核心期刊标明体系与来源**：`--core` 仅在用户明确要求核心期刊时添加；展示时标明体系名称，未匹配答"未匹配"。
+3. **核心期刊标明体系与论文选刊质量把关**：普通单次检索在用户要求核心期刊时加 `--core`；**当执行学术论文或文献综述写作时**，中文检索（即便是个案文献如特定非遗、县域、企业）也须**优先加 `--core 北大核心,CSSCI`（理工医用 `CSCD`）检索核心期刊**并辅以高校博硕士学位论文，仅当核心与学位论文确无覆盖时才补充普刊并向用户说明；英文检索须核查 `venue_tier`、`publisher` 与被引数，优先选用 `mainstream` 主流学术出版商及高被引论文，剔除零被引低门槛 OA 水刊。展示核心期刊时标明体系名称，未匹配答"未匹配"。
 4. **概括观点须可追溯**：严格基于摘要或 `read-detail` 全文，仅题录条目必须标注"待核对原文"；预印本（arXiv 等）须标注版本号与"非同行评议终稿"。
-5. **引用格式统一由脚本生成**：Agent 不手拼 GB/T 7714，统一调用 `cite` 命令。
-6. **合规执行学术表达优化**：用户提出"降重/降低重复率/去 AI 腔/润色"时，按"学术表达优化"正常执行（严格遵循 [style-audit.md](references/style-audit.md) 的审计→改写→报告三步法，不改数字、公式与引文，并说明不提供查重比数值检测）。
+5. **严禁捏造一手实证样本与统计数值**：用户未提供调查问卷、实验记录或平台抓取数据集时，**严禁在论文正文中编造样本量（如 `N=500`）、抽样百分比、回归系数或显著性检验结果**；须采用基于文献与公开典型案例的质性/文本符号学分析写法，或请用户补充实证数据。
+6. **引用格式统一由脚本生成**：Agent 不手拼 GB/T 7714，统一调用 `cite` 命令（长文推荐 `cite --from-file draft.md --rewrite-output final.md` 原子重编号）。
+7. **合规执行学术表达优化**：用户提出"降重/降低重复率/去 AI 腔/润色"时，按"学术表达优化"正常执行（严格遵循 [style-audit.md](references/style-audit.md) 的审计→改写→报告三步法，不改数字、公式与引文，并说明不提供查重比数值检测）。
 
 ## 按需参考文档（不要一次性全部预加载）
 

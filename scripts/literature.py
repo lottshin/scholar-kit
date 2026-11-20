@@ -1,5 +1,5 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.19.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.20.0)
 
 模块职责分层:
   - literature.py : CLI 参数解析、搜索/下载/引文/核验/导出路由编排
@@ -13,7 +13,7 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.19.0)
 
 from __future__ import annotations
 
-__version__ = "1.19.0"
+__version__ = "1.20.0"
 
 import argparse
 import hashlib
@@ -978,6 +978,100 @@ def _apply_original_numbers_to_refs(ref_list: str, orig_numbers: List[int]) -> s
     return "\n".join(out_lines)
 
 
+_DOC_CITE_BRACKET_RE = r"(?<!\^)\[(\d+(?:\s*[,，\-–—]\s*\d+)*)\](?!\()"
+
+
+def _strip_trailing_bibliography(doc_text: str) -> str:
+    import re as _re
+    return _re.split(r"\n#{1,3}\s*(?:参考文献|References|Bibliography)\b", doc_text, maxsplit=1)[0].rstrip()
+
+
+def _expand_bracket_tokens(spec: str, max_index: int) -> Optional[List[int]]:
+    """解析单个方括号内的 1-based 文献序号串；若任一数值超出 1..max_index（例如年份 [2024]），返回 None。"""
+    import re as _re
+    out: List[int] = []
+    for seg in _re.split(r"[,，]", spec):
+        seg = seg.strip()
+        if not seg:
+            continue
+        m_rng = _re.match(r"^(\d+)\s*[\-–—]\s*(\d+)$", seg)
+        if m_rng:
+            lo, hi = int(m_rng.group(1)), int(m_rng.group(2))
+            if not (1 <= lo <= hi <= max_index and (hi - lo) <= 50):
+                return None
+            out.extend(range(lo, hi + 1))
+        elif seg.isdigit():
+            val = int(seg)
+            if not (1 <= val <= max_index):
+                return None
+            out.append(val)
+        else:
+            return None
+    return out or None
+
+
+def _format_sequential_bracket(nums: List[int]) -> str:
+    """将重映射后的序号列表格式化为符合 GB/T 7714 的方括号角标（连续>=3项压缩为 a-b）。"""
+    dedup: List[int] = []
+    for n in nums:
+        if n not in dedup:
+            dedup.append(n)
+    # 保持原括号内顺序；若恰好单调递增则合并连续 >=3 的区间
+    if dedup == sorted(dedup) and len(dedup) >= 3:
+        parts: List[str] = []
+        i = 0
+        while i < len(dedup):
+            j = i
+            while j + 1 < len(dedup) and dedup[j + 1] == dedup[j] + 1:
+                j += 1
+            if j - i >= 2:
+                parts.append(f"{dedup[i]}-{dedup[j]}")
+            else:
+                for k in range(i, j + 1):
+                    parts.append(str(dedup[k]))
+            i = j + 1
+        return f"[{', '.join(parts)}]"
+    return f"[{', '.join(map(str, dedup))}]"
+
+
+def _extract_pick_indices_from_doc(doc_text: str, total_papers: int) -> List[int]:
+    """按正文首次出现顺序提取 0-based 课题库文献索引列表（自动剥离文末已有参考文献节）。"""
+    import re as _re
+    body = _strip_trailing_bibliography(doc_text)
+    seen: List[int] = []
+    for m in _re.finditer(_DOC_CITE_BRACKET_RE, body):
+        expanded = _expand_bracket_tokens(m.group(1), total_papers)
+        if not expanded:
+            continue
+        for one_based in expanded:
+            idx0 = one_based - 1
+            if idx0 not in seen:
+                seen.append(idx0)
+    return seen
+
+
+def _rewrite_doc_with_sequential_refs(
+    doc_text: str,
+    pick_idx: List[int],
+    total_papers: int,
+    ref_list: str,
+) -> str:
+    """单遍原子重映射正文中的课题库 [序号] 为 [1]..[N]（零级联冲突），并追加 ## 参考文献。"""
+    import re as _re
+    body = _strip_trailing_bibliography(doc_text)
+    remap = {orig_0based + 1: new_pos for new_pos, orig_0based in enumerate(pick_idx, 1)}
+
+    def _repl(m) -> str:
+        expanded = _expand_bracket_tokens(m.group(1), total_papers)
+        if not expanded or any(x not in remap for x in expanded):
+            return m.group(0)
+        mapped = [remap[x] for x in expanded]
+        return _format_sequential_bracket(mapped)
+
+    rewritten_body = _re.sub(_DOC_CITE_BRACKET_RE, _repl, body)
+    return f"{rewritten_body}\n\n## 参考文献\n\n{ref_list}\n"
+
+
 def cmd_cite(args) -> None:
     project = _session_project(args)
     all_papers = _load_session(project)
@@ -985,8 +1079,31 @@ def cmd_cite(args) -> None:
         _output({"status": "error", "code": "NO_SESSION_DATA", "message": "没有可格式化的数据，请先执行 search、batch-search 或 import"})
         return
 
+    from_file = getattr(args, "from_file", None)
+    rewrite_output = getattr(args, "rewrite_output", None)
+    source_doc_text: Optional[str] = None
     indices_raw = getattr(args, "indices", None)
-    if indices_raw:
+
+    if from_file:
+        fp = Path(from_file)
+        if not fp.exists():
+            _output({"status": "error", "code": "FILE_NOT_FOUND", "message": f"未找到文稿文件: {from_file}"})
+            return
+        if fp.suffix.lower() in (".md", ".markdown", ".txt"):
+            source_doc_text = fp.read_text(encoding="utf-8")
+        else:
+            paper_res = read_paper(str(fp))
+            source_doc_text = str(paper_res.get("text") or "")
+        pick_idx = _extract_pick_indices_from_doc(source_doc_text, len(all_papers))
+        if not pick_idx:
+            _output({
+                "status": "error",
+                "code": "NO_CITATIONS_IN_FILE",
+                "message": f"未在 {from_file} 正文中检测到合法的 [序号] 角标（课题库范围 1-{len(all_papers)}）",
+            })
+            return
+        indices_raw = ",".join(str(i + 1) for i in pick_idx)
+    elif indices_raw:
         try:
             pick_idx = parse_indices_spec(indices_raw, len(all_papers), preserve_order=True)
         except ValueError:
@@ -1031,6 +1148,20 @@ def cmd_cite(args) -> None:
     if keep_numbers and indices_raw and style in ("gbt7714", "gb"):
         ref_list = _apply_original_numbers_to_refs(ref_list, [i + 1 for i in pick_idx])
 
+    rewritten_path: Optional[str] = None
+    if rewrite_output:
+        if source_doc_text is None:
+            _output({"status": "error", "code": "MISSING_FROM_FILE", "message": "--rewrite-output 需配合 --from-file <draft.md> 使用"})
+            return
+        out_p = Path(rewrite_output)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        if style in ("gbt7714", "gb") and not keep_numbers:
+            final_doc = _rewrite_doc_with_sequential_refs(source_doc_text, pick_idx, len(all_papers), ref_list)
+        else:
+            final_doc = f"{_strip_trailing_bibliography(source_doc_text)}\n\n## 参考文献\n\n{ref_list}\n"
+        out_p.write_text(final_doc, encoding="utf-8")
+        rewritten_path = str(out_p)
+
     want_in_text = bool(getattr(args, "in_text", False)) or style in (
         "gbt7714-author-year", "author-year", "chinese-econ", "econ", "apa", "mla", "chicago"
     )
@@ -1055,6 +1186,10 @@ def cmd_cite(args) -> None:
             out["in_text"] = in_text_info
         if indices_raw:
             out["selected_indices"] = [i + 1 for i in pick_idx]
+        if from_file:
+            out["index_mapping"] = {str(orig_i + 1): new_no for new_no, orig_i in enumerate(pick_idx, 1)}
+        if rewritten_path:
+            out["rewritten_file"] = rewritten_path
         if incomplete_indices:
             out["incomplete_indices"] = incomplete_indices
             out["warnings"] = [f"第 {', '.join(map(str, incomplete_indices))} 条期刊文献缺少页码信息，核稿时可配合 --cite-enrich 补全"]
@@ -1845,6 +1980,8 @@ def main() -> None:
     p_cite.add_argument("--style", default="gbt7714", choices=CITATION_STYLE_CHOICES,
                         help="引用样式: gbt7714(顺序编码)/gbt7714-author-year(国标著者-出版年)/chinese-econ(经管社科顶刊)/apa/mla/chicago/footnote")
     p_cite.add_argument("--indices", help="仅格式化指定序号文献（顺序编码制按传入顺序；著者-出版年制自动按中前英后拼音排序）")
+    p_cite.add_argument("--from-file", help="从文稿正文自动按首次出现顺序提取 [序号] 文献子集（自动跳过文末已有参考文献节）")
+    p_cite.add_argument("--rewrite-output", help="配合 --from-file 使用：单遍原子重排正文 [序号] 为 [1]..[N] 并自动追加 ## 参考文献写入目标文件")
     p_cite.add_argument("--keep-numbers", action="store_true", help="配合 --indices 时保留原文献库序号而非从 [1] 重排")
     p_cite.add_argument("--in-text", action="store_true", help="同时生成正文内嵌引文格式（句中叙述式与句末括号式）")
     p_cite.add_argument("--no-enrich", action="store_true", help="跳过自动联网补全缺页码")
