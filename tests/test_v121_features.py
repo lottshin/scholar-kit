@@ -567,3 +567,165 @@ def test_open_cnki_reading_tab_bypasses_popup_blocker_with_referrer(monkeypatch)
             },
         )
     ]
+
+
+def test_refworks_export_page_range_no_duplicate_sp():
+    from cnki.download import _parse_refworks_export
+
+    raw = (
+        "RT Journal Article\n"
+        "T1 数字经济与高质量发展\n"
+        "A1 赵涛\n"
+        "JF 管理世界\n"
+        "YR 2020\n"
+        "VO 36\n"
+        "IS 10\n"
+        "SP 65\n"
+        "OP 65-76\n"
+        "AB 第一行摘要内容\n"
+        "续行摘要内容\n"
+        "K1 数字经济;高质量发展\n"
+        "ER\n"
+        "RT Journal Article\n"
+        "T1 第二篇测试论文\n"
+        "SP 10\n"
+        "EP 22\n"
+        "ER\n"
+    )
+    items = _parse_refworks_export(raw)
+    assert len(items) == 2
+    assert items[0]["pages"] == "65-76"
+    assert items[0]["abstract"] == "第一行摘要内容 续行摘要内容"
+    assert items[1]["pages"] == "10-22"
+
+
+def test_auth_cnki_no_false_positive_on_header_buttons_and_detects_personal_login():
+    from cnki import driver as drv_mod
+
+    class _UnauthHeaderDrv:
+        current_url = "https://kns.cnki.net/"
+        title = "中国知网"
+
+        def execute_script(self, script):
+            if "innerText" in script and "document.body" in script:
+                return "总库 检索 登录 个人登录 机构登录 IP登录 注册"
+            return ""
+
+        def get_cookies(self):
+            return [{"name": "Ecp_ClientId", "value": "abc"}]
+
+    unauth = _UnauthHeaderDrv()
+    assert drv_mod._has_cnki_institution_access(unauth) is False
+    assert drv_mod._has_cnki_personal_login(unauth) is False
+    assert drv_mod._has_cnki_any_access(unauth) is False
+
+    class _PersonalLoggedDrv(_UnauthHeaderDrv):
+        def get_cookies(self):
+            return [{"name": "Ecp_LoginStuts", "value": '{"IsAutoLogin":true,"UserName":"u123","ShowName":"张同学"}'}]
+
+    personal = _PersonalLoggedDrv()
+    assert drv_mod._has_cnki_personal_login(personal) is True
+    assert drv_mod._has_cnki_any_access(personal, institution=None) is True
+    # 若显式要求特定高校机构认证，个人登录不应冒充该机构
+    assert drv_mod._has_cnki_any_access(personal, institution="北京大学") is False
+
+
+def test_download_self_heals_expired_kcms2_url_and_open_download_tab(monkeypatch):
+    from cnki import detail as det_mod, download as dl_mod, search as s_mod
+
+    navigated = []
+    monkeypatch.setattr(det_mod, "_is_cnki_error_or_404", lambda d: True)
+    monkeypatch.setattr(s_mod, "refresh_cnki_url", lambda d, **kw: "https://kns.cnki.net/kcms2/article/abstract?v=fresh999")
+    monkeypatch.setattr(dl_mod, "_navigate_within_cnki", lambda d, u, **kw: navigated.append(u))
+    monkeypatch.setattr(dl_mod, "_handle_captcha", lambda d: d)
+
+    hint = {"title": "数字经济与高质量发展", "journal": "管理世界", "url": "https://kns.cnki.net/kcms2/article/abstract?v=expired"}
+    healed = dl_mod._heal_expired_download_url(object(), hint["url"], hint)
+    assert healed.endswith("fresh999")
+    assert hint["url"].endswith("fresh999")
+    assert navigated == ["https://kns.cnki.net/kcms2/article/abstract?v=fresh999"]
+
+
+def test_thesis_frontmatter_toc_and_partial_cache_guard(monkeypatch):
+    from cnki import detail as det_mod
+    from sections import extract_frontmatter_toc
+
+    frontmatter = (
+        "[第 4 页]\n"
+        "目 录\n"
+        "第一章 绪论 .................... 1\n"
+        "1.1 研究背景与意义 ............. 2\n"
+        "1.2 文献综述 ................... 8\n"
+        "第二章 理论基础与研究假说 ...... 21\n"
+        "2.1 核心概念界定 ............... 22\n"
+        "第三章 研究设计与实证检验 ...... 45\n"
+        "第四章 研究结论与政策建议 ...... 98\n"
+    )
+    fm_toc = extract_frontmatter_toc(frontmatter)
+    assert len(fm_toc) == 7
+    assert fm_toc[0]["level"] == 1 and fm_toc[0]["page"] == 1
+    assert fm_toc[1]["level"] == 2 and fm_toc[1]["page"] == 2
+    assert fm_toc[-1]["page"] == 98
+
+    # 验证详情页已提取到原生分章目录时，toc_only=True 零标签页直接完成，绝不打开 HTML/FlowPDF
+    opened_tabs = []
+    saved_caches = []
+
+    class _DummyDrv:
+        current_url = "https://kns.cnki.net/kns8s/AdvSearch"
+        _scholar_was_warm = True
+
+    monkeypatch.setattr(det_mod, "_detect_browser", lambda: "chrome")
+    monkeypatch.setattr(det_mod, "_create_driver", lambda browser=None: _DummyDrv())
+    monkeypatch.setattr(det_mod, "_prepare_cnki_session", lambda d: None)
+    monkeypatch.setattr(det_mod, "_save_cookies", lambda d: None)
+    monkeypatch.setattr(det_mod, "_navigate_within_cnki", lambda d, u, **k: None)
+    monkeypatch.setattr(det_mod, "_handle_captcha", lambda d: d)
+    monkeypatch.setattr(det_mod, "_is_cnki_error_or_404", lambda d: False)
+    monkeypatch.setattr(
+        det_mod,
+        "_parse_detail_page",
+        lambda d: {
+            "abstract": "博士论文摘要",
+            "native_toc": [
+                {"id": "S1", "index": 1, "level": 1, "title": "第一章 绪论", "page": 1},
+                {"id": "S2", "index": 2, "level": 1, "title": "第二章 实证分析", "page": 35},
+                {"id": "S3", "index": 3, "level": 1, "title": "第三章 结论", "page": 88},
+            ],
+        },
+    )
+    monkeypatch.setattr(det_mod, "_load_cached_fulltext", lambda *a, **k: None)
+    monkeypatch.setattr(det_mod, "_read_fulltext_html", lambda *a, **k: opened_tabs.append("html"))
+    monkeypatch.setattr(det_mod, "_read_fulltext_flowpdf", lambda *a, **k: opened_tabs.append("flowpdf"))
+    monkeypatch.setattr(det_mod, "_save_cached_fulltext", lambda *a, **k: saved_caches.append(1))
+    monkeypatch.setattr(det_mod, "_release_driver", lambda d: None)
+
+    papers = [{"title": "测试博士论文", "source": "CNKI", "url": "https://kns.cnki.net/kcms2/article/abstract?v=phd1"}]
+    det_mod.batch_read_detail(papers, top_n=1, fulltext=True, toc_only=True)
+    assert opened_tabs == []
+    assert saved_caches == []
+    assert len(papers[0]["native_toc"]) == 3
+
+
+def test_shared_browser_file_lock_serializes_and_respects_busy_on_reaper(tmp_path, monkeypatch):
+    import config
+    from cnki import driver as drv_mod
+
+    monkeypatch.setenv("SCHOLAR_HOME", str(tmp_path / "home"))
+    config.reset()
+    try:
+        fh1 = drv_mod._acquire_browser_lock(19333, timeout=1.0)
+        assert fh1 not in (None, False)
+        # 非阻塞二次获取应立即返回 False（证明互斥锁生效）
+        fh2 = drv_mod._acquire_browser_lock(19333, timeout=0.0)
+        assert fh2 is False
+        # 空闲回收器在锁被占用时必须返回 busy 跳过，绝不强关正在工作的浏览器
+        busy_res = drv_mod.close_shared_browser(19333, respect_lock=True)
+        assert busy_res["closed"] is False
+        assert busy_res.get("reason") == "busy"
+        drv_mod._release_browser_lock(fh1)
+        fh3 = drv_mod._acquire_browser_lock(19333, timeout=0.5)
+        assert fh3 not in (None, False)
+        drv_mod._release_browser_lock(fh3)
+    finally:
+        config.reset()

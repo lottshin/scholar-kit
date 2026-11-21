@@ -174,7 +174,7 @@ scholar-kit/
 │   ├── workflows.py          ← 标准化流水线模板
 │   ├── smoke_upstream.py     ← 外部学术 API 每周线上契约巡检探针
 │   └── cnki/                 ← 知网自动化模块（双引擎检索/详情/防风控下载/DOM 契约探针）
-└── tests/                    ← pytest 自动化回归测试套件（90 项用例）
+└── tests/                    ← pytest 自动化回归测试套件（95 项用例）
 ```
 
 </details>

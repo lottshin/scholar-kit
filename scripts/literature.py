@@ -85,7 +85,7 @@ from evidence import (  # noqa: E402
     parse_indices_spec,
 )
 from formatter import citation_preview, export_papers, generate_in_text_citations, generate_reference_list  # noqa: E402
-from sections import parse_fulltext_sections, public_toc, slice_fulltext_sections  # noqa: E402
+from sections import extract_frontmatter_toc, parse_fulltext_sections, public_toc, slice_fulltext_sections  # noqa: E402
 from search import (  # noqa: E402
     analyze_trends,
     calculate_quality_score,
@@ -273,13 +273,16 @@ def cmd_search(args) -> None:
         else:
             keep = want_download and source == "cnki"
             bulk_abs = getattr(args, "bulk_abstract", False)
+            no_bulk_abs = getattr(args, "no_bulk_abstract", False)
             req_per_page = getattr(args, "per_page", None)
             if req_per_page is None and ((args.limit and args.limit > 20) or bulk_abs):
                 req_per_page = 50
             cnki_kw: Dict[str, Any] = {}
             if req_per_page is not None:
                 cnki_kw["per_page"] = req_per_page
-            if bulk_abs:
+            if no_bulk_abs:
+                cnki_kw["bulk_abstract"] = False
+            elif bulk_abs:
                 cnki_kw["bulk_abstract"] = True
             cnki_core_only = None
             if args.core:
@@ -538,12 +541,22 @@ def cmd_search(args) -> None:
             dl_urls = [p.get("url") for p in dl_papers if isinstance(p, dict) and p.get("url")]
             if dl_urls:
                 dl_format = getattr(args, "download_file_format", "pdf") or "pdf"
-                dl_result = batch_download_cnki(
-                    dl_urls,
-                    save_dir=dl_dir,
-                    file_format=dl_format,
-                    _driver=reuse_driver,
-                )
+                dl_hints = _paper_lookup_by_url(dl_papers)
+                try:
+                    dl_result = batch_download_cnki(
+                        dl_urls,
+                        save_dir=dl_dir,
+                        file_format=dl_format,
+                        _driver=reuse_driver,
+                        paper_hints=dl_hints,
+                    )
+                except TypeError:
+                    dl_result = batch_download_cnki(
+                        dl_urls,
+                        save_dir=dl_dir,
+                        file_format=dl_format,
+                        _driver=reuse_driver,
+                    )
                 fallback_format = getattr(args, "download_fallback_format", None)
                 if fallback_format:
                     failed_urls = [
@@ -628,6 +641,7 @@ def cmd_batch_search(args) -> None:
         year_to=args.year_to,
         sort=args.sort or "relevance",
         pages=args.pages or 1,
+        bulk_abstract=not getattr(args, "no_bulk_abstract", False),
     )
 
     if result.get("status") in ("success", "partial") and result.get("results"):
@@ -688,7 +702,15 @@ def cmd_download(args) -> None:
         return
 
     if target and "cnki.net" in target:
-        _output(download_cnki(target, save_dir=save_dir, file_format=args.file_format or "pdf"))
+        sess_papers = _load_session(getattr(args, "project", None))
+        matched_p = next((p for p in sess_papers if isinstance(p, dict) and p.get("url") == target), {})
+        _output(download_cnki(
+            target,
+            save_dir=save_dir,
+            file_format=args.file_format or "pdf",
+            expected_title=matched_p.get("title", ""),
+            expected_journal=matched_p.get("journal", ""),
+        ))
     elif target:
         _output({"status": "error", "code": "UNSUPPORTED_URL", "message": "目前仅支持知网 URL 直接下载"})
     else:
@@ -871,7 +893,16 @@ def cmd_batch_download(args) -> None:
         return
 
     save_dir = args.dir if args.dir != "./papers" else cfg_get("save_dir", "./papers")
-    result = batch_download_cnki(urls=urls, save_dir=save_dir, file_format=args.file_format or "pdf")
+    hints = _paper_lookup_by_url(session_data or _load_session(_session_project(args)))
+    try:
+        result = batch_download_cnki(
+            urls=urls,
+            save_dir=save_dir,
+            file_format=args.file_format or "pdf",
+            paper_hints=hints,
+        )
+    except TypeError:
+        result = batch_download_cnki(urls=urls, save_dir=save_dir, file_format=args.file_format or "pdf")
     fallback_format = getattr(args, "fallback_format", None)
     if fallback_format:
         failed_urls = [
@@ -1389,7 +1420,20 @@ def cmd_read_detail(args) -> None:
         return
 
     if cnki_selected:
-        batch_read_detail(papers=cnki_selected, top_n=len(cnki_selected), fulltext=do_fulltext)
+        extra_rd_kw: Dict[str, Any] = {}
+        if toc_only and not section_spec:
+            extra_rd_kw["toc_only"] = True
+        if max_chars and not section_spec:
+            extra_rd_kw["max_chars"] = max_chars
+        try:
+            batch_read_detail(
+                papers=cnki_selected,
+                top_n=len(cnki_selected),
+                fulltext=do_fulltext,
+                **extra_rd_kw,
+            )
+        except TypeError:
+            batch_read_detail(papers=cnki_selected, top_n=len(cnki_selected), fulltext=do_fulltext)
 
     if local_pdf_selected and do_fulltext:
         for lp in local_pdf_selected:
@@ -1437,6 +1481,10 @@ def cmd_read_detail(args) -> None:
         if do_fulltext and ft_content:
             parsed_secs = parse_fulltext_sections(ft_content)
             toc = public_toc(parsed_secs)
+            if toc_only:
+                fm_toc = extract_frontmatter_toc(ft_content)
+                if len(fm_toc) > len(toc) and (len(toc) < 4 or len(fm_toc) >= len(toc) * 2):
+                    toc = fm_toc
             entry["toc"] = toc
             if toc_only and not section_spec:
                 entry["toc_only"] = True
@@ -1450,6 +1498,10 @@ def cmd_read_detail(args) -> None:
                 entry["fulltext"] = sliced["text"]
             else:
                 entry["fulltext"] = ft_content
+        elif do_fulltext and toc_only and not section_spec and isinstance(p.get("native_toc"), list) and p["native_toc"]:
+            entry["toc"] = p["native_toc"]
+            entry["toc_only"] = True
+            entry["toc_source"] = "cnki_detail_catalog"
         elif do_fulltext:
             entry["fulltext"] = ""
             if p.get("auth_required"):
@@ -2185,7 +2237,9 @@ def main() -> None:
     p_search.add_argument("--per-page", type=int, choices=[10, 20, 50], default=None,
                           help="知网单页显示条数（10/20/50；limit>20 时自动切 50）")
     p_search.add_argument("--bulk-abstract", action="store_true",
-                          help="知网检索后尝试批量题录导出补全摘要（个人登录秒级 50 篇，机构 IP 自动回退详情补全）")
+                          help="强制切换 50 条/页并批量导出题录摘要（未登录时额外详情补全前 5 篇）")
+    p_search.add_argument("--no-bulk-abstract", action="store_true",
+                          help="关闭知网检索结果的自动无感 Refworks 题录摘要/页码补全")
     p_search.add_argument("--enable-fallback", action="store_true",
                           help="启用 API 降级：主数据源失败时自动切换到备用数据源")
     p_search.add_argument("--async-search", action="store_true",
@@ -2325,6 +2379,8 @@ def main() -> None:
     p_batch.add_argument("--sort", choices=["relevance", "date", "citations", "downloads", "quality"],
                          default="relevance", help="排序方式")
     p_batch.add_argument("--pages", type=int, default=1, help="每组关键词抓取页数")
+    p_batch.add_argument("--no-bulk-abstract", action="store_true",
+                         help="关闭知网批量检索的自动无感 Refworks 题录摘要/页码补全")
     p_batch.add_argument("--export", help="直接导出: bibtex/ris/markdown/json/excel")
     p_batch.add_argument("--output", help="导出文件路径")
     p_batch.add_argument("--append", action="store_true", help="追加到已有会话结果（而非覆盖）")

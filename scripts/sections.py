@@ -308,6 +308,96 @@ def public_toc(sections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
 
 
+def extract_frontmatter_toc(fulltext: str) -> List[Dict[str, Any]]:
+    """从学位论文/长文前部『目录』页（带点线或页码尾标）直接提取整本论文的章节层级与页码。
+    专门用于 FlowPDF 大部头学位论文仅抽取前 16 页即可秒级生成完整目录的场景。
+    """
+    if not fulltext or not fulltext.strip():
+        return []
+    lines = fulltext.splitlines()
+    entries: List[Dict[str, Any]] = []
+    in_toc = False
+    toc_start = -1
+    seen_titles: set[str] = set()
+
+    leader_extract_re = re.compile(
+        r"^(.+?)(?:[.\u2026·•⋯\-_]{2,}|\u3000{2,}|\s{2,})([IVXLCDM]+|\d{1,4})\s*$",
+        re.IGNORECASE,
+    )
+    plain_trailing_page_re = re.compile(
+        r"^((?:第\s*[一二三四五六七八九十百零\d]+\s*[章篇节]|[一二三四五六七八九十]+、|\d{1,2}(?:\.\d{1,2}){0,2})\s*\S.*?)\s+(\d{1,4})\s*$"
+    )
+
+    for idx, raw in enumerate(lines):
+        s = raw.strip()
+        if not s or _PAGE_MARKER_RE.match(s):
+            continue
+        if _TOC_HEADER_RE.match(re.sub(r"\s+", "", s)):
+            in_toc = True
+            toc_start = idx
+            continue
+        if in_toc and (idx - toc_start) > 260:
+            break
+        if in_toc and len(s) > 95 and not _TOC_LEADER_LINE_RE.search(s):
+            break
+
+        m = leader_extract_re.match(s)
+        if not m and in_toc:
+            m = plain_trailing_page_re.match(s)
+        if not m:
+            continue
+
+        raw_title = re.sub(r"[.\u2026·•⋯\-_]+\s*$", "", m.group(1)).strip()
+        raw_page = m.group(2).strip()
+        if not raw_title or len(raw_title) < 2 or len(raw_title) > 72:
+            continue
+
+        detected = _detect_raw_heading(raw_title)
+        if detected:
+            kind, clean_title = detected
+        elif in_toc and raw_title in _STANDALONE_MAJOR_TITLES:
+            kind, clean_title = "standalone", raw_title
+        else:
+            continue
+
+        norm = _norm_heading_key(clean_title)
+        if not norm or norm in seen_titles:
+            continue
+        seen_titles.add(norm)
+
+        page_num: Optional[int] = int(raw_page) if raw_page.isdigit() else None
+        entries.append({"kind": kind, "title": clean_title, "page": page_num})
+
+    if len(entries) < 3:
+        return []
+
+    kinds = {e["kind"] for e in entries}
+    has_chapter = "chapter" in kinds
+    has_cn_num = "cn_num" in kinds
+
+    out: List[Dict[str, Any]] = []
+    for i, e in enumerate(entries):
+        k = e["kind"]
+        if k in ("chapter", "standalone", "roman"):
+            lvl = 1
+        elif has_chapter:
+            lvl = 2 if k in ("section_cn", "arabic_2", "cn_num") else 3
+        elif has_cn_num:
+            lvl = 1 if k == "cn_num" else (2 if k in ("paren_cn", "arabic_2") else 3)
+        else:
+            lvl = 1 if k == "arabic_1" else (2 if k == "arabic_2" else 3)
+        item: Dict[str, Any] = {
+            "id": f"S{i + 1}",
+            "index": i + 1,
+            "level": lvl,
+            "title": e["title"],
+        }
+        if e.get("page") is not None:
+            item["page"] = e["page"]
+        out.append(item)
+    return out
+
+
 def _match_section_query(sec: Dict[str, Any], query: str) -> bool:
     q = query.strip()
     if not q:

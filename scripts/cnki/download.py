@@ -30,13 +30,13 @@ from .driver import (
 def _get_batch_window_size() -> int:
     try:
         from config import get as cfg_get
-        val = cfg_get("batch_window_size", 4)
+        val = cfg_get("batch_window_size", 2)
     except ImportError:
-        val = os.environ.get("SCHOLAR_BATCH_WINDOW_SIZE", "4")
+        val = os.environ.get("SCHOLAR_BATCH_WINDOW_SIZE", "2")
     try:
         return max(1, int(val))
     except (TypeError, ValueError):
-        return 4
+        return 2
 
 BATCH_WINDOW_SIZE = _get_batch_window_size()
 COOLDOWN_MIN = 4
@@ -209,12 +209,83 @@ def _format_save_dir(save_dir: str, file_format: str, separate_formats: bool = T
     return str(Path(save_dir) / file_format.lower())
 
 
+def _heal_expired_download_url(
+    driver,
+    current_url: str,
+    hint: Optional[Dict[str, Any]] = None,
+) -> str:
+    """当知网加密详情链接 (`kcms2?v=...`) 隔天失效返回 404/错误页时，利用会话题名与期刊自动重定位新 URL。"""
+    if not hint or not hint.get("title"):
+        return current_url
+    try:
+        from .detail import _is_cnki_error_or_404
+        if not _is_cnki_error_or_404(driver):
+            return current_url
+        from .search import refresh_cnki_url
+        _log(f"[cnki-download] 详情链接已过期，正在按题名自动重定位: {hint.get('title', '')[:36]}...")
+        refreshed = refresh_cnki_url(
+            driver,
+            title=hint.get("title", ""),
+            author=hint.get("authors", ""),
+            journal=hint.get("journal", ""),
+        )
+        if refreshed:
+            hint["url"] = refreshed
+            _navigate_within_cnki(driver, refreshed)
+            _handle_captcha(driver)
+            return refreshed
+    except Exception as e:
+        _log(f"[cnki-download] 过期链接自动重定位失败: {e}")
+    return current_url
+
+
+def _open_download_tab(driver, url: str, abs_save_dir: str) -> Optional[str]:
+    """使用原生 Target.createTarget + 带 Referer 导航打开下载详情标签页，免疫浏览器弹窗拦截。"""
+    handles_before = set(getattr(driver, "window_handles", []) or [])
+    switch_to = getattr(driver, "switch_to", None)
+    if switch_to is not None and hasattr(switch_to, "new_window"):
+        try:
+            switch_to.new_window("tab")
+            new_handle = driver.current_window_handle
+            _enable_download_behavior(driver, abs_save_dir)
+            navigated = False
+            if hasattr(driver, "execute_cdp_cmd"):
+                try:
+                    driver.execute_cdp_cmd(
+                        "Page.navigate",
+                        {"url": url, "referrer": "https://kns.cnki.net/"},
+                    )
+                    navigated = True
+                except Exception:
+                    navigated = False
+            if not navigated:
+                _navigate_within_cnki(driver, url, base_delay=0.5)
+            return new_handle
+        except Exception:
+            pass
+
+    try:
+        driver.execute_script("window.open('');")
+        new_handles = set(getattr(driver, "window_handles", []) or []) - handles_before
+        if new_handles:
+            new_handle = new_handles.pop()
+            driver.switch_to.window(new_handle)
+            _enable_download_behavior(driver, abs_save_dir)
+            _safe_get(driver, url)
+            return new_handle
+    except Exception:
+        pass
+    return None
+
+
 def download_cnki(
     url: str,
     save_dir: str = "./papers",
     file_format: str = "pdf",
     fallback_format: Optional[str] = None,
     separate_formats: bool = True,
+    expected_title: str = "",
+    expected_journal: str = "",
 ) -> Dict[str, Any]:
     """
     从知网下载单篇论文。
@@ -244,6 +315,12 @@ def download_cnki(
 
         _navigate_within_cnki(driver, url)
         driver = _handle_captcha(driver)
+        if expected_title:
+            url = _heal_expired_download_url(
+                driver,
+                url,
+                {"title": expected_title, "journal": expected_journal},
+            )
 
         title = _get_title(driver)
         snapshot = set(os.listdir(active_save_dir))
@@ -357,8 +434,9 @@ def _save_download_progress(progress_file: Path, completed_urls: set):
 def _trigger_batch_window(
     driver, urls_window: List[str], save_dir: str, file_format: str,
     global_idx_offset: int, total: int,
+    paper_hints: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
-    """并行加载批次：先一口气开 N 个标签页让页面同时加载，再逐个切回去点下载。
+    """并行加载批次：先开 N 个标签页让页面同时加载，再逐个切回去点下载。
     Phase B 中途异常时 break 并把剩余 URL 推入重试，同时清理所有孤儿标签页。
     返回 (ok_results, batch_errors, retry_urls)"""
 
@@ -367,31 +445,25 @@ def _trigger_batch_window(
     batch_errors = []
     retry_urls = []
     snapshot_before = set(os.listdir(save_dir))
+    abs_save_dir = os.path.abspath(save_dir)
 
     tab_handles: List[tuple[str, str, int]] = []
     handles_before = set(driver.window_handles)
 
     for i, url in enumerate(urls_window):
         idx = global_idx_offset + i + 1
-        _log(f"[cnki-download] [{idx}/{total}] 并行打开: {url[:80]}...")
+        _log(f"[cnki-download] [{idx}/{total}] 打开详情页: {url[:80]}...")
         orphan_handle = None
         try:
-            before_open = set(driver.window_handles)
-            driver.execute_script("window.open('');")
-            after_open = set(driver.window_handles)
-            new_handles = after_open - before_open
-            if not new_handles:
+            orphan_handle = _open_download_tab(driver, url, abs_save_dir)
+            if not orphan_handle:
                 _log(f"[cnki-download] [{idx}/{total}] 未能打开新标签")
                 batch_errors.append({"url": url, "code": "CNKI_DOWNLOAD_FAILED", "error": "无法打开新标签页"})
                 continue
-            orphan_handle = new_handles.pop()
-            driver.switch_to.window(orphan_handle)
-            _enable_download_behavior(driver, os.path.abspath(save_dir))
-            _safe_get(driver, url)
             tab_handles.append((url, orphan_handle, idx))
             orphan_handle = None
             if i < len(urls_window) - 1:
-                time.sleep(random.uniform(0.8, 1.8))
+                time.sleep(random.uniform(1.0, 2.0))
         except Exception as e:
             _log(f"[cnki-download] [{idx}/{total}] 开标签失败: {e}")
             batch_errors.append({"url": url, "code": "CNKI_DOWNLOAD_FAILED", "error": str(e)})
@@ -414,6 +486,8 @@ def _trigger_batch_window(
         try:
             driver.switch_to.window(handle)
             driver = _handle_captcha(driver)
+            if paper_hints and url in paper_hints:
+                _heal_expired_download_url(driver, url, paper_hints.get(url))
 
             title = _get_title(driver)
             _log(f"[cnki-download] [{idx}/{total}] 标题: {title or '(未获取)'}")
@@ -543,6 +617,7 @@ def batch_download_cnki(
     file_format: str = "pdf",
     separate_formats: bool = True,
     _driver=None,
+    paper_hints: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     批量下载知网论文 — 均匀分批 + 并行加载 + 反爬冷却 + 断点续传 + 失败重试。
@@ -637,6 +712,7 @@ def batch_download_cnki(
                 driver, batch_urls, save_dir, file_format,
                 global_idx_offset=offset,
                 total=total,
+                paper_hints=paper_hints,
             )
             offset += len(batch_urls)
             all_ok.extend(ok)
@@ -683,6 +759,7 @@ def batch_download_cnki(
                     driver, rb_urls, save_dir, file_format,
                     global_idx_offset=0,
                     total=len(unique_retry),
+                    paper_hints=paper_hints,
                 )
                 for r in ok:
                     if not any(existing["url"] == r["url"] for existing in all_ok):
@@ -876,51 +953,75 @@ def _parse_noteexpress_export(content: str) -> list[dict]:
 def _parse_refworks_export(content: str) -> list[dict]:
     results = []
     blocks = re.split(r'\nER\s*(?:\n|$)|(?=\nRT\s)', content)
+    tag_re = re.compile(r'^[A-Z][A-Z0-9]\s')
     for block in blocks:
-        paper = {"source": "CNKI-export"}
-        for line in block.strip().split("\n"):
-            line = line.strip()
+        paper: Dict[str, Any] = {"source": "CNKI-export"}
+        sp_val = ""
+        ep_val = ""
+        op_val = ""
+        last_tag = ""
+        for raw_line in block.strip().split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if not tag_re.match(line):
+                if last_tag == "AB" and paper.get("abstract"):
+                    paper["abstract"] = f"{paper['abstract']} {line}".strip()
+                continue
+            last_tag = line[:2]
+            val = line[3:].strip()
             if line.startswith("T1 "):
-                paper["title"] = line[3:].strip()
+                paper["title"] = val
             elif line.startswith("A1 "):
                 existing = paper.get("authors", "")
-                author = line[3:].strip()
-                paper["authors"] = f"{existing}; {author}" if existing else author
+                if val:
+                    paper["authors"] = f"{existing}; {val}" if existing else val
             elif line.startswith("YR "):
-                y = re.search(r'\d{4}', line)
+                y = re.search(r'\d{4}', val)
                 if y:
                     paper["year"] = int(y.group())
             elif line.startswith("JF ") or line.startswith("JO "):
-                paper["journal"] = line[3:].strip()
+                paper["journal"] = val
             elif line.startswith("VO "):
-                paper["volume"] = line[3:].strip()
+                paper["volume"] = val
             elif line.startswith("IS "):
-                paper["issue"] = line[3:].strip()
+                paper["issue"] = val
             elif line.startswith("SP "):
-                sp = line[3:].strip()
-                if paper.get("pages"):
-                    paper["pages"] = f"{sp}-{paper['pages']}"
-                else:
-                    paper["pages"] = sp
+                sp_val = val
+            elif line.startswith("EP "):
+                ep_val = val
             elif line.startswith("OP "):
-                ep = line[3:].strip()
-                sp = paper.get("pages", "")
-                if sp and "-" not in sp:
-                    paper["pages"] = f"{sp}-{ep}"
-                else:
-                    paper["pages"] = ep
+                op_val = val
             elif line.startswith("DO "):
-                paper["doi"] = line[3:].strip()
+                paper["doi"] = val
             elif line.startswith("AB "):
-                paper["abstract"] = line[3:].strip()
+                paper["abstract"] = val
             elif line.startswith("K1 ") or line.startswith("KW "):
-                kws = [k.strip() for k in re.split(r'[;；,，]+', line[3:].strip()) if k.strip()]
+                kws = [k.strip() for k in re.split(r'[;；,，]+', val) if k.strip()]
                 if kws:
                     paper["keywords"] = list(dict.fromkeys((paper.get("keywords") or []) + kws))
             elif line.startswith("AD "):
-                addrs = [s.strip() for s in re.split(r'[;；]+', line[3:].strip()) if s.strip()]
+                addrs = [s.strip() for s in re.split(r'[;；]+', val) if s.strip()]
                 if addrs:
                     paper["institutions"] = addrs
+
+        # 精确合成起止页码（避免 CNKI 同时输出 `SP 65` 与 `OP 65-76` 时拼成 `65-65-76`）
+        if re.search(r'\d+\s*[-–—]\s*\d+', op_val):
+            paper["pages"] = re.sub(r'[–—]', '-', op_val)
+        elif re.search(r'\d+\s*[-–—]\s*\d+', sp_val):
+            paper["pages"] = re.sub(r'[–—]', '-', sp_val)
+        elif sp_val and ep_val:
+            paper["pages"] = sp_val if sp_val == ep_val else f"{sp_val}-{ep_val}"
+        elif sp_val and op_val:
+            if sp_val.isdigit() and op_val.isdigit() and int(op_val) >= int(sp_val):
+                paper["pages"] = sp_val if sp_val == op_val else f"{sp_val}-{op_val}"
+            else:
+                paper["pages"] = sp_val
+        elif sp_val:
+            paper["pages"] = sp_val
+        elif op_val:
+            paper["pages"] = op_val
+
         if paper.get("title"):
             results.append(paper)
     return results

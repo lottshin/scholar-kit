@@ -198,6 +198,81 @@ def _idle_timeout_seconds() -> int:
         return 1200
 
 
+def _browser_lock_file(port: int = _DEFAULT_DEBUG_PORT if "_DEFAULT_DEBUG_PORT" in globals() else 9222) -> Path:
+    try:
+        from config import global_state_dir
+        return global_state_dir(create=True) / f"browser-port-{int(port)}.lock"
+    except Exception:
+        return Path.cwd() / ".scholar-kit" / f"browser-port-{int(port)}.lock"
+
+
+def _try_lock_file_nonblocking(fh) -> bool:
+    if sys.platform == "win32":
+        import msvcrt
+        fh.seek(0)
+        if fh.tell() == 0:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write("0")
+                fh.flush()
+            fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        return True
+    else:
+        import fcntl
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+
+
+def _acquire_browser_lock(port: int = 9222, timeout: float = 180.0):
+    """跨平台获取共享浏览器调试端口文件锁，防止多命令/多智能体并发踩踏同一常驻 Chrome 标签页。"""
+    lock_p = _browser_lock_file(port)
+    try:
+        lock_p.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(lock_p, "a+", encoding="utf-8")
+    except Exception:
+        return None
+
+    deadline = time.time() + max(0.0, float(timeout))
+    warned = False
+    while True:
+        try:
+            _try_lock_file_nonblocking(fh)
+            return fh
+        except (OSError, IOError):
+            if time.time() >= deadline:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+                if timeout <= 0:
+                    return False
+                raise TimeoutError(f"等待共享浏览器端口 {port} 释放锁超时 ({int(timeout)}s)")
+            if not warned:
+                _log(f"[cnki] 端口 {port} 共享浏览器正被另一知网任务使用，排队等待释放...")
+                warned = True
+            time.sleep(0.4)
+
+
+def _release_browser_lock(fh) -> None:
+    if not fh or fh is False:
+        return
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        fh.close()
+    except Exception:
+        pass
+
+
 def _spawn_idle_reaper(port: int) -> None:
     """启动极轻量后台守护子进程：共享浏览器连续闲置超过阈值（默认 20 分钟）后自动调用 close_shared_browser 退出，避免程序坞长期残留图标。"""
     idle_sec = _idle_timeout_seconds()
@@ -222,7 +297,10 @@ def _spawn_idle_reaper(port: int) -> None:
         "    if time.time() - last >= idle_sec:\n"
         "        try:\n"
         "            from cnki.driver import close_shared_browser\n"
-        "            close_shared_browser(port)\n"
+        "            res = close_shared_browser(port, respect_lock=True)\n"
+        "            if res.get('reason') == 'busy':\n"
+        "                time.sleep(45)\n"
+        "                continue\n"
         "        except Exception: pass\n"
         "        break\n"
         "    time.sleep(45)\n"
@@ -924,57 +1002,75 @@ def _release_driver(driver: Optional["webdriver.Remote"], *, force_quit: bool = 
     """安全释放浏览器会话：
     - 常驻复用模式 (`_scholar_reused=True`) 下仅保存 Cookie、清理多余标签页并停止本轮 chromedriver 服务，
       保持后台 Chrome 进程存活供下一条 CLI 命令秒级热附着；
-    - 独占模式或 `force_quit=True` 时完整退出浏览器。
+    - 独占模式或 `force_quit=True` 时完整退出浏览器；
+    - 始终在 finally 中释放跨进程文件锁。
     """
     if driver is None:
         return
+    lock_fh = getattr(driver, "_scholar_lock_fh", None)
     try:
-        _touch_browser_activity()
-        _save_cookies(driver)
-    except Exception:
-        pass
-
-    reused = bool(getattr(driver, "_scholar_reused", False))
-    if reused and not force_quit:
         try:
-            handles = list(getattr(driver, "window_handles", []) or [])
-            if len(handles) > 1:
-                keep = handles[0]
-                for h in handles[1:]:
+            _touch_browser_activity()
+            _save_cookies(driver)
+        except Exception:
+            pass
+
+        reused = bool(getattr(driver, "_scholar_reused", False))
+        if reused and not force_quit:
+            try:
+                handles = list(getattr(driver, "window_handles", []) or [])
+                if len(handles) > 1:
+                    keep = handles[0]
+                    for h in handles[1:]:
+                        try:
+                            driver.switch_to.window(h)
+                            driver.close()
+                        except Exception:
+                            pass
                     try:
-                        driver.switch_to.window(h)
-                        driver.close()
+                        driver.switch_to.window(keep)
                     except Exception:
                         pass
-                try:
-                    driver.switch_to.window(keep)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            svc = getattr(driver, "service", None)
-            if svc is not None:
-                svc.stop()
-        except Exception:
-            pass
-        return
-
-    try:
-        if reused and force_quit:
-            try:
-                driver.execute_cdp_cmd("Browser.close", {})
             except Exception:
                 pass
-        driver.quit()
-    except Exception:
-        pass
+            try:
+                svc = getattr(driver, "service", None)
+                if svc is not None:
+                    svc.stop()
+            except Exception:
+                pass
+            return
+
+        try:
+            if reused and force_quit:
+                try:
+                    driver.execute_cdp_cmd("Browser.close", {})
+                except Exception:
+                    pass
+            driver.quit()
+        except Exception:
+            pass
+    finally:
+        driver._scholar_lock_fh = None
+        _release_browser_lock(lock_fh)
 
 
-def close_shared_browser(port: Optional[int] = None) -> dict:
+def close_shared_browser(port: Optional[int] = None, *, respect_lock: bool = False) -> dict:
     """显式关闭后台常驻的知网共享浏览器实例。"""
     active_port = int(port or os.environ.get("SCHOLAR_DEBUG_PORT", _DEFAULT_DEBUG_PORT))
+    lock_fh = None
+    if respect_lock:
+        lock_fh = _acquire_browser_lock(active_port, timeout=0.0)
+        if lock_fh is False:
+            return {
+                "status": "success",
+                "closed": False,
+                "port": active_port,
+                "reason": "busy",
+                "message": f"端口 {active_port} 正在执行任务，跳过空闲回收",
+            }
     if not _is_debug_port_open(active_port):
+        _release_browser_lock(lock_fh)
         return {
             "status": "success",
             "closed": False,
@@ -1018,6 +1114,7 @@ def close_shared_browser(port: Optional[int] = None) -> dict:
                     svc.stop()
             except Exception:
                 pass
+        _release_browser_lock(lock_fh)
 
 
 def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Remote":
@@ -1070,9 +1167,11 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
     first_err = None
     was_already_warm = False
     port = int(os.environ.get("SCHOLAR_DEBUG_PORT", _DEFAULT_DEBUG_PORT))
+    reuse_mode = _should_reuse_browser(headless=headless)
+    lock_fh = _acquire_browser_lock(port) if reuse_mode else None
 
     # 策略 0: 常驻热复用模式（优先连接已有调试端口，未启动则以独立会话启动供跨命令共享）
-    if _should_reuse_browser(headless=headless):
+    if reuse_mode:
         if _is_debug_port_open(port):
             try:
                 driver = _connect_remote_browser(browser, port)
@@ -1144,6 +1243,7 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
                 _log(f"[cnki] 连接已有浏览器失败: {e}")
 
     if driver is None:
+        _release_browser_lock(lock_fh)
         err_msg = (
             f"无法创建浏览器实例（{browser}）: {first_err}\n\n"
             f"【诊断】所有启动方式均失败（直接启动 / 本地驱动 / 沙盒外启动）。\n\n"
@@ -1154,6 +1254,10 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
             f"3. 确认网络可用后：pip install selenium>=4.10 会自动管理驱动"
         )
         raise RuntimeError(err_msg)
+
+    driver._scholar_lock_fh = lock_fh if getattr(driver, "_scholar_reused", False) else None
+    if lock_fh and not getattr(driver, "_scholar_reused", False):
+        _release_browser_lock(lock_fh)
 
     no_stealth = os.environ.get("SCHOLAR_KIT_NO_STEALTH", "").strip()
     if no_stealth not in ("1", "true", "yes"):
@@ -1335,24 +1439,75 @@ _CNKI_INSTITUTION_HEADER_RE = re.compile(
 
 
 def _has_cnki_institution_access(driver: "webdriver.Remote", institution: Optional[str] = None) -> bool:
+    try:
+        current_url = driver.current_url or ""
+    except Exception:
+        current_url = ""
+    low_url = current_url.lower()
+    if "cnki.net" not in low_url:
+        return False
+    if any(h in low_url for h in ("login.cnki.net", "passport.cnki.net", "fsso.cnki.net", "my.cnki.net/login")):
+        return False
+
     text = _page_text(driver)
     try:
         title = driver.title or ""
     except Exception:
         title = ""
-    try:
-        current_url = driver.current_url or ""
-    except Exception:
-        current_url = ""
     haystack = text + "\n" + title
-    is_cnki_url = "cnki.net" in current_url.lower()
-    markers = ("机构馆", "机构用户", "机构账号", "机构登录", "IP登录", "IP 登录")
-    if is_cnki_url and any(marker in haystack for marker in markers):
+    # 注意：绝不能包含「机构登录」「IP登录」——未登录知网首页顶栏按钮本身就含这两个词，会导致严重假阳性！
+    markers = ("机构馆", "机构用户", "机构账号", "机构已登录")
+    if any(marker in haystack for marker in markers):
         return True
     # 校内 IP 已识别但未登录个人账号时，知网头部显示“机构名 + 个人登录/退出”
-    if is_cnki_url and _CNKI_INSTITUTION_HEADER_RE.search(haystack):
+    if _CNKI_INSTITUTION_HEADER_RE.search(haystack):
         return True
-    if institution and institution in haystack and is_cnki_url:
+    if institution and institution in haystack:
+        return True
+    return False
+
+
+def _has_cnki_personal_login(driver: "webdriver.Remote") -> bool:
+    """检测知网个人账号/漫游账号登录态（基于 Ecp_LoginStuts Cookie 与顶栏用户 DOM，避免未登录顶栏按钮假阳性）。"""
+    try:
+        current_url = (driver.current_url or "").lower()
+    except Exception:
+        current_url = ""
+    if "cnki.net" not in current_url:
+        return False
+    if any(h in current_url for h in ("login.cnki.net", "passport.cnki.net", "fsso.cnki.net", "my.cnki.net/login")):
+        return False
+
+    try:
+        for c in (driver.get_cookies() or []):
+            if not isinstance(c, dict):
+                continue
+            name = c.get("name", "")
+            val = str(c.get("value", "") or "").strip()
+            if name == "Ecp_LoginStuts" and val and ("UserName" in val or "ShowName" in val or "IsAutoLogin" in val):
+                return True
+    except Exception:
+        pass
+
+    try:
+        dom_hit = driver.execute_script(r"""
+            var el = document.querySelector('#Ecp_loginShowName, #Ecp_Text_UserName, .ecp_user-name, .login-user-name');
+            if (!el || el.offsetParent === null) return '';
+            var t = (el.innerText || el.textContent || '').trim();
+            if (!t || t === '登录' || t === '个人登录' || t === '机构登录' || t === '注册') return '';
+            return t;
+        """)
+        if isinstance(dom_hit, str) and dom_hit.strip():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _has_cnki_any_access(driver: "webdriver.Remote", institution: Optional[str] = None) -> bool:
+    if _has_cnki_institution_access(driver, institution=institution):
+        return True
+    if not institution and _has_cnki_personal_login(driver):
         return True
     return False
 
@@ -1379,6 +1534,7 @@ def _auth_diagnostics(driver: "webdriver.Remote") -> dict:
         },
         "markers": {
             "institution": _has_cnki_institution_access(driver),
+            "personal_account": _has_cnki_personal_login(driver),
             "login": any(
                 k in text or k in title
                 for k in ("统一身份认证", "用户名", "密码", "选择高校", "扫码登录", "验证码")
@@ -1469,8 +1625,8 @@ def _wait_for_cnki_auth(
                     "知网安全验证（如滑块），请在浏览器中完成；完成前请不要关闭窗口。",
                     poll_timeout=max(30, int(deadline - time.time())),
                 )
-            if _has_cnki_institution_access(driver, institution=institution):
-                _log("[cnki-auth] 已检测到机构权限，保存会话。")
+            if _has_cnki_any_access(driver, institution=institution):
+                _log("[cnki-auth] 已检测到登录/机构权限，保存会话。")
                 return True
             if verify_url:
                 current_url = driver.current_url or ""
@@ -1492,7 +1648,7 @@ def _wait_for_cnki_auth(
         time.sleep(1)
     except Exception:
         pass
-    return _has_cnki_institution_access(driver, institution=institution)
+    return _has_cnki_any_access(driver, institution=institution)
 
 
 def authenticate_cnki(
@@ -1522,12 +1678,19 @@ def authenticate_cnki(
         browser = _detect_browser()
         driver = _create_driver(browser=browser)
 
-        driver.get("https://kns.cnki.net/")
-        time.sleep(1)
-        _load_cookies(driver)
-        driver.get(verify_url)
-        time.sleep(1)
-        if not force and _has_cnki_institution_access(driver, institution=institution):
+        if getattr(driver, "_scholar_was_warm", False):
+            _prepare_cnki_session(driver)
+            _navigate_within_cnki(driver, verify_url, base_delay=0.6)
+        else:
+            driver.get("https://kns.cnki.net/")
+            time.sleep(0.8)
+            try:
+                _load_cookies(driver, merge_only=True)
+            except TypeError:
+                _load_cookies(driver)
+            driver.get(verify_url)
+            time.sleep(0.8)
+        if not force and _has_cnki_any_access(driver, institution=institution):
             cookies_saved = bool(_save_cookies(driver) or _cookie_path().exists())
             return {
                 "status": "success",
@@ -1541,7 +1704,7 @@ def authenticate_cnki(
                 "profile_dir": str(_profile_dir()),
                 "direct_domains": direct_domain_list,
                 "diagnostics": _auth_diagnostics(driver),
-                "message": "检测到已有知网机构会话，已复用，无需再次登录。",
+                "message": "检测到已有知网登录/机构会话，已复用，无需再次登录。",
             }
 
         _log(f"[cnki-auth] 打开认证入口: {auth_url}")
@@ -1568,7 +1731,7 @@ def authenticate_cnki(
         elif captcha_timeout <= 0:
             _log("[cnki-auth] 跳过安全验证等待（captcha_timeout=0）")
 
-        access_confirmed = access_confirmed or _has_cnki_institution_access(driver, institution=institution)
+        access_confirmed = access_confirmed or _has_cnki_any_access(driver, institution=institution)
         diagnostics = _auth_diagnostics(driver)
         cookies_saved = bool(_save_cookies(driver) or _cookie_path().exists())
         snapshot_file = _write_debug_snapshot(driver, debug_snapshot)

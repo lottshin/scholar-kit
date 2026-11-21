@@ -17,8 +17,10 @@ from .constants import (
 from .driver import (
     _create_driver,
     _detect_browser,
+    _detect_cnki_login_wall,
     _handle_captcha,
     _load_cookies,
+    _navigate_within_cnki,
     _prepare_cnki_session,
     _release_driver,
     _safe_get,
@@ -1104,8 +1106,7 @@ def reconcile_cnki_paper(
             _prepare_cnki_session(driver)
 
         def _run_expr_once(expr_str: str, use_50: bool = False) -> List[Dict[str, Any]]:
-            _safe_get(driver, CNKI_ADV_SEARCH_URL)
-            time.sleep(max(1.0, REQUEST_INTERVAL - 1))
+            _navigate_within_cnki(driver, CNKI_ADV_SEARCH_URL, base_delay=0.8)
             nonlocal_drv = _handle_captcha(driver)
             sub = _submit_major_search(nonlocal_drv, expr_str)
             if not sub.get("ok"):
@@ -1233,7 +1234,7 @@ def search_cnki(
     expr: str = None,
     fuzzy: bool = False,
     per_page: Optional[int] = None,
-    bulk_abstract: bool = False,
+    bulk_abstract: bool = True,
     _keep_driver: bool = False,
 ):
     """知网文献搜索（支持专业检索式、多字段精确/模糊限定、前置核心与年份过滤、50条/页扩容与批量题录摘要导出）。"""
@@ -1309,8 +1310,7 @@ def search_cnki(
         used_adv = False
 
         if prefer_adv_page:
-            _safe_get(driver, CNKI_ADV_SEARCH_URL)
-            time.sleep(max(1.2, REQUEST_INTERVAL - 1))
+            _navigate_within_cnki(driver, CNKI_ADV_SEARCH_URL, base_delay=0.9)
             driver = _handle_captcha(driver)
 
             doctype_done = _preselect_adv_doctype(driver, doc_type, core)
@@ -1347,8 +1347,7 @@ def search_cnki(
                 _log("[cnki] AdvSearch 普通主题提交未成功，安全回退普通搜索页 + 侧边栏筛选")
 
         if not used_adv:
-            _safe_get(driver, CNKI_SEARCH_URL)
-            time.sleep(REQUEST_INTERVAL)
+            _navigate_within_cnki(driver, CNKI_SEARCH_URL)
             driver = _handle_captcha(driver)
             _input_search_keyword(driver, keyword)
             doctype_done = False
@@ -1417,11 +1416,14 @@ def search_cnki(
                 driver = _handle_captcha(driver)
 
             page_results = _parse_search_results(driver, cite_enrich=cite_remaining)
+            merged_cnt = 0
             if bulk_abstract and page_results:
                 exported = _bulk_export_from_results_page(driver, max_items=len(page_results))
                 if exported:
                     merged_cnt = _merge_bulk_export_into_results(page_results, exported)
                     _log(f"[cnki] 批量导出已补全 {merged_cnt}/{len(page_results)} 条摘要与卷期页码")
+            if merged_cnt == 0 and page_num == 0 and cite_enrich == 0 and page_results:
+                _enrich_missing_pages_inline(driver, page_results, max_rows=8)
             cite_remaining = max(0, cite_remaining - len(page_results))
             _log(f"[cnki] 第 {page_num + 1} 页获取 {len(page_results)} 条结果")
             all_results.extend(page_results)
@@ -1491,6 +1493,7 @@ def batch_search_cnki(
     first_author: str = None,
     fund: str = None,
     fuzzy: bool = False,
+    bulk_abstract: bool = True,
 ) -> Dict[str, Any]:
     """批量知网搜索：一次启动浏览器，循环执行每组关键词（完整保留每轮文献类型、高级字段与核心筛选）。"""
     if not keywords:
@@ -1531,8 +1534,7 @@ def batch_search_cnki(
         for idx, keyword in enumerate(keywords):
             _log(f"\n[cnki-batch] === 搜索 {idx + 1}/{len(keywords)}: {keyword} ===")
             try:
-                _safe_get(driver, entry_url)
-                time.sleep(REQUEST_INTERVAL)
+                _navigate_within_cnki(driver, entry_url)
                 driver = _handle_captcha(driver)
                 if idx == 0:
                     _save_cookies(driver)
@@ -1586,8 +1588,7 @@ def batch_search_cnki(
 
                 if not submitted:
                     if driver.current_url != CNKI_SEARCH_URL:
-                        driver.get(CNKI_SEARCH_URL)
-                        time.sleep(REQUEST_INTERVAL)
+                        _navigate_within_cnki(driver, CNKI_SEARCH_URL)
                         driver = _handle_captcha(driver)
                     _input_search_keyword(driver, keyword)
                     doctype_done = False
@@ -1625,6 +1626,14 @@ def batch_search_cnki(
                             break
                         driver = _handle_captcha(driver)
                     page_results = _parse_search_results(driver)
+                    merged_cnt = 0
+                    if bulk_abstract and page_results:
+                        exported = _bulk_export_from_results_page(driver, max_items=len(page_results))
+                        if exported:
+                            merged_cnt = _merge_bulk_export_into_results(page_results, exported)
+                            _log(f"[cnki-batch] 批量导出已补全 {merged_cnt}/{len(page_results)} 条摘要与卷期页码")
+                    if merged_cnt == 0 and page_num == 0 and page_results:
+                        _enrich_missing_pages_inline(driver, page_results, max_rows=6)
                     _log(f"[cnki-batch] {keyword} 第 {page_num + 1} 页: {len(page_results)} 条")
                     kw_results.extend(page_results)
                     if not page_results:
@@ -2020,8 +2029,10 @@ def _bulk_export_from_results_page(driver, max_items: int = 50) -> List[Dict[str
     """尝试勾选当前页结果并通过知网 `Refworks` 题录导出一次性拿全摘要、关键词与卷期页码。
 
     注意：2026 版知网题录导出在仅校园网 IP 登录、未登录个人账号时会重定向至 `login.cnki.net`。
-    本函数会在 <1s 内自动检测该重定向，立即关窗清理复选框并返回空列表，绝不阻塞主流程。
+    本函数会在 <1s 内自动检测该重定向并缓存 `_cnki_export_unavailable=True`，后续翻页或多词检索直接零耗时跳过。
     """
+    if getattr(driver, "_cnki_export_unavailable", False):
+        return []
     from .download import _parse_refworks_export
 
     main_handle = driver.current_window_handle
@@ -2036,8 +2047,18 @@ def _bulk_export_from_results_page(driver, max_items: int = 50) -> List[Dict[str
                 if (!cbs[i].checked) cbs[i].click();
                 cnt++;
             }
-            var exp = document.querySelector('a[exporttype="Refworks"]');
-            if (cnt > 0 && exp) {
+            if (cnt === 0) return 0;
+            var exp = document.querySelector('a[exporttype="Refworks"], li[exporttype="Refworks"] a, a[exporttype*="Refworks" i]');
+            if (!exp) {
+                var allExp = document.querySelectorAll('.BatchOper a, .export-list a, ul.export a, a');
+                for (var j = 0; j < allExp.length; j++) {
+                    if ((allExp[j].textContent || '').trim() === 'Refworks') {
+                        exp = allExp[j];
+                        break;
+                    }
+                }
+            }
+            if (exp) {
                 exp.click();
                 return cnt;
             }
@@ -2046,7 +2067,7 @@ def _bulk_export_from_results_page(driver, max_items: int = 50) -> List[Dict[str
         if not checked:
             return []
 
-        deadline = time.time() + 4.0
+        deadline = time.time() + 4.5
         while time.time() < deadline:
             diff = set(driver.window_handles) - before_handles
             if diff:
@@ -2059,12 +2080,19 @@ def _bulk_export_from_results_page(driver, max_items: int = 50) -> List[Dict[str
 
         driver.switch_to.window(new_handle)
         raw_export = ""
-        poll_end = time.time() + 6.0
+        poll_end = time.time() + 6.5
         while time.time() < poll_end:
             cur_url = (driver.current_url or "").lower()
             cur_title = driver.title or ""
-            if "login.cnki.net" in cur_url or "登录" in cur_title:
-                _log("[cnki-export] 批量题录导出需知网个人账号登录（当前仅机构 IP），自动跳过并回退详情补全")
+            if (
+                "login.cnki.net" in cur_url
+                or "passport.cnki.net" in cur_url
+                or "fsso.cnki.net" in cur_url
+                or "登录" in cur_title
+                or _detect_cnki_login_wall(driver)
+            ):
+                driver._cnki_export_unavailable = True
+                _log("[cnki-export] 批量题录导出需知网个人账号登录，已自动记忆并切换行内引用补全")
                 return []
             raw_export = driver.execute_script(r"""
                 var sels = ['#litotxt', '.literature-list', '#result', 'pre', 'textarea'];
@@ -2316,6 +2344,42 @@ def _parse_search_results(driver, cite_enrich: int = 0) -> list[dict]:
                 _log(f"[cnki] 单行解析失败: {e}")
                 continue
         return results
+    finally:
+        try:
+            driver.implicitly_wait(3)
+        except Exception:
+            pass
+
+
+def _enrich_missing_pages_inline(driver, page_results: List[Dict[str, Any]], max_rows: int = 8) -> int:
+    """当未登录个人账号无法批量导出 Refworks 时，直接在结果列表页通过行内引用弹窗秒补前 N 篇期刊页码（零详情页跳转）。"""
+    if not HAS_SELENIUM:
+        return 0
+    try:
+        driver.implicitly_wait(0)
+        dom_rows = []
+        for selector in CNKI_SELECTORS["results"]["rows"]:
+            dom_rows = driver.find_elements(By.CSS_SELECTOR, selector)
+            if dom_rows:
+                break
+        if not dom_rows:
+            return 0
+        enriched = 0
+        for idx, entry in enumerate(page_results):
+            if enriched >= max_rows or idx >= len(dom_rows):
+                break
+            if entry.get("pages") or entry.get("is_online_first"):
+                continue
+            if entry.get("doc_type") in ("thesis", "master", "doctor"):
+                continue
+            _enrich_row_from_quote_popup(driver, dom_rows[idx], entry)
+            if entry.get("pages"):
+                enriched += 1
+        if enriched:
+            _log(f"[cnki] 已通过列表页引用弹窗原地补齐 {enriched} 篇期刊页码")
+        return enriched
+    except Exception:
+        return 0
     finally:
         try:
             driver.implicitly_wait(3)

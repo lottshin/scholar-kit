@@ -57,13 +57,10 @@ def get_detail(url: str, expected_title: str = "") -> Dict[str, Any]:
         browser = _detect_browser()
         driver = _create_driver(browser=browser)
 
-        _safe_get(driver, "https://kns.cnki.net/")
-        time.sleep(0.6)
-        _load_cookies(driver)
+        _prepare_cnki_session(driver)
 
         active_url = url
-        _safe_get(driver, active_url)
-        time.sleep(REQUEST_INTERVAL)
+        _navigate_within_cnki(driver, active_url)
         driver = _handle_captcha(driver)
 
         if _is_cnki_error_or_404(driver) and expected_title:
@@ -71,8 +68,7 @@ def get_detail(url: str, expected_title: str = "") -> Dict[str, Any]:
             refreshed = refresh_cnki_url(driver, title=expected_title)
             if refreshed:
                 active_url = refreshed
-                _safe_get(driver, active_url)
-                time.sleep(max(1.2, REQUEST_INTERVAL - 1))
+                _navigate_within_cnki(driver, active_url)
                 driver = _handle_captcha(driver)
 
         detail = _parse_detail_page(driver)
@@ -202,10 +198,70 @@ def _parse_detail_page_inner(driver) -> Dict[str, Any]:
     except Exception:
         detail["funds"] = []
 
-    # ── 卷期页码、DOI 提取 ──────────────────────────────
+    # ── 卷期页码、DOI 与原生分章目录提取 ──────────────────
     _extract_pub_info(driver, detail)
+    native_toc = _extract_detail_page_toc(driver)
+    if native_toc:
+        detail["native_toc"] = native_toc
 
     return detail
+
+
+def _extract_detail_page_toc(driver) -> List[Dict[str, Any]]:
+    """提取知网硕博学位论文/长文详情页自带的『分章下载/目录』结构（免打开 200 页 FlowPDF 秒拿目录）。"""
+    try:
+        raw_items = driver.execute_script(r"""
+            var rows = document.querySelectorAll(
+                '#DownLoadParts li, #DownLoadParts tr, .catalog-list li, #catalogDiv li, ul.catalog li'
+            );
+            var out = [];
+            for (var i = 0; i < rows.length; i++) {
+                var txt = (rows[i].innerText || rows[i].textContent || '').replace(/\s+/g, ' ').trim();
+                if (!txt || txt.length < 2 || txt.length > 120) continue;
+                txt = txt.replace(/\s*(?:分章下载|本章下载|下载|阅读)\s*/g, ' ').trim();
+                if (txt) out.push(txt);
+            }
+            return out;
+        """) or []
+    except Exception:
+        return []
+
+    if not isinstance(raw_items, list) or len(raw_items) < 3:
+        return []
+
+    toc: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        page_num: Optional[int] = None
+        m_pg = re.search(r"[\s.…·\-_]+(\d{1,4})(?:\s*[-–—]\s*\d{1,4})?\s*$", s)
+        if m_pg:
+            page_num = int(m_pg.group(1))
+            s = s[:m_pg.start()].strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+
+        if re.match(r"^(?:第\s*[一二三四五六七八九十百零\d]+\s*[章篇部分]|[一二三四五六七八九十]+[、.．]|摘要|abstract|绪论|引言|结论|参考文献|致谢)", s, re.IGNORECASE):
+            lvl = 1
+        elif re.match(r"^(?:第\s*[一二三四五六七八九十百零\d]+\s*节|\d{1,2}\.\d{1,2}(?!\.\d)|[（(][一二三四五六七八九十]+[)）])", s):
+            lvl = 2
+        else:
+            lvl = 3
+
+        item: Dict[str, Any] = {
+            "id": f"S{len(toc) + 1}",
+            "index": len(toc) + 1,
+            "level": lvl,
+            "title": s,
+        }
+        if page_num is not None:
+            item["page"] = page_num
+        toc.append(item)
+
+    return toc if len(toc) >= 3 else []
 
 
 def _extract_pub_info(driver, detail: Dict[str, Any]):
@@ -824,9 +880,16 @@ def _flowpdf_extract_all_textlayers(driver, total_pages: int) -> dict:
     return {int(k): v for k, v in raw.items() if v and v.strip()}
 
 
-def _read_fulltext_flowpdf(driver, detail_url: str) -> Optional[str]:
-    """KXReader 全文提取（硕博论文）。三级加速：API直取 → 批量滚动 → 逐页补漏。"""
+def _read_fulltext_flowpdf(
+    driver,
+    detail_url: str,
+    *,
+    toc_only: bool = False,
+    max_chars: Optional[int] = None,
+) -> Optional[str]:
+    """KXReader 全文提取（硕博论文与无 HTML 期刊）。三级加速 + --toc/--max-chars 按需早停。"""
     original_window = driver.current_window_handle
+    driver._cnki_partial_fulltext = False
 
     try:
         href = driver.execute_script("""
@@ -900,13 +963,20 @@ def _read_fulltext_flowpdf(driver, detail_url: str) -> Optional[str]:
                 _log("[cnki-flowpdf] 未找到 canvas 元素，无法提取")
                 return None
 
-            _log(f"[cnki-flowpdf] 共 {total_pages} 页")
+            scan_pages = total_pages
+            if toc_only and total_pages > 18:
+                scan_pages = 16
+                driver._cnki_partial_fulltext = True
+                _log(f"[cnki-flowpdf] 共 {total_pages} 页（--toc 目录快读模式仅扫描前 {scan_pages} 页）")
+            else:
+                _log(f"[cnki-flowpdf] 共 {total_pages} 页")
 
             # ── 方法 1: PDF.js API 直取（最快，~3s） ──────────────
             all_pages = {}
             try:
                 driver.set_script_timeout(30)
                 api_result = driver.execute_async_script("""
+                    var maxP = arguments[0];
                     var cb = arguments[arguments.length - 1];
                     try {
                         var app = window.PDFViewerApplication;
@@ -920,7 +990,7 @@ def _read_fulltext_flowpdf(driver, detail_url: str) -> Optional[str]:
                         }
                         if (!app || !app.pdfDocument) { cb(null); return; }
                         var doc = app.pdfDocument;
-                        var n = doc.numPages;
+                        var n = Math.min(doc.numPages, maxP);
                         var results = {};
                         var done = 0;
                         for (var i = 1; i <= n; i++) {
@@ -938,21 +1008,23 @@ def _read_fulltext_flowpdf(driver, detail_url: str) -> Optional[str]:
                         }
                         setTimeout(function() { cb(results); }, 25000);
                     } catch(e) { cb(null); }
-                """)
+                """, int(scan_pages))
                 if api_result:
                     all_pages = {int(k): v.strip() for k, v in api_result.items()
                                  if v and v.strip()}
-                    if len(all_pages) >= total_pages * 0.5:
+                    if len(all_pages) >= scan_pages * 0.5:
                         _log(f"[cnki-flowpdf] PDF.js API 直取成功: "
-                             f"{len(all_pages)}/{total_pages} 页")
+                             f"{len(all_pages)}/{scan_pages} 页")
             except Exception as e:
                 _log(f"[cnki-flowpdf] PDF.js API 不可用: {e}")
 
-            # ── 方法 2: 批量滚动 + 一次性提取（~30s） ─────────────
-            if len(all_pages) < total_pages * 0.5:
+            # ── 方法 2: 批量滚动 + 一次性提取（支持 --max-chars 早停） ────
+            stopped_for_max_chars = False
+            if len(all_pages) < scan_pages * 0.5:
                 _log("[cnki-flowpdf] 使用批量滚动模式...")
-                for batch_end in range(5, total_pages + 5, 5):
-                    target = min(batch_end, total_pages) - 1
+                char_goal = int(max_chars * 1.35) if (max_chars and max_chars > 0 and not toc_only) else 0
+                for batch_end in range(5, scan_pages + 5, 5):
+                    target = min(batch_end, scan_pages) - 1
                     driver.execute_script(f"""
                         var c = document.querySelectorAll('canvas');
                         if (c.length > {target})
@@ -961,14 +1033,23 @@ def _read_fulltext_flowpdf(driver, detail_url: str) -> Optional[str]:
                     time.sleep(0.5)
                     if batch_end % 50 == 0:
                         driver = _handle_captcha(driver)
+                    if char_goal and batch_end < scan_pages and batch_end % 10 == 0:
+                        partial_now = _flowpdf_extract_all_textlayers(driver, min(batch_end, scan_pages))
+                        if sum(len(v) for v in partial_now.values()) >= char_goal:
+                            all_pages = partial_now
+                            stopped_for_max_chars = True
+                            driver._cnki_partial_fulltext = True
+                            _log(f"[cnki-flowpdf] 已达 --max-chars 字数目标，提前在第 {min(batch_end, scan_pages)}/{total_pages} 页停止滚动")
+                            break
 
-                time.sleep(3)
-                all_pages = _flowpdf_extract_all_textlayers(driver, total_pages)
-                _log(f"[cnki-flowpdf] 批量提取: {len(all_pages)}/{total_pages} 页")
+                if not stopped_for_max_chars:
+                    time.sleep(2.5)
+                    all_pages = _flowpdf_extract_all_textlayers(driver, scan_pages)
+                _log(f"[cnki-flowpdf] 批量提取: {len(all_pages)}/{scan_pages} 页")
 
             # ── 方法 3: 逐页补漏（仅处理缺失页） ─────────────────
-            if 0 < len(all_pages) < total_pages * 0.8:
-                missing = [p for p in range(1, total_pages + 1)
+            if not stopped_for_max_chars and 0 < len(all_pages) < scan_pages * 0.8:
+                missing = [p for p in range(1, scan_pages + 1)
                            if p not in all_pages]
                 if missing:
                     _log(f"[cnki-flowpdf] 补漏 {len(missing)} 页...")
@@ -980,8 +1061,8 @@ def _read_fulltext_flowpdf(driver, detail_url: str) -> Optional[str]:
                         """)
                         time.sleep(0.8)
                     time.sleep(2)
-                    all_pages = _flowpdf_extract_all_textlayers(driver, total_pages)
-                    _log(f"[cnki-flowpdf] 补漏后: {len(all_pages)}/{total_pages} 页")
+                    all_pages = _flowpdf_extract_all_textlayers(driver, scan_pages)
+                    _log(f"[cnki-flowpdf] 补漏后: {len(all_pages)}/{scan_pages} 页")
 
             if not all_pages:
                 _log("[cnki-flowpdf] 未能提取到任何文本")
@@ -1099,6 +1180,8 @@ def batch_read_detail(
     papers: List[Dict[str, Any]],
     top_n: int = 5,
     fulltext: bool = False,
+    toc_only: bool = False,
+    max_chars: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """批量获取论文详情（摘要+可选全文），复用同一个浏览器会话。"""
     if not papers:
@@ -1198,6 +1281,10 @@ def batch_read_detail(
                     paper["is_online_first"] = False
 
                 if fulltext:
+                    if toc_only and isinstance(paper.get("native_toc"), list) and len(paper["native_toc"]) >= 3:
+                        _log(f"[cnki-detail] 详情页直接提取到原生章节目录 ({len(paper['native_toc'])} 节)，跳过打开全文页")
+                        continue
+
                     # 拿到 cnki_id 后再次检查是否命中稳定键缓存或本地 PDF
                     cached = _load_cached_fulltext(url, paper=paper)
                     if cached:
@@ -1215,27 +1302,30 @@ def batch_read_detail(
                         paper["auth_reason"] = auth_blocked_reason
                         continue
 
+                    driver._cnki_partial_fulltext = False
                     if not ft:
                         ft = _read_fulltext_html(driver, url)
                     wall_now = getattr(driver, "_cnki_auth_wall_reason", None)
                     if not ft and not wall_now:
                         _log("[cnki-detail] HTML阅读不可用，尝试原版阅读(FlowPDF)...")
-                        ft = _read_fulltext_flowpdf(driver, url)
+                        ft = _read_fulltext_flowpdf(driver, url, toc_only=toc_only, max_chars=max_chars)
                         wall_now = getattr(driver, "_cnki_auth_wall_reason", None)
 
                     if ft:
-                        saved = _save_cached_fulltext(url, {
-                            "cnki_id": paper.get("cnki_id", ""),
-                            "abstract": paper.get("abstract", ""),
-                            "keywords": paper.get("keywords", []),
-                            "fulltext": ft,
-                            "fulltext_length": len(ft),
-                        }, paper=paper)
+                        is_partial = bool(getattr(driver, "_cnki_partial_fulltext", False))
+                        if not is_partial:
+                            saved = _save_cached_fulltext(url, {
+                                "cnki_id": paper.get("cnki_id", ""),
+                                "abstract": paper.get("abstract", ""),
+                                "keywords": paper.get("keywords", []),
+                                "fulltext": ft,
+                                "fulltext_length": len(ft),
+                            }, paper=paper)
+                            paper["fulltext_cache"] = str(saved)
                         paper["has_fulltext"] = True
                         paper["fulltext"] = ft
                         paper["fulltext_length"] = len(ft)
-                        paper["fulltext_cache"] = str(saved)
-                        _log(f"[cnki-detail] 全文获取成功: {len(ft)} 字")
+                        _log(f"[cnki-detail] 全文获取成功: {len(ft)} 字{'（按需早停片段，未覆盖全本缓存）' if is_partial else ''}")
                     elif wall_now:
                         auth_blocked_reason = str(wall_now)
                         paper["has_fulltext"] = False
