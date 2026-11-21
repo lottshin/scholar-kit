@@ -8,6 +8,7 @@ evidence.py - 会话/课题文献库、学科中立的主题聚类、研究空�
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 from collections import Counter
@@ -157,7 +158,183 @@ def _paper_evidence(paper: Dict[str, Any], index: int) -> Dict[str, Any]:
     }
     if paper.get("pages"):
         evidence["pages"] = paper.get("pages")
+    evidence.update(extract_paper_facets(paper))
     return evidence
+
+
+_METHOD_RULES: List[tuple[str, str]] = [
+    (r"双重差分|多期\s*DID|\bDID\b|difference-in-differences|准自然实验", "双重差分 (DID)"),
+    (r"工具变量|\b2SLS\b|\bIV\b|instrumental variable", "工具变量 (IV)"),
+    (r"断点回归|\bRDD\b|regression discontinuity", "断点回归 (RDD)"),
+    (r"合成控制|synthetic control", "合成控制法"),
+    (r"空间杜宾|空间计量|空间溢出|\bSDM\b|\bSAR\b|spatial econometr", "空间计量"),
+    (r"倾向得分匹配|\bPSM\b|propensity score", "倾向得分匹配 (PSM)"),
+    (r"定性比较|\bfsQCA\b|\bQCA\b|组态分析", "定性比较分析 (QCA)"),
+    (r"扎根理论|grounded theory", "扎根理论"),
+    (r"民族志|田野调查|参与式观察|深度访谈|ethnograph|fieldwork|in-depth interview", "田野调查/质性访谈"),
+    (r"多案例|单案例|典型案例|个案研究|case study", "案例研究"),
+    (r"结构方程|\bSEM\b|问卷调查|李克特|survey|questionnaire", "问卷调查/SEM"),
+    (r"随机对照|\bRCT\b|临床试验|randomized controlled", "随机对照试验 (RCT)"),
+    (r"元分析|系统综述|\bmeta-analysis\b|systematic review|\bPRISMA\b", "元分析/系统综述"),
+    (r"消融实验|基线对比|\bablation\b|\bbenchmark\b|fine-tuning|微调", "实验基准/消融对比"),
+    (r"面板数据|固定效应|双向固定|panel data|fixed effect", "面板固定效应"),
+    (r"符号学|话语分析|文本分析|内容分析|多模态|discourse analysis|semiotic|multimodal", "文本/多模态话语分析"),
+    (r"博弈论|演化博弈|数理模型|理论模型|game theory|theoretical model", "数理/博弈建模"),
+]
+
+_FINDING_CUE_RE = re.compile(
+    r"(?:研究发现|结果表明|实证表明|实证显示|实证结果|本文发现|检验发现|分析表明|研究结论|发现[：:，,]|表明[：:，,]|"
+    r"results?\s+(?:show|indicate|demonstrate|suggest|reveal)|we\s+(?:find|show|demonstrate)|findings?\s+(?:suggest|indicate|show))",
+    re.IGNORECASE,
+)
+
+_SAMPLE_CUE_PATTERNS = [
+    re.compile(r"((?:19|20)\d{2}\s*[—\-~至]+\s*(?:19|20)\d{2}\s*年[^，。；,.]{2,28}(?:数据|样本|面板|企业|城市|省份|县域))"),
+    re.compile(r"((?:沪深\s*A\s*股|中国\s*A\s*股|制造业|重污染)[^，。；,.]{0,18}(?:上市公司|企业))"),
+    re.compile(r"\b(CHARLS|CFPS|CGSS|CHFS|CMDS|CSMAR|Wind|CNRDS|ImageNet|MMLU|GSM8K|HumanEval|MIMIC-(?:III|IV)|UK\s+Biobank)\b", re.I),
+    re.compile(r"(\d{2,6}\s*(?:家|个|份|名|例|篇)[^，。；,.]{1,16}(?:企业|城市|地级市|县|样本|问卷|受访者|患者))"),
+    re.compile(r"\b([Nn]\s*=\s*[\d,]{2,9})\b"),
+]
+
+_POS_POLARITY_RE = re.compile(
+    r"(?:显著促进|显著提升|显著增强|显著提高|显著推动|正向影响|赋能|显著改善|有效缓解|显著降低.{0,8}(?:风险|成本|碳排放|贫困)|"
+    r"significantly\s+(?:increase|improve|enhance|promote|boost|facilitate|positively)|positive\s+(?:effect|impact|relationship))",
+    re.IGNORECASE,
+)
+_NEG_POLARITY_RE = re.compile(
+    r"(?:显著抑制|显著阻碍|显著削弱|负向影响|显著挤出|加剧了|显著恶化|不利于|"
+    r"significantly\s+(?:inhibit|reduce|decrease|hinder|impede|suppress|negatively)|negative\s+(?:effect|impact|relationship))",
+    re.IGNORECASE,
+)
+_NONLINEAR_POLARITY_RE = re.compile(
+    r"(?:倒\s*U\s*[型形]|U\s*[型形]|非线性|门槛效应|边际递减|先升后降|先抑后扬|双刃剑|"
+    r"inverted[- ]u|u-shaped|non-?linear|threshold\s+effect)",
+    re.IGNORECASE,
+)
+
+
+def _detect_text_polarity(text: str) -> str:
+    if not text:
+        return "mixed_or_neutral"
+    if _NONLINEAR_POLARITY_RE.search(text):
+        return "nonlinear"
+    has_pos = bool(_POS_POLARITY_RE.search(text))
+    has_neg = bool(_NEG_POLARITY_RE.search(text))
+    if has_pos and not has_neg:
+        return "positive"
+    if has_neg and not has_pos:
+        return "negative"
+    return "mixed_or_neutral"
+
+
+def extract_paper_facets(paper: Dict[str, Any]) -> Dict[str, Any]:
+    """从单篇论文的题名、摘要与关键词中确定性抽取结构化学术要素（方法、样本、核心发现句、效应极性）。"""
+    title = str(paper.get("title") or "").strip()
+    abstract = str(paper.get("abstract") or "").strip()
+    kw_str = " ".join(_normalize_keywords(paper.get("keywords")))
+    blob = f"{title} {kw_str} {abstract}"
+
+    methods: List[str] = []
+    for pat, label in _METHOD_RULES:
+        if re.search(pat, blob, re.IGNORECASE):
+            if label not in methods:
+                methods.append(label)
+        if len(methods) >= 2:
+            break
+    method_str = " / ".join(methods) if methods else ("理论/规范或待核原文" if not abstract else "综合分析")
+
+    sample_str = ""
+    for sp in _SAMPLE_CUE_PATTERNS:
+        m = sp.search(blob)
+        if m:
+            sample_str = m.group(1).strip()
+            break
+
+    core_finding = ""
+    if abstract:
+        protected = re.sub(r"(?<=\d)\.(?=\d)", "\u2024", abstract)
+        sents = [s.replace("\u2024", ".").strip() for s in re.split(r"(?<=[。！？.!?])\s*", protected) if len(s.strip()) >= 14]
+        cue_sents = [s for s in sents if _FINDING_CUE_RE.search(s)]
+        if cue_sents:
+            core_finding = " ".join(cue_sents[:2])
+        elif len(sents) >= 2:
+            core_finding = sents[-1]
+        elif sents:
+            core_finding = sents[0]
+        if len(core_finding) > 165:
+            core_finding = core_finding[:162].rstrip("，,;； ") + "…"
+
+    polarity = _detect_text_polarity(core_finding or abstract)
+    polarity_label = {
+        "positive": "正向促进 (+)",
+        "negative": "负向抑制 (-)",
+        "nonlinear": "非线性/门槛 (∩/∪)",
+        "mixed_or_neutral": "综合/中性",
+    }[polarity]
+
+    return {
+        "research_method": method_str,
+        "data_sample": sample_str or "-",
+        "core_finding": core_finding,
+        "effect_polarity": polarity,
+        "polarity_label": polarity_label,
+    }
+
+
+def _venue_badge(paper: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    if paper.get("core_type"):
+        parts.append(str(paper["core_type"]).replace(";", "/"))
+    for vt in (paper.get("venue_tags") or []):
+        if vt not in parts:
+            parts.append(str(vt))
+    if paper.get("is_warning"):
+        parts.append("预警")
+    return ",".join(parts[:3])
+
+
+def build_comparison_matrix(selected: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], str]:
+    """生成可供文献综述直接引用的结构化『文献要素对比矩阵』（JSON + Markdown 三线表）。"""
+    matrix: List[Dict[str, Any]] = []
+    md_rows: List[List[str]] = []
+    for item in selected:
+        p = item["paper"]
+        idx = item["index"]
+        facets = extract_paper_facets(p)
+        authors = _split_authors(p.get("authors"))
+        first_au = authors[0] if authors else "佚名"
+        if len(authors) > 1:
+            first_au = f"{first_au}等" if any("\u4e00" <= c <= "\u9fff" for c in first_au) else f"{first_au} et al."
+        yr = _paper_year(p) or "n.d."
+        journal = str(p.get("journal") or p.get("source") or "-").strip()
+        badge = _venue_badge(p)
+        venue_col = f"{journal} ({badge})" if badge else journal
+        finding_col = facets["core_finding"] or "（仅题录，待核对原文）"
+        row_obj = {
+            "index": idx,
+            "author_year": f"{first_au} ({yr})",
+            "title": p.get("title", ""),
+            "venue": venue_col,
+            **facets,
+        }
+        matrix.append(row_obj)
+        md_rows.append([
+            f"[{idx}]",
+            f"{first_au} ({yr})",
+            venue_col[:26],
+            facets["research_method"],
+            facets["data_sample"][:24],
+            f"{facets['polarity_label']}：{finding_col[:72]}",
+        ])
+
+    if not md_rows:
+        return [], ""
+    lines = [
+        "| 序号 | 作者(年份) | 来源/级别 | 研究方法 | 数据/样本 | 效应方向与核心结论 |",
+        "| --- | --- | --- | --- | --- | --- |",
+        *["| " + " | ".join(c.replace("|", "\\|") for c in r) + " |" for r in md_rows],
+    ]
+    return matrix, "\n".join(lines)
 
 
 _GENERIC_STOPWORDS = {
@@ -360,23 +537,52 @@ def _review_clusters(selected: List[Dict[str, Any]], topic: str) -> List[Dict[st
     result = []
     for label, items in sorted(clusters_map.items(), key=lambda kv: len(kv[1]), reverse=True):
         evidence = []
-        claims = []
+        findings = []
+        methods_counter: Counter[str] = Counter()
+        pos_indices: List[int] = []
+        neg_or_nl_indices: List[int] = []
         for item in items:
             p = item["paper"]
             abstract = str(p.get("abstract") or "").strip()
-            if abstract:
-                claims.append(abstract[:90])
+            facets = extract_paper_facets(p)
+            if facets["core_finding"]:
+                findings.append(f"[{item['index']}] {facets['core_finding']}")
+            if facets["research_method"] and "待核原文" not in facets["research_method"]:
+                methods_counter[facets["research_method"]] += 1
+            if facets["effect_polarity"] == "positive":
+                pos_indices.append(item["index"])
+            elif facets["effect_polarity"] in ("negative", "nonlinear"):
+                neg_or_nl_indices.append(item["index"])
             evidence.append({
                 "index": item["index"],
                 "title": p.get("title", ""),
                 "trace_status": "abstract" if abstract else "metadata_only",
+                "research_method": facets["research_method"],
+                "data_sample": facets["data_sample"],
+                "effect_polarity": facets["effect_polarity"],
+                "core_finding": facets["core_finding"],
                 "abstract_excerpt": abstract[:160],
             })
+        top_methods = "、".join(m for m, _ in methods_counter.most_common(3))
+        divergence_note = ""
+        if pos_indices and neg_or_nl_indices:
+            pos_str = "".join(f"[{i}]" for i in pos_indices[:4])
+            neg_str = "".join(f"[{i}]" for i in neg_or_nl_indices[:4])
+            divergence_note = f"存在学术争鸣/结论分化：文献{pos_str}报告正向促进效应，而文献{neg_str}指出负向抑制或非线性门槛边界。"
+        synth_parts = []
+        if top_methods:
+            synth_parts.append(f"主流方法采用{top_methods}")
+        if findings:
+            synth_parts.append("核心结论：" + "；".join(findings[:3]))
+        if divergence_note:
+            synth_parts.append(divergence_note)
         result.append({
             "label": label,
             "count": len(items),
+            "dominant_methods": [m for m, _ in methods_counter.most_common(3)],
+            "divergence_note": divergence_note or None,
             "papers": evidence,
-            "synthesis": "；".join(claims[:3]) if claims else "",
+            "synthesis": "。".join(synth_parts) if synth_parts else "",
         })
     return result
 
@@ -490,6 +696,82 @@ def _review_gaps(papers: List[Dict[str, Any]], topic: str) -> List[Dict[str, Any
     return gaps
 
 
+def _probe_openalex_hit_count(query: str, year_from: int) -> Optional[Dict[str, Any]]:
+    """向 OpenAlex 发起轻量级 `per-page=1` 探测，秒级获取全球真实命中篇数，用于为研究空白提供可验证检索证据。"""
+    import urllib.parse
+    import urllib.request
+
+    params = {
+        "search": query,
+        "filter": f"from_publication_date:{year_from}-01-01",
+        "per-page": "1",
+    }
+    headers = {"User-Agent": "scholar-kit/1.25 (mailto:scholar-kit@users.noreply.github.com)"}
+    payload: Optional[Dict[str, Any]] = None
+    try:
+        import requests
+        r = requests.get("https://api.openalex.org/works", params=params, headers=headers, timeout=6)
+        if r.status_code == 200:
+            payload = r.json()
+    except Exception:
+        payload = None
+
+    if payload is None:
+        url = f"https://api.openalex.org/works?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        except Exception:
+            return None
+
+    try:
+        cnt = int((payload.get("meta") or {}).get("count", 0))
+        verdict = "confirmed_sparse" if cnt < 15 else ("moderate_space" if cnt < 80 else "already_crowded")
+        return {
+            "database": "OpenAlex",
+            "query": query,
+            "year_range": f"{year_from}-{datetime.now().year}",
+            "total_hits": cnt,
+            "verdict": verdict,
+        }
+    except Exception:
+        return None
+
+
+def _verify_gaps_live(gaps: List[Dict[str, Any]], topic: str) -> List[Dict[str, Any]]:
+    """对候选空白维度执行真实外部数据库检索计数验证（响应 SKILL.md 硬性规则2：研究空白须附检索证据）。"""
+    yr_from = datetime.now().year - 4
+    dim_query_suffix = {
+        "时间新近性": topic,
+        "方法支撑": f"{topic} empirical experiment",
+        "比较/整合": f"{topic} comparative cross-cultural meta-analysis",
+        "语种覆盖": topic,
+    }
+    verified: List[Dict[str, Any]] = []
+    for g in gaps:
+        g_copy = dict(g)
+        dim = g.get("dimension", "")
+        if dim in ("证据完整性", "原文核验"):
+            verified.append(g_copy)
+            continue
+        q = dim_query_suffix.get(dim, f"{topic} {g.get('title', '')}")
+        proof = _probe_openalex_hit_count(q, yr_from)
+        if proof:
+            g_copy["search_proof"] = proof
+            if proof["verdict"] == "already_crowded" and g.get("dimension") in ("方法支撑", "比较/整合"):
+                g_copy["basis"] = (
+                    f"{g_copy['basis']} 【外部核验纠偏：OpenAlex 检索 `{q}` ({proof['year_range']}) 实际命中 {proof['total_hits']} 篇，"
+                    "说明国际学界并非空白，仅当前会话样本未覆盖，严禁直接断言学界空白！】"
+                )
+            else:
+                g_copy["basis"] = (
+                    f"{g_copy['basis']} 【外部检索证据：{proof['database']} 检索 `{q}` ({proof['year_range']}) 命中 {proof['total_hits']} 篇 ({proof['verdict']})】"
+                )
+        verified.append(g_copy)
+    return verified
+
+
 def _build_review_markdown(
     topic: str,
     selected: List[Dict[str, Any]],
@@ -521,6 +803,10 @@ def _build_review_markdown(
         tags_str = f" [标签: {', '.join(p['tags'])}]" if p.get("tags") else ""
         note_str = f"（批注：{p['note']}）" if p.get("note") else ""
         lines.append(f"- [{item['index']}] {p.get('title', '未获取')}（{journal}, {year}）— {status}{tags_str}{note_str}")
+
+    _, matrix_md = build_comparison_matrix(selected[:12])
+    if matrix_md:
+        lines.extend(["", "## 文献要素对比矩阵（方法 · 样本 · 核心结论）", "", matrix_md])
 
     if clusters:
         lines.extend(["", "## 主题聚类线索"])
@@ -675,11 +961,15 @@ def _build_review_draft(
             f"其中 {abstract_cnt} 篇具备摘要支撑，{len(usable) - abstract_cnt} 篇仅含题录待核对原文{intro_indices}。"
             f"按关键词与题名聚类，现有文献集中于{'、'.join(c['label'] for c in cluster_list[:4])}等议题。"
         )
-        lines.extend(["", "## 二、主要研究脉络与主题分支"])
+        lines.extend(["", "## 二、结构化文献对比矩阵", ""])
+        _, draft_matrix_md = build_comparison_matrix(usable[:12])
+        if draft_matrix_md:
+            lines.append(draft_matrix_md)
+        lines.extend(["", "## 三、主要研究脉络与主题分支"])
         for cluster in cluster_list:
             indices = _cluster_evidence_indices(cluster)
             if cluster.get("synthesis"):
-                body = f"代表性摘要线索包括：{cluster['synthesis']}"
+                body = cluster["synthesis"]
             else:
                 body = "该组文献目前缺少摘要文本，仅能作为题录线索列出，具体结论待核对原文后补入"
             lines.extend([
@@ -687,7 +977,7 @@ def _build_review_draft(
                 f"该分支共 {cluster['count']} 篇相关文献{indices}。{body}。",
                 "",
             ])
-        lines.extend(["## 三、样本覆盖局限与补检方向"])
+        lines.extend(["## 四、样本覆盖局限与补检方向"])
         for i, gap in enumerate(gaps[:4], 1):
             indices = "".join(f"[{idx}]" for idx in gap.get("evidence_indices", [])[:5]) or "（当前库无直接命中）"
             lines.append(
@@ -950,13 +1240,48 @@ _SIGNPOST_MARKERS = (
 )
 
 
+_CONTRASTIVE_CLAIM_RE = re.compile(
+    r"(?:然而|相反|但|不过|不同于|并非|质疑|争议|分化|另一方面|contrary|however|whereas|unlike|although|while)",
+    re.IGNORECASE,
+)
+
+_HARD_STAT_CLAIM_RE = re.compile(
+    r"(?:\b[Nn]\s*=\s*\d{2,}|\bp\s*[<≤=]\s*0\.\d+|\bR\^?2\s*=\s*0\.\d+|"
+    r"问卷.{0,10}\d{2,}\s*份|回收率.{0,6}\d+(?:\.\d+)?%|回归系数.{0,8}-?\d+\.\d+)",
+    re.IGNORECASE,
+)
+
+
+def _check_year_mismatch_in_claim(claim_txt: str, indices: List[int], evidence_by_index: Dict[int, Dict[str, Any]]) -> Optional[str]:
+    """检测正文中类似 `赵涛等（2022）[1]` 或 `Smith (2021)[2]` 的显式年份是否与所引文献真实发表年份冲突。"""
+    for m in re.finditer(r"[（(]\s*((?:19|20)\d{2})[a-z]?\s*[)）]\s*(?:\^\s*)?\[(\d+)\]", claim_txt):
+        yr_in_text = int(m.group(1))
+        ref_idx = int(m.group(2))
+        if ref_idx in evidence_by_index:
+            p = evidence_by_index[ref_idx].get("paper") or {}
+            true_yr = _paper_year(p)
+            if true_yr and str(true_yr)[:4].isdigit() and int(str(true_yr)[:4]) != yr_in_text:
+                return f"正文标注年份 ({yr_in_text}) 与文献 [{ref_idx}] 真实发表年份 ({true_yr}) 不一致"
+    return None
+
+
 def _support_for_claim(claim: Dict[str, Any], evidence_by_index: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
     clean_claim = {k: v for k, v in claim.items() if not k.startswith("_")}
     indices = claim.get("evidence_indices", [])
+    claim_txt_plain = str(claim.get("claim") or "")
+    has_unbacked_stat = bool(not indices and _HARD_STAT_CLAIM_RE.search(claim_txt_plain))
     if not indices:
+        if has_unbacked_stat:
+            return {
+                **clean_claim,
+                "support_level": "unsupported",
+                "unbacked_statistic": True,
+                "matched_indices": [],
+                "matched_terms": [],
+                "note": "包含未挂引文的具体统计数值/样本量，请核实是否来自真实一手数据（防统计幻觉）",
+            }
         # 兼容 style-audit.md：同段已有引文支撑的作者评述句、章节导引/图表引出句（如“本文首先…”“见表1”）及结语对策推论句，只要不含“研究表明/数据显示”等无出处经验指称，记为 commentary 不扣分
         sec_name = str(claim.get("section") or "")
-        claim_txt_plain = str(claim.get("claim") or "")
         is_synthesis_sec = any(k in sec_name for k in ("结语", "结论", "路径", "对策", "建议", "启示", "讨论"))
         is_signpost = any(m in claim_txt_plain for m in _SIGNPOST_MARKERS)
         if not claim.get("_needs_strict_cite") and (claim.get("_para_has_citation") or is_synthesis_sec or is_signpost):
@@ -996,6 +1321,9 @@ def _support_for_claim(claim: Dict[str, Any], evidence_by_index: Dict[int, Dict[
     has_abstract = False
     has_cross_lingual_abstract = False
 
+    claim_polarity = _detect_text_polarity(claim_txt)
+    paper_polarities: List[Tuple[int, str, str]] = []
+
     for idx in indices:
         ev = evidence_by_index[idx]
         paper = ev["paper"]
@@ -1006,6 +1334,8 @@ def _support_for_claim(claim: Dict[str, Any], evidence_by_index: Dict[int, Dict[
             paper_is_cjk = any("\u4e00" <= c <= "\u9fff" for c in str(paper.get("title") or "") + str(paper.get("abstract") or ""))
             if claim_is_cjk != paper_is_cjk:
                 has_cross_lingual_abstract = True
+            p_facets = extract_paper_facets(paper)
+            paper_polarities.append((idx, p_facets["effect_polarity"], p_facets["core_finding"]))
         hits = [t for t in c_terms if _term_in_text(t, p_text)]
         if hits:
             matched_indices.append(idx)
@@ -1013,7 +1343,23 @@ def _support_for_claim(claim: Dict[str, Any], evidence_by_index: Dict[int, Dict[
                 if h not in matched_terms:
                     matched_terms.append(h)
 
-    if not has_abstract:
+    year_mismatch = _check_year_mismatch_in_claim(claim_txt, indices, evidence_by_index)
+    polarity_conflict_note = None
+    if (
+        claim_polarity in ("positive", "negative")
+        and paper_polarities
+        and not _CONTRASTIVE_CLAIM_RE.search(claim_txt)
+    ):
+        opposite = "negative" if claim_polarity == "positive" else "positive"
+        if all(pp[1] == opposite for pp in paper_polarities):
+            ref_i, _, orig_finding = paper_polarities[0]
+            polarity_conflict_note = (
+                f"结论方向疑似写反：正文表述为『{claim_polarity}』，但所引文献 [{ref_i}] 原文核心结论为『{opposite}』（{orig_finding[:80]}）"
+            )
+
+    if polarity_conflict_note:
+        level = "contradicted"
+    elif not has_abstract:
         level = "needs_fulltext_check"
     elif len(matched_terms) >= 2:
         level = "strong"
@@ -1026,23 +1372,36 @@ def _support_for_claim(claim: Dict[str, Any], evidence_by_index: Dict[int, Dict[
     else:
         level = "weak"
 
-    return {
+    out_res: Dict[str, Any] = {
         **clean_claim,
         "support_level": level,
         "matched_indices": matched_indices,
         "matched_terms": matched_terms[:8],
     }
+    if polarity_conflict_note:
+        out_res["polarity_conflict"] = polarity_conflict_note
+    if year_mismatch:
+        out_res["year_mismatch"] = year_mismatch
+    return out_res
 
 
 def _validate_writing(
     markdown: str,
     selected: List[Dict[str, Any]],
     all_candidates: Optional[List[Dict[str, Any]]] = None,
+    *,
+    allow_primary_data: bool = False,
 ) -> Dict[str, Any]:
     pool = all_candidates if all_candidates is not None else selected
     evidence_by_index = {item["index"]: item for item in pool}
     claims = _claim_sentences(markdown, evidence_by_index)
     claim_results = [_support_for_claim(c, evidence_by_index) for c in claims]
+    if allow_primary_data:
+        for r in claim_results:
+            if r.get("unbacked_statistic"):
+                r["support_level"] = "commentary"
+                r.pop("unbacked_statistic", None)
+                r["note"] = "已声明包含作者一手实证样本/实验结果"
 
     counts: Counter[str] = Counter(r["support_level"] for r in claim_results)
     cited_indices = {idx for c in claims for idx in c.get("evidence_indices", []) if idx in evidence_by_index}
@@ -1053,10 +1412,34 @@ def _validate_writing(
     unused_usable = [idx for idx in usable_indices if idx not in cited_indices]
 
     unsupported_claims = [r for r in claim_results if r["support_level"] == "unsupported"]
+    contradicted_claims = [r for r in claim_results if r["support_level"] == "contradicted"]
+    year_mismatches = [r for r in claim_results if r.get("year_mismatch")]
+    unbacked_stats = [r for r in claim_results if r.get("unbacked_statistic")]
     weak_claims = [r for r in claim_results if r["support_level"] in ("weak", "needs_fulltext_check")]
     invalid_claims = [r for r in claim_results if r["support_level"] == "invalid"]
 
     issues = []
+    if contradicted_claims:
+        issues.append({
+            "type": "polarity_conflict",
+            "count": len(contradicted_claims),
+            "examples": contradicted_claims[:5],
+            "message": "部分论断与所引文献原文的正负向结论极性相反（疑似张冠李戴或结论写反）",
+        })
+    if year_mismatches:
+        issues.append({
+            "type": "year_mismatch",
+            "count": len(year_mismatches),
+            "examples": year_mismatches[:5],
+            "message": "正文著者-出版年标注与所引文献真实年份不一致",
+        })
+    if unbacked_stats:
+        issues.append({
+            "type": "unbacked_statistics",
+            "count": len(unbacked_stats),
+            "examples": unbacked_stats[:5],
+            "message": "检测到未挂引文的统计检验/样本量数值（若确属一手实证数据可传 --allow-primary-data）",
+        })
     if unsupported_claims:
         issues.append({
             "type": "unsupported_claim",
@@ -1087,14 +1470,22 @@ def _validate_writing(
         })
 
     score = 100
+    score -= min(counts.get("contradicted", 0) * 20, 50)
+    score -= min(len(year_mismatches) * 8, 24)
     score -= min(counts.get("unsupported", 0) * 8, 32)
     score -= min(counts.get("weak", 0) * 6, 30)
     score -= min(counts.get("needs_fulltext_check", 0) * 5, 25)
     score -= min(counts.get("invalid", 0) * 18, 45)
     score = max(score, 0)
-    status = "success" if score >= 80 and not invalid_claims else "warning"
+    status = "success" if score >= 80 and not invalid_claims and not contradicted_claims else "warning"
 
     recommendations = []
+    if contradicted_claims:
+        recommendations.append("立即核对 polarity_conflict 条目：正文结论的正负方向与所引文献原文相反，请修正表述或更换正确引文。")
+    if year_mismatches:
+        recommendations.append("修正正文中与参考文献真实年份不一致的年份标注。")
+    if unbacked_stats:
+        recommendations.append("核查未挂引文的样本量/回归显著性数值，严禁虚构一手实证数据（若确有真实数据集请加 --allow-primary-data）。")
     if unsupported_claims:
         recommendations.append("为未附编号的论断补充 [证据序号]，或删除无法由当前文献库支撑的判断。")
     if weak_claims:
@@ -1255,6 +1646,13 @@ def cmd_topics(args, output_fn: Callable[[Any], None] = _default_output) -> None
         return
     topic = args.topic or _session_project(args) or "当前课题"
     suggestions = _build_topics(topic, papers, args.limit or 8)
+    if getattr(args, "verify_gaps", False):
+        yr_from = datetime.now().year - 4
+        for s in suggestions:
+            q = " ".join(s.get("followup_search", [])[:2]) or topic
+            proof = _probe_openalex_hit_count(q, yr_from)
+            if proof:
+                s["search_proof"] = proof
     output_fn({
         "status": "success",
         "project": _session_project(args),
@@ -1274,15 +1672,37 @@ def cmd_validate(args, output_fn: Callable[[Any], None] = _default_output) -> No
     limit = min(args.limit or 12, len(papers))
     all_candidates = _review_candidates(papers, topic)
     selected, clusters, gaps = _review_write_inputs(papers, topic, limit)
-    if args.file:
-        markdown = Path(args.file).read_text(encoding="utf-8")
+    target_file = getattr(args, "file", None) or getattr(args, "filepath", None)
+    if target_file:
+        fpath = Path(target_file)
+        if not fpath.exists():
+            output_fn({"status": "error", "code": "FILE_NOT_FOUND", "message": f"待校验文稿不存在: {fpath}"})
+            return
+        if fpath.suffix.lower() in (".docx", ".pdf"):
+            from docx_tools import cmd_read_paper
+            doc_out: Dict[str, Any] = {}
+            cmd_read_paper(
+                argparse.Namespace(filepath=str(fpath), numbered=False, toc=False, section=None, max_chars=None, output=None, raw=False),
+                output_fn=doc_out.update,
+            )
+            if doc_out.get("status") == "error":
+                output_fn(doc_out)
+                return
+            markdown = str(doc_out.get("content") or doc_out.get("text") or "")
+        else:
+            markdown = fpath.read_text(encoding="utf-8")
     else:
         markdown = _build_review_draft(topic, selected, clusters, gaps, mode="draft")
-    validation = _validate_writing(markdown, selected, all_candidates=all_candidates)
+    validation = _validate_writing(
+        markdown,
+        selected,
+        all_candidates=all_candidates,
+        allow_primary_data=bool(getattr(args, "allow_primary_data", False)),
+    )
     validation.update({
         "project": _session_project(args),
         "topic": topic,
-        "checked_file": args.file,
+        "checked_file": str(target_file) if target_file else None,
     })
     output_fn(validation)
 
@@ -1307,7 +1727,10 @@ def cmd_review(args, output_fn: Callable[[Any], None] = _default_output) -> None
     selected = _select_review_papers(papers, topic, limit)
     clusters = _review_clusters(selected, topic) if getattr(args, "cluster", False) else None
     gaps = _review_gaps(papers, topic) if getattr(args, "gaps", False) else None
+    if gaps and getattr(args, "verify_gaps", False):
+        gaps = _verify_gaps_live(gaps, topic)
     evidence = [_paper_evidence(item["paper"], item["index"]) for item in selected]
+    comparison_matrix, _ = build_comparison_matrix(selected)
     markdown = _build_review_markdown(topic, selected, len(papers), candidates, clusters, gaps)
 
     if args.output:
@@ -1325,6 +1748,7 @@ def cmd_review(args, output_fn: Callable[[Any], None] = _default_output) -> None
             "total": len(papers),
             "output_file": args.output,
             "auto_detail": auto_detail,
+            "comparison_matrix": comparison_matrix,
             "clusters": clusters,
             "gaps": gaps,
             "evidence": evidence,

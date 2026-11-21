@@ -6,15 +6,19 @@ description: >-
   offline-identifies SCI/SSCI/A&HCI/ESCI, CCF-A/B/C (2026), and CAS Early Warning journals;
   enriches metadata via Crossref and resolves OA links via Unpaywall. Generates citations
   (GB/T 7714, APA, MLA, Chicago, pure-ASCII BibTeX, RIS), verifies & reconciles drifted titles,
-  writes literature reviews, suggests inline references, analyzes citation networks, and generates research trend reports.
+  builds structured literature comparison matrices & search-verified research gaps, audits claim
+  polarity & unbacked statistics, generates publication-ready empirical/regression/benchmark tables
+  (Markdown, LaTeX booktabs, Word three-line docx), recommends submission journals (quarantining CAS warnings),
+  and drafts point-by-point peer-review rebuttal letters linked to manuscript anchors.
   Use when the user asks to 搜索/检索/查找 文献/论文, 下载论文/全文, 写文献综述,
   引用建议/插入文献, 选题分析/研究选题/研究问题, 格式化参考文献, 参考文献/核验引用/题名核对, 引文追踪/引用网络/共引/同被引,
   研究趋势/热点分析, 文献对比/对比矩阵, 阅读笔记, Zotero/LaTeX/BibTeX,
+  描述性统计/相关系数矩阵/回归表/三线表/实验对比表, 投稿选刊/期刊推荐/目标期刊, 审稿意见/返修/Rebuttal/Response Letter,
   学术表达优化/论文改写/提升原创性, 查重/降重/降低重复率/重复率,
   知网/CNKI/PubMed/SCI/SSCI/CCF/预警期刊, 批量导出/计量分析, or 导出BibTeX/RIS.
   DO NOT USE for general web search, non-academic content, or code documentation lookup.
 metadata:
-  version: 1.24.2
+  version: 1.25.0
   compatibility:
     platform: any
     python: ">=3.9"
@@ -76,13 +80,16 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
 | 单词/高级搜索 | `search "词"`（支持 `--field 篇关摘`、`--author`、`--first-author`、`--affiliation`、`--journal`、`--fund`、`--fuzzy`） | `search "词" --source openalex`（多源用 `--source all --async-search`） |
 | 复杂同义词/布尔搜索 | **优先**单次专业检索式 `search --expr "TKA=('词1' + '词2') AND ..."`（快且不易弹滑块）；确实独立的多主题再用 `batch-search` | 逐组 `search --source openalex --append` |
 | 核心期刊与预警筛选 | 加 `--core`（知网支持 `北大核心,CSSCI,CSCD,AMI,EI`；英文源离线支持 `SCI,SSCI,AHCI,ESCI,CCF-A,CCF-B`）及 `--exclude-warning`（读 [core-journals.md](references/core-journals.md)） | API 源支持 `SCI/SSCI/AHCI/CCF` 与中科院预警期刊过滤；不支持中国知网核心体系筛选（须如实说明） |
-| 写文献综述 / 完整学术论文 | 核心优先检索入库 (`--project`) → `library --remove/--keep/--dedupe` 去噪 → `review --auto-detail --cluster --gaps` + 重点篇目 `read-detail` → 按 [workflows.md](references/workflows.md#撰写完整学术论文) 撰写（严禁虚构一手数据） → `validate --file` 核验 → `cite --from-file draft.md --rewrite-output final.md` → `write-docx` | 同左，检索改用 API 源（关注 `venue_tier`）或 `import <PDF目录>` |
-| 选题分析 | `topics --project <课题> --topic <方向>` | 同左 |
+| 写文献综述 / 完整学术论文 | 核心优先检索入库 (`--project`) → `library --remove/--keep/--dedupe` 去噪 → `review --auto-detail --cluster --gaps --verify-gaps` + 重点篇目 `read-detail` → 按 [workflows.md](references/workflows.md#撰写完整学术论文) 撰写（严禁虚构一手数据） → `validate draft.md` 校验极性与统计支撑 → `cite --from-file draft.md --rewrite-output final.md` → `write-docx` | 同左，检索改用 API 源（关注 `venue_tier`）或 `import <PDF目录>` |
+| 选题分析 | `topics --project <课题> --topic <方向> [--verify-gaps]` | 同左 |
 | 论文下载 | 先确认格式后 `search --download` 或 `batch-download` | 仅 `download --doi <DOI>`（开放获取 OA） |
+| 实证统计 / 回归 / 实验对比制表 | `data-table <csv/tsv/json> --type summary/corr/regression/comparison --format markdown/latex/docx` | 同左（纯本地标准库确定性计算） |
+| 投稿目标选刊匹配 | `match-journal [--project <课题>] [--from-file <文稿>] [--topic <方向> --live]`（自动分层冲刺/主投/稳健并隔离中科院在榜预警刊） | 同左 |
+| 审稿意见返修（Rebuttal） | `rebuttal <意见文件> [--manuscript <原稿.docx> --init-patch patch.json -o response.docx]` → 完善补丁与回复 → `patch-docx --dry-run` → 正式写回 | 同左 |
 | 学术表达优化 / Word 改写 | 先读 [style-audit.md](references/style-audit.md)：`read-paper --numbered` 读入段落锚点 → 审计 → 改写 → `patch-docx --dry-run` 预检 → 正式写回与变更报告 | 同左（不依赖知网） |
 | 引文追踪（滚雪球） / 趋势 | `citations <知网URL/中文题名/DOI> [--save both --append --project <课题>]` / `trends` | `citations <DOI/arXiv> [--save both --append]` / `trends` |
 | 本地 PDF 文献库导入 | `import <PDF文件夹或文件> --project <课题> [--append]` → 直接复用 `read-detail --fulltext`、`review`、`cite` | 同左 |
-| 对比矩阵 / 笔记 | 读 [workflows.md](references/workflows.md#文献对比矩阵) | 同左 |
+| 对比矩阵 / 笔记 | `review`（自带结构化 `comparison_matrix` 与结论极性分歧提示）+ 读 [workflows.md](references/workflows.md#文献对比矩阵) | 同左 |
 
 > 搜索结果为 `0` 时：主动尝试同义词、中英文切换、放宽年份或 `--source all --async-search` / `--enable-fallback`，不要第一次无结果就直接放弃。
 
@@ -101,10 +108,13 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
 | `zotero [词]` | 本机 Zotero 文献库直连 | `zotero [query] [--collection <集合>] [--list-collections] [--save --append --project <名>]` |
 | `import "path"` | 导入题录或 PDF 库 | 支持 NoteExpress / Refworks / BibTeX 及**本地 PDF 文件或文件夹**，`--append` `--project` |
 | `projects` / `library` | 课题库整理与批注 | `library --project <名> [--keep 1,3,5-8] [--remove 4,9] [--dedupe] [--indices 1,3 --tag "核心实证" --note "批注"]` |
-| `review` | 生成综述证据包 | `--project` `--topic` `--limit` `--auto-detail` `--detail-top-n` `--cluster` `--gaps` `--output` `--raw` |
-| `write` | 生成综述证据骨架 | `--project` `--topic` `--mode outline/draft/section` `--section` `--format markdown/docx` `--with-citations` `--validate` |
-| `validate` | 校验正文证据支撑 | `--project` `--topic` `--file draft.md` |
-| `topics` / `trends` / `citations` | 选题 / 趋势 / 深度引文 | `citations <知网URL/中文题名/DOI> --direction citing/cited/both/coref/cocited --limit 20 [--save both --append --project <名>]` |
+| `review` | 生成综述证据包与对比矩阵 | `--project` `--topic` `--limit` `--auto-detail` `--detail-top-n` `--cluster` `--gaps` `--verify-gaps`（联网核验外部命中篇数纠偏伪空白） `-o/--output` `--raw` |
+| `write` | 生成综述证据骨架 | `--project` `--topic` `--mode outline/draft/section` `--section` `--format markdown/docx` `--with-citations` `--validate` `-o/--output` |
+| `validate [file]` | 校验证据、极性冲突与统计归属 | `[filepath]` / `--file <md/docx/pdf>` `--project` `--topic` `--allow-primary-data`（检测反写正负向结论、年份错位及无引文裸统计数字） |
+| `data-table <file>` | 实证统计/回归/实验对比制表 | `<csv/tsv/json>` `--type/--mode summary/corr/regression/comparison` `--columns` `--digits` `--lang zh/en` `--caption` `--format markdown/latex/docx` `-o/--output` `--raw` |
+| `match-journal` | 投稿目标期刊分层匹配与避雷 | `--project` `--from-file <docx/md>` `--topic` `--live` `--lang all/zh/en` `--limit` `--raw`（隔离中科院在榜预警刊，标注历史调出刊） |
+| `rebuttal <file>` | 审稿意见拆解与回复函生成 | `<comments.txt/md/docx>` `--manuscript <原稿.docx/md>` `--title` `--lang auto/zh/en` `--format markdown/docx` `--init-patch <patch.json>` `-o/--output` `--raw` |
+| `topics` / `trends` / `citations` | 选题 / 趋势 / 深度引文 | `topics [--verify-gaps]`；`citations <知网URL/中文题名/DOI> --direction citing/cited/both/coref/cocited --limit 20 [--save both --append --project <名>]` |
 | `read-paper` / `pdf-meta` | 读用户文稿 / PDF 元数据 | `read-paper <docx/txt/md/tex/pdf> [--numbered] [--toc] [--section "第3章,4.2"] [--max-chars] [--output] [--raw]`；`pdf-meta <file.pdf>` |
 | `write-docx` / `patch-docx` | 生成 / 修补 Word | `write-docx <md> [--output] [--no-superscript]`（自动三线表、正文角标原生上标、摘要楷体、表题居中与页脚页码）；`patch-docx <docx> --patch patch.json [--dry-run] [--output]`（支持 `replace_references` 与 `superscript_citations`） |
 | `workflows` / `check` / `clean-cache` | 模板 / 自检 / 清缓存 | `check [--fix] [--cnki-dom]`（`--cnki-dom` 巡检知网页面改版契约）；`clean-cache [--all] [--dry-run]` |

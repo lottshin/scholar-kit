@@ -256,22 +256,44 @@ python scripts\literature.py workflows --execute literature_review_classic --var
 
 ## 文献对比矩阵
 
-用户要求对比多篇论文时，Agent 按以下模板整理（不需要新脚本命令）：
+1. **脚本结构化预抽取**：运行 `review --project <课题名> --cluster --gaps [--verify-gaps]`，脚本自动输出 `comparison_matrix`（含研究方法、样本区间、核心发现句与正向/负向/非线性效应极性）及聚类内的 `divergence_note`（正负向结论分歧提示）。
+2. **全文深挖与综合对比**：对重点篇目补充 `read-detail --indices ... --fulltext`，Agent 在脚本矩阵基础上补充**研究问题、理论贡献、局限性与同用户研究的对话关系**，输出 Markdown 表或通过 `write-docx` 生成原生 Word 三线表。
 
-1. 读取论文内容：知网论文用 `read-detail --fulltext`；API 源论文直接使用搜索返回的摘要，或由用户提供 PDF
-2. 对每篇论文提取以下维度：
+## 实证统计与实验制表（`data-table`）
 
-| 维度 | 说明 |
-|------|------|
-| 研究问题 | 论文试图回答什么问题 |
-| 研究方法 | 定性/定量/混合，具体方法 |
-| 数据来源 | 样本量、数据收集方式 |
-| 核心发现 | 主要结论（1-2 句） |
-| 理论贡献 | 对已有理论的推进 |
-| 局限性 | 作者承认的局限 |
-| 与用户研究的关联 | 如何为用户研究提供支持 |
+用户提供 `.csv / .tsv` 面板/问卷数据、回归模型结果 JSON 或算法实验对比表时，严禁手算均值/标准差或手拼显著性星号，统一调用 `data-table` 确定性生成：
 
-3. 输出为 Markdown 对比表，可用 `write-docx` 生成 Word
+```bash
+# 1. 描述性统计三线表（N, Mean, SD, Min, Median, Max）并直接导出 Word 三线表
+data-table panel.csv --type summary --columns "tfp,dig,size,lev" --caption "表1 主要变量描述性统计" --format docx -o table1.docx
+
+# 2. 皮尔逊相关系数矩阵（自动计算精确双尾 t 检验 p 值并标注 */**/***）导出 LaTeX booktabs
+data-table panel.csv --type corr --lang en --format latex -o corr_table.tex
+
+# 3. 经济学/社科双行回归表（系数 + 括号标准误或中括号 t 值 + 固定效应行 + N/R²）
+data-table models.json --type regression --caption "表3 基准回归与稳健性检验" --format docx -o reg.docx
+
+# 4. 机器学习/理工实验对比表（自动识别 Loss/RMSE/MAE/FID 越小越优，加粗最优、下划线次优）
+data-table benchmark.csv --type comparison --lang en --format latex
+```
+
+## 投稿目标期刊匹配（`match-journal`）
+
+用户询问“这篇论文适合投什么期刊”“推荐几个核心期刊并避开预警刊”时：
+
+1. 运行 `match-journal [--project <课题名>] [--from-file 论文定稿.docx] [--topic "<英文或中文研究主题>" --live] [--lang all/zh/en]`。
+2. 脚本自动聚合引文母刊与同领域高被引母刊，叠加离线核心索引（北大核心 / CSSCI / CSCD / SCI / SSCI / A&HCI / CCF）分为**冲刺顶刊/顶会（Tier 1）**、**主投高契合核心（Tier 2）**、**稳健拓展核心（Tier 3）**，并将**中科院在榜预警期刊**强制隔离至 `excluded_warning_venues`（2023 曾上榜已调出期刊附加历史谨慎提示）。
+3. Agent 结合用户论文篇幅、方法类型（实证计量 / 质性个案 / 算法工程）与审稿周期给出具体选刊建议。
+
+## 审稿意见返修与点对点回复函（`rebuttal`）
+
+用户收到期刊审稿意见（退修 / Major Revision / Minor Revision），需要撰写点对点回复函并同步修改原稿时：
+
+1. 运行 `rebuttal 审稿意见.txt --manuscript 原稿.docx --init-patch revise_patch.json -o Response_Letter.docx`：
+   - 自动拆分 `Editor`、`Reviewer #1/#2`、`审稿专家一/二` 的逐条意见（`R1-C1`、`R1-C2`...），识别意见类别（内生性与识别、文献对话、概念机制、数据图表、表述规范）；
+   - 自动按关键词重叠度定位原稿最相关的段落锚点 `[Pn]` 并预填 `revise_patch.json`。
+2. Agent 与用户逐条确认补充实证或改写方案后，填实回复正文与 `revise_patch.json` 中的 `find` / `replace`。
+3. 先执行 `patch-docx 原稿.docx --patch revise_patch.json --dry-run` 确认 100% 精准命中，再写回修订稿并输出终版 `Response_Letter.docx`。
 
 ## 阅读笔记生成
 

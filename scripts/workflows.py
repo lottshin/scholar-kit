@@ -45,9 +45,10 @@ WORKFLOW_TEMPLATES: Dict[str, Dict[str, Any]] = {
                 "command": "review",
                 "args": {
                     "cluster": True,
-                    "gaps": True
+                    "gaps": True,
+                    "verify_gaps": True,
                 },
-                "description": "生成主题聚类和研究空白分析"
+                "description": "生成结构化对比矩阵、主题聚类与外部检索验证的研究空白"
             }
         ],
         "variables": ["topic"],
@@ -378,6 +379,72 @@ WORKFLOW_TEMPLATES: Dict[str, Dict[str, Any]] = {
         "expected_output": "双向引文入库结果 + 主题脉络梳理",
         "estimated_time_seconds": 20,
     },
+
+    "manuscript_qa_gate": {
+        "name": "交稿前引文真伪与极性核验门禁",
+        "description": "一键核验文稿末尾参考文献真伪/补齐漏页码，并逐句反查正文论断是否出现结论极性写反或年份错标",
+        "steps": [
+            {
+                "command": "verify-refs",
+                "args": {
+                    "from_file": "{manuscript}",
+                    "fix_session": True,
+                    "project": "{project}",
+                },
+                "description": "核对文末参考文献真伪、纠偏改名/回译偏差并补齐卷期页码",
+            },
+            {
+                "command": "validate",
+                "args": {
+                    "file": "{manuscript}",
+                    "project": "{project}",
+                },
+                "description": "逐句校验正文引用支撑度、正负向极性冲突与统计数值归属",
+            },
+        ],
+        "variables": ["manuscript", "project"],
+        "expected_output": "参考文献真伪纠偏报告 + 正文论断极性与证据支撑评分",
+        "estimated_time_seconds": 25,
+    },
+
+    "submission_venue_matching": {
+        "name": "目标投稿期刊梯度推荐与预警避坑",
+        "description": "综合课题引文高频母刊、SCI/SSCI/CCF/北大核心/CSSCI 收录体系与中科院预警名单生成冲刺/主投/保底期刊梯度",
+        "steps": [
+            {
+                "command": "match-journal",
+                "args": {
+                    "project": "{project}",
+                    "topic": "{topic}",
+                    "live": True,
+                },
+                "description": "分析课题母刊分布并在线扩展同主题高契合核心期刊（自动剔除预警期刊）",
+            },
+        ],
+        "variables": ["project", "topic"],
+        "expected_output": "冲刺/主投/保底三级投稿推荐表 + 预警期刊避坑清单",
+        "estimated_time_seconds": 8,
+    },
+
+    "peer_review_rebuttal": {
+        "name": "审稿意见拆解与点对点返修闭环",
+        "description": "自动拆解审稿邮件条目、归类问题属性、匹配原稿段落锚点并生成标准 Response Letter 与修订补丁模板",
+        "steps": [
+            {
+                "command": "rebuttal",
+                "args": {
+                    "filepath": "{comments_file}",
+                    "manuscript": "{manuscript}",
+                    "output": "{output_file}",
+                    "init_patch": "{patch_file}",
+                },
+                "description": "生成逐条审稿回复函骨架与原稿段落锚点补丁模板",
+            },
+        ],
+        "variables": ["comments_file", "manuscript", "output_file", "patch_file"],
+        "expected_output": "Response Letter 文档 + 可供 patch-docx --dry-run 预检的补丁模板",
+        "estimated_time_seconds": 5,
+    },
 }
 
 
@@ -410,6 +477,8 @@ POSITIONAL_ARGS = {
     "import": {"filepath"},
     "pdf-meta": {"filepath"},
     "write-docx": {"filepath"},
+    "data-table": {"filepath"},
+    "rebuttal": {"filepath"},
 }
 
 

@@ -1,20 +1,21 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.23.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.25.0)
 
 模块职责分层:
-  - literature.py : CLI 参数解析、搜索/下载/引文/核验/导出路由编排
-  - config.py     : 全局 (~/.scholar-kit) 与工作区 (./.scholar-kit) 状态及配置加载
-  - evidence.py   : 会话/课题库（含筛选/去重/批注）、学科中立聚类、研究空白信号、证据骨架与论断核查
-  - docx_tools.py : .docx/.txt/.md/.tex/.pdf 论文读取（含段落锚点与章节切片）、本地 PDF 题录导入、Word 交稿排版与补丁预检
-  - sections.py   : 学术长文与硕博学位论文目录结构识别及按章节精准切片
-  - venues.py     : 国际期刊与会议质量离线识别（SCI/SSCI/A&HCI/ESCI、CCF 2026 推荐目录、中科院预警期刊）
-  - zotero.py     : 本机 Zotero SQLite / 本地 HTTP 零依赖直连与 PDF 附件映射
-  - doctor.py     : 环境自检 (`check`)、PEP 668 隔离虚拟环境引导与缓存清理 (`clean-cache`)
+  - literature.py     : CLI 参数解析、搜索/下载/引文/核验/导出路由编排
+  - config.py         : 全局 (~/.scholar-kit) 与工作区 (./.scholar-kit) 状态及配置加载
+  - evidence.py       : 会话/课题库、对比矩阵、结论极性/统计核验与外部检索空白实证
+  - research_tools.py : 实证数据三线表/LaTeX制表、目标投稿选刊匹配、审稿意见返修与补丁联动
+  - docx_tools.py     : .docx/.txt/.md/.tex/.pdf 论文读取（含段落锚点与章节切片）、本地 PDF 题录导入、Word 交稿排版与补丁预检
+  - sections.py       : 学术长文与硕博学位论文目录结构识别及按章节精准切片
+  - venues.py         : 国际期刊与会议质量离线识别（SCI/SSCI/A&HCI/ESCI、CCF 2026 推荐目录、中科院预警期刊）
+  - zotero.py         : 本机 Zotero SQLite / 本地 HTTP 零依赖直连与 PDF 附件映射
+  - doctor.py         : 环境自检 (`check`)、PEP 668 隔离虚拟环境引导与缓存清理 (`clean-cache`)
 """
 
 from __future__ import annotations
 
-__version__ = "1.23.0"
+__version__ = "1.25.0"
 
 import argparse
 import hashlib
@@ -85,6 +86,11 @@ from evidence import (  # noqa: E402
     parse_indices_spec,
 )
 from formatter import citation_preview, export_papers, generate_in_text_citations, generate_reference_list  # noqa: E402
+from research_tools import (  # noqa: E402
+    cmd_data_table as _cmd_data_table,
+    cmd_match_journal as _cmd_match_journal,
+    cmd_rebuttal as _cmd_rebuttal,
+)
 from sections import extract_frontmatter_toc, parse_fulltext_sections, public_toc, slice_fulltext_sections  # noqa: E402
 from search import (  # noqa: E402
     analyze_trends,
@@ -2000,6 +2006,18 @@ def cmd_close_browser(_args) -> None:
     _output(close_shared_browser())
 
 
+def cmd_data_table(args) -> None:
+    _cmd_data_table(args, output_fn=_output)
+
+
+def cmd_match_journal(args) -> None:
+    _cmd_match_journal(args, output_fn=_output)
+
+
+def cmd_rebuttal(args) -> None:
+    _cmd_rebuttal(args, output_fn=_output)
+
+
 def cmd_trends(args) -> None:
     papers = _load_session(_session_project(args))
     if not papers:
@@ -2472,11 +2490,12 @@ def main() -> None:
     p_review.add_argument("--topic", help="综述主题；默认使用 --project 或当前课题")
     p_review.add_argument("--project", help="课题文献库名称")
     p_review.add_argument("--limit", type=int, default=12, help="最多纳入前 N 篇相关文献（默认 12）")
-    p_review.add_argument("--output", help="输出 Markdown 文件路径")
+    p_review.add_argument("-o", "--output", help="输出 Markdown 文件路径")
     p_review.add_argument("--auto-detail", action="store_true", help="生成综述前自动补全高相关知网文献摘要")
     p_review.add_argument("--detail-top-n", type=int, default=5, help="配合 --auto-detail，最多补全 N 篇（默认 5）")
-    p_review.add_argument("--cluster", action="store_true", help="按语料关键词动态聚类")
+    p_review.add_argument("--cluster", action="store_true", help="按语料关键词动态聚类并检测正负向结论分歧")
     p_review.add_argument("--gaps", action="store_true", help="基于当前文献库统计生成覆盖度与空白提示")
+    p_review.add_argument("--verify-gaps", action="store_true", help="对候选空白发起外部数据库实时检索计数核验，附带真实命中篇数证明")
     p_review.add_argument("--raw", action="store_true", help="直接输出 Markdown 文本")
     p_review.set_defaults(func=cmd_review)
 
@@ -2487,25 +2506,64 @@ def main() -> None:
     p_write.add_argument("--format", choices=["markdown", "md", "docx"], default="markdown")
     p_write.add_argument("--mode", choices=["outline", "draft", "section"], default="draft")
     p_write.add_argument("--section", help="只生成指定章节")
-    p_write.add_argument("--output", help="输出文件路径")
+    p_write.add_argument("-o", "--output", help="输出文件路径")
     p_write.add_argument("--with-citations", action="store_true", help="附加参考文献列表")
     p_write.add_argument("--citation-style", default="gbt7714", choices=CITATION_STYLE_CHOICES)
     p_write.add_argument("--validate", action="store_true", help="同时输出证据质量校验报告")
     p_write.add_argument("--raw", action="store_true", help="直接输出 Markdown 文本")
     p_write.set_defaults(func=cmd_write)
 
-    p_validate = sub.add_parser("validate", help="校验综述正文的证据支撑质量")
+    p_validate = sub.add_parser("validate", help="校验综述/论文正文的证据支撑度、正负向结论极性冲突与统计数值归属")
+    p_validate.add_argument("filepath", nargs="?", help="待校验的文稿路径（支持 .md / .docx / .pdf / .txt，也可通过 --file 指定）")
     p_validate.add_argument("--project", help="课题文献库名称")
     p_validate.add_argument("--topic", help="写作主题")
     p_validate.add_argument("--limit", type=int, default=12, help="最多纳入前 N 篇相关文献（默认 12）")
-    p_validate.add_argument("--file", help="待校验的 Markdown 文件")
+    p_validate.add_argument("--file", help="待校验的文稿文件路径")
+    p_validate.add_argument("--allow-primary-data", action="store_true", help="声明正文包含作者真实一手样本/实验统计数据，免报无引文统计告警")
     p_validate.set_defaults(func=cmd_validate)
 
-    p_topics = sub.add_parser("topics", help="基于课题文献库生成带证据的选题建议")
+    p_topics = sub.add_parser("topics", help="基于课题文献库生成带证据与可检验空白的选题建议")
     p_topics.add_argument("--project", help="课题文献库名称")
     p_topics.add_argument("--topic", help="选题方向")
     p_topics.add_argument("--limit", type=int, default=6, help="最多生成 N 个选题建议（默认 6）")
+    p_topics.add_argument("--verify-gaps", action="store_true", help="联网探测候选交叉方向的真实外部文献命中篇数")
     p_topics.set_defaults(func=cmd_topics)
+
+    # data-table / match-journal / rebuttal（科研执行中后段闭环）
+    p_dtable = sub.add_parser("data-table", help="将实证 CSV/TSV/JSON 数据生成出版级三线统计表、相关系数矩阵、回归表或实验对比表（Markdown/LaTeX/Word）")
+    p_dtable.add_argument("filepath", help="输入数据文件路径（.csv / .tsv / .json）")
+    p_dtable.add_argument("--type", "--mode", dest="type", choices=["auto", "summary", "corr", "regression", "comparison"], default="auto",
+                          help="表格类型：summary(描述统计)/corr(相关矩阵带显著性星号)/regression(双行回归表)/comparison(实验对比加粗最优)")
+    p_dtable.add_argument("--columns", help="指定参与计算的列名，逗号分隔（默认自动识别数值列）")
+    p_dtable.add_argument("--digits", type=int, default=None, help="保留小数位数（默认描述/相关 3 位，回归 4 位，对比 2 位）")
+    p_dtable.add_argument("--lang", choices=["zh", "en"], default="zh", help="表头与表注语言（zh/en）")
+    p_dtable.add_argument("--caption", help="自定义表题（如 '表1 主要变量描述性统计'）")
+    p_dtable.add_argument("--format", choices=["markdown", "latex", "docx"], default="markdown",
+                          help="输出格式：markdown / latex (booktabs) / docx (原生三线表)")
+    p_dtable.add_argument("-o", "--output", help="输出文件路径")
+    p_dtable.add_argument("--raw", action="store_true", help="直接输出纯文本表格代码")
+    p_dtable.set_defaults(func=cmd_data_table)
+
+    p_mjournal = sub.add_parser("match-journal", help="基于课题引文母刊分布、核心收录体系与中科院预警名单推荐冲刺/主投/保底投稿期刊")
+    p_mjournal.add_argument("--project", help="课题文献库名称")
+    p_mjournal.add_argument("--from-file", help="从现有文稿（.docx/.md）末尾提取参考文献母刊参与匹配")
+    p_mjournal.add_argument("--topic", help="研究主题（配合 --live 在线扩展国际核心候选期刊）")
+    p_mjournal.add_argument("--live", action="store_true", help="联网检索同主题高被引母刊补充候选池")
+    p_mjournal.add_argument("--lang", choices=["all", "zh", "en"], default="all", help="筛选中文刊(zh)/英文刊(en)/全部(all)")
+    p_mjournal.add_argument("--limit", type=int, default=12, help="最多推荐期刊数量（默认 12）")
+    p_mjournal.add_argument("--raw", action="store_true", help="直接输出 Markdown 推荐表")
+    p_mjournal.set_defaults(func=cmd_match_journal)
+
+    p_rebuttal = sub.add_parser("rebuttal", help="拆解审稿专家意见并生成点对点回复函（Response Letter）与原稿段落修订补丁模板")
+    p_rebuttal.add_argument("filepath", help="审稿意见文件（.txt / .md / .docx）")
+    p_rebuttal.add_argument("--manuscript", help="原稿文件（.docx / .md），传入后自动匹配各条意见对应的段落锚点 [Pn]")
+    p_rebuttal.add_argument("--title", help="论文标题（填入回复函抬头）")
+    p_rebuttal.add_argument("--lang", choices=["auto", "zh", "en"], default="auto", help="回复函语言（默认按审稿意见自动识别中英文）")
+    p_rebuttal.add_argument("--format", choices=["markdown", "docx"], default="markdown", help="输出格式（markdown 或原生排版 docx）")
+    p_rebuttal.add_argument("-o", "--output", help="输出 Response Letter 路径")
+    p_rebuttal.add_argument("--init-patch", help="输出可供 patch-docx 使用的修订补丁模板 JSON 路径")
+    p_rebuttal.add_argument("--raw", action="store_true", help="直接输出 Markdown 回复函")
+    p_rebuttal.set_defaults(func=cmd_rebuttal)
 
     # workflows & check
     p_workflows = sub.add_parser("workflows", help="列出或执行预定义工作流模板")
