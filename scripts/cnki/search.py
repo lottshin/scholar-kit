@@ -2074,9 +2074,12 @@ def _bulk_export_from_results_page(driver, max_items: int = 50) -> List[Dict[str
             wrap.innerHTML = '<iframe id="__sk_export_frame" name="__sk_export_frame" src="about:blank" style="width:800px;height:600px;border:0;"></iframe>';
             document.body.appendChild(wrap);
             var ifr = document.getElementById('__sk_export_frame');
+            try { ifr.contentWindow.name = '__sk_export_frame'; } catch (e) {}
 
-            var origOpen = window.open;
-            var origSubmit = HTMLFormElement.prototype.submit;
+            if (!window.__sk_orig_open) window.__sk_orig_open = window.open;
+            if (!window.__sk_orig_submit) window.__sk_orig_submit = HTMLFormElement.prototype.submit;
+            var origOpen = window.__sk_orig_open;
+            var origSubmit = window.__sk_orig_submit;
             window.open = function(url) {
                 if (url && url !== 'about:blank') {
                     ifr.src = url;
@@ -2085,8 +2088,7 @@ def _bulk_export_from_results_page(driver, max_items: int = 50) -> List[Dict[str
             };
             HTMLFormElement.prototype.submit = function() {
                 try {
-                    this.setAttribute('target', '__sk_export_frame');
-                    this.target = '__sk_export_frame';
+                    HTMLFormElement.prototype.setAttribute.call(this, 'target', '__sk_export_frame');
                     if (!this.isConnected) document.body.appendChild(this);
                 } catch (e) {}
                 return origSubmit.apply(this, arguments);
@@ -2096,10 +2098,10 @@ def _bulk_export_from_results_page(driver, max_items: int = 50) -> List[Dict[str
             try {
                 exp.click();
             } finally {
+                if (origTarget === '_blank') exp.setAttribute('target', '_blank');
                 setTimeout(function() {
-                    window.open = origOpen;
-                    HTMLFormElement.prototype.submit = origSubmit;
-                    if (origTarget === '_blank') exp.setAttribute('target', '_blank');
+                    if (window.__sk_orig_open) window.open = window.__sk_orig_open;
+                    if (window.__sk_orig_submit) HTMLFormElement.prototype.submit = window.__sk_orig_submit;
                 }, 800);
             }
             return cnt;
@@ -2212,6 +2214,8 @@ def _bulk_export_from_results_page(driver, max_items: int = 50) -> List[Dict[str
                 pass
         try:
             driver.execute_script(r"""
+                if (window.__sk_orig_open) window.open = window.__sk_orig_open;
+                if (window.__sk_orig_submit) HTMLFormElement.prototype.submit = window.__sk_orig_submit;
                 var oldWrap = document.getElementById('__sk_export_wrap');
                 if (oldWrap) oldWrap.remove();
                 var clearBtn = document.querySelector('a.clearAll, #clearChecked, .BatchOper a[href*="clear"]');

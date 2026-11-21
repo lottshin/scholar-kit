@@ -629,12 +629,12 @@ def _open_cnki_reading_tab(driver, href: str, referrer: str = "") -> Optional[st
     """
     if not href:
         return None
-    ref = referrer
-    if not ref:
-        try:
-            ref = driver.current_url or "https://kns.cnki.net/"
-        except Exception:
-            ref = "https://kns.cnki.net/"
+    prev_url = ""
+    try:
+        prev_url = driver.current_url or ""
+    except Exception:
+        prev_url = ""
+    ref = referrer or prev_url or "https://kns.cnki.net/"
 
     navigated = False
     if hasattr(driver, "execute_cdp_cmd"):
@@ -649,17 +649,22 @@ def _open_cnki_reading_tab(driver, href: str, referrer: str = "") -> Optional[st
     if not navigated:
         _navigate_within_cnki(driver, href, base_delay=0.6)
 
-    deadline = time.time() + 12.0
+    start_ts = time.time()
+    deadline = start_ts + 15.0
     while time.time() < deadline:
         try:
             cur = driver.current_url or ""
             state = driver.execute_script("return document.readyState || '';") or ""
-            if cur and cur != "about:blank" and state in ("interactive", "complete"):
+            elapsed = time.time() - start_ts
+            # 单标签原位跳转时：必须等待 URL 真正离开旧详情页且完成 bar.cnki.net 鉴权中转跳转，避免在旧详情页上提前退出循环！
+            left_prev = bool(cur and cur != "about:blank" and (cur != prev_url or href == prev_url))
+            past_redirect_gate = ("bar.cnki.net" not in cur.lower()) or elapsed >= 5.5
+            if left_prev and past_redirect_gate and state == "complete":
                 break
         except Exception:
             pass
         time.sleep(0.3)
-    time.sleep(1.2)
+    time.sleep(1.5)
     return getattr(driver, "current_window_handle", "main") or "main"
 
 
@@ -769,6 +774,24 @@ def _read_fulltext_html(driver, detail_url: str) -> Optional[str]:
                 poll_timeout=120,
             )
             time.sleep(2)
+
+        # 等待 HTML 阅读器正文异步渲染就绪（防止 SPA 首帧尚未挂载段落即提前提取为空）
+        render_deadline = time.time() + 8.0
+        while time.time() < render_deadline:
+            try:
+                ready = driver.execute_script(r"""
+                    var el = document.querySelector('.article-body, .main-text, .article, #content, .content, .doc');
+                    if (el && (el.innerText || '').trim().length > 200) return true;
+                    var ps = document.querySelectorAll('p');
+                    var total = 0;
+                    for (var i = 0; i < ps.length; i++) total += (ps[i].innerText || '').trim().length;
+                    return total > 400;
+                """)
+                if ready or _detect_cnki_login_wall(driver):
+                    break
+            except Exception:
+                pass
+            time.sleep(0.4)
 
         return _extract_html_fulltext(driver)
 

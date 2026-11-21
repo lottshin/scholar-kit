@@ -485,7 +485,7 @@ def _launch_browser_outside_sandbox(browser: str, port: int = _DEFAULT_DEBUG_POR
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
         "--disable-blink-features=AutomationControlled",
-        "--window-position=-32000,-32000",
+        f"--window-position={_VISIBLE_POS[0]},{_VISIBLE_POS[1]}",
         "--window-size=1280,900",
         "about:blank",
     ]
@@ -1471,6 +1471,9 @@ def _detect_cnki_login_wall(driver: "webdriver.Remote") -> Optional[str]:
     if any(t in title for t in login_titles):
         return f"知网要求登录认证（页面：{title}），请连接校园网/VPN 或先运行 auth-cnki"
 
+    if "bar.cnki.net/bar/download/order" in url and any(k in title for k in ("订单", "支付", "结算", "购买", "充值")):
+        return f"知网要求付费购买或登录机构账号（页面：{title}），请连接校园网/VPN 或先运行 auth-cnki"
+
     try:
         wall_hit = driver.execute_script(r"""
             var body = (document.body && document.body.innerText) || '';
@@ -1480,9 +1483,9 @@ def _detect_cnki_login_wall(driver: "webdriver.Remote") -> Optional[str]:
             if (loginEl && loginEl.offsetParent !== null) {
                 return '检测到知网登录/付费拦截框';
             }
-            var markers = ['请先登录', '非授权用户', '机构用户登录', '个人账号登录', '购买本篇', '余额不足，请充值'];
+            var markers = ['请先登录', '非授权用户', '机构用户登录', '个人账号登录', '购买本篇', '余额不足', '扫码支付', '立即支付', '确认订单'];
             for (var i = 0; i < markers.length; i++) {
-                if (body.indexOf(markers[i]) >= 0 && body.length < 3500) {
+                if (body.indexOf(markers[i]) >= 0 && body.length < 4500) {
                     return markers[i];
                 }
             }

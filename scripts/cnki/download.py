@@ -149,7 +149,10 @@ def _click_download_btn(driver, file_format: str = "pdf") -> Optional[str]:
             btn = WebDriverWait(driver, 5).until(
                 EC.element_to_be_clickable((by, selector))
             )
-            btn.click()
+            try:
+                driver.execute_script("arguments[0].removeAttribute('target'); arguments[0].click();", btn)
+            except Exception:
+                btn.click()
             return file_format
         except (TimeoutException, NoSuchElementException):
             continue
@@ -159,11 +162,11 @@ def _click_download_btn(driver, file_format: str = "pdf") -> Optional[str]:
         for link in links:
             text = (link.text or "").strip()
             if text == btn_text:
-                link.click()
+                driver.execute_script("arguments[0].removeAttribute('target'); arguments[0].click();", link)
                 return file_format
             href = link.get_attribute("href") or ""
             if "download" in href and btn_text[:3] in text:
-                link.click()
+                driver.execute_script("arguments[0].removeAttribute('target'); arguments[0].click();", link)
                 return file_format
     except Exception:
         pass

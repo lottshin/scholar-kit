@@ -166,19 +166,23 @@ def save_adv_dom_diagnosis(driver, reason: str = "") -> Optional[str]:
 
 def probe_cnki_dom_contracts() -> Dict[str, Any]:
     """执行只读的知网高级检索页面 DOM 契约巡检（约 5 秒，不提交重度查询）。"""
-    from .driver import _create_driver, _detect_browser, _handle_captcha, _load_cookies, _release_driver, _safe_get
+    from .driver import (
+        _create_driver,
+        _detect_browser,
+        _handle_captcha,
+        _navigate_within_cnki,
+        _prepare_cnki_session,
+        _release_driver,
+    )
 
     sels = CNKI_SELECTORS["adv_search"]
     driver = None
     try:
         browser = _detect_browser()
         driver = _create_driver(browser=browser)
-        _safe_get(driver, "https://kns.cnki.net/")
-        time.sleep(0.5)
-        _load_cookies(driver)
+        _prepare_cnki_session(driver)
 
-        _safe_get(driver, CNKI_ADV_SEARCH_URL)
-        time.sleep(1.5)
+        _navigate_within_cnki(driver, CNKI_ADV_SEARCH_URL, base_delay=0.9)
         driver = _handle_captcha(driver)
 
         probe_js = r"""
