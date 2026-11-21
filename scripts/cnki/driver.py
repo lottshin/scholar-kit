@@ -481,8 +481,11 @@ def _launch_browser_outside_sandbox(browser: str, port: int = _DEFAULT_DEBUG_POR
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-popup-blocking",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
         "--disable-blink-features=AutomationControlled",
-        f"--window-position={_VISIBLE_POS[0]},{_VISIBLE_POS[1]}",
+        "--window-position=-32000,-32000",
         "--window-size=1280,900",
         "about:blank",
     ]
@@ -493,15 +496,19 @@ def _launch_browser_outside_sandbox(browser: str, port: int = _DEFAULT_DEBUG_POR
         CREATE_NEW_PROCESS_GROUP = 0x00000200
         DETACHED_PROCESS = 0x00000008
         creation_flags = CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 7  # SW_SHOWMINNOACTIVE：静默后台最小化启动，绝不抢占前台焦点
         try:
             subprocess.Popen(
                 [exe] + args,
                 creationflags=creation_flags,
+                startupinfo=si,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
             )
-            _log(f"[cnki] 已通过 CREATE_BREAKAWAY_FROM_JOB 在沙盒外启动 {browser}")
+            _log(f"[cnki] 已通过 CREATE_BREAKAWAY_FROM_JOB 静默后台启动 {browser}")
             return True
         except OSError as e:
             _log(f"[cnki] BREAKAWAY 方式失败: {e}，尝试 ShellExecute...")
@@ -512,12 +519,41 @@ def _launch_browser_outside_sandbox(browser: str, port: int = _DEFAULT_DEBUG_POR
                 None, "open", exe, " ".join(args), None, 7  # SW_SHOWMINNOACTIVE
             )
             if ret > 32:
-                _log(f"[cnki] 已通过 ShellExecuteW 在沙盒外启动 {browser}")
+                _log(f"[cnki] 已通过 ShellExecuteW 静默后台启动 {browser}")
                 return True
             else:
                 _log(f"[cnki] ShellExecuteW 返回错误码: {ret}")
         except Exception as e:
             _log(f"[cnki] ShellExecuteW 失败: {e}")
+
+    elif sys.platform == "darwin":
+        import subprocess
+        app_idx = exe.find(".app/")
+        if app_idx > 0 and shutil.which("open"):
+            app_bundle = exe[: app_idx + 4]
+            try:
+                subprocess.Popen(
+                    ["open", "-g", "-j", "-n", "-a", app_bundle, "--args"] + args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                )
+                _log(f"[cnki] 已通过 macOS open -g -j 静默后台启动 {browser}（不抢焦点）")
+                return True
+            except OSError as e:
+                _log(f"[cnki] open -g -j 启动失败: {e}，回退直接启动...")
+        try:
+            subprocess.Popen(
+                [exe] + args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+            )
+            _log(f"[cnki] 已在独立会话启动 {browser}，等待调试端口连接")
+            return True
+        except OSError as e:
+            _log(f"[cnki] 独立会话启动 {browser} 失败: {e}")
 
     else:
         import subprocess
@@ -605,8 +641,30 @@ def _connect_remote_browser(browser: str, port: int = _DEFAULT_DEBUG_PORT) -> "w
     return driver
 
 
+def _macos_hide_browser() -> bool:
+    """macOS 专用：通过 AppKit NSRunningApplication.hide 将 Scholar Kit 浏览器进程静默隐藏（无最小化果冻动画、不改视口尺寸）。"""
+    if sys.platform != "darwin":
+        return False
+    import subprocess
+    pid = _find_scholar_browser_pid_macos()
+    if not pid:
+        return False
+    jxa = (
+        'ObjC.import("AppKit"); '
+        f'var app = $.NSRunningApplication.runningApplicationWithProcessIdentifier({pid}); '
+        'if (app && !app.isNil()) { app.hide; "ok"; } else { "miss"; }'
+    )
+    try:
+        r = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa], capture_output=True, text=True, timeout=3)
+        return r.returncode == 0 and "ok" in (r.stdout or "")
+    except Exception:
+        return False
+
+
 def _hide_browser(driver: "webdriver.Remote"):
-    """将浏览器最小化到任务栏，便于用户随时恢复查看状态。"""
+    """将浏览器静默收至后台（macOS 使用进程级 AppKit hide 免抢焦点；其余平台最小化到任务栏）。"""
+    if sys.platform == "darwin" and _macos_hide_browser():
+        return
     try:
         driver.minimize_window()
     except Exception:
@@ -1020,17 +1078,42 @@ def _release_driver(driver: Optional["webdriver.Remote"], *, force_quit: bool = 
             try:
                 handles = list(getattr(driver, "window_handles", []) or [])
                 if len(handles) > 1:
-                    keep = handles[0]
-                    for h in handles[1:]:
+                    closed_via_cdp = False
+                    if hasattr(driver, "execute_cdp_cmd"):
                         try:
-                            driver.switch_to.window(h)
-                            driver.close()
+                            cur_h = getattr(driver, "current_window_handle", "") or ""
+                            t_info = driver.execute_cdp_cmd("Target.getTargets", {}) or {}
+                            pages = [
+                                t for t in (t_info.get("targetInfos") or [])
+                                if isinstance(t, dict) and t.get("type") == "page" and t.get("targetId")
+                            ]
+                            if len(pages) > 1:
+                                keep_tid = next(
+                                    (t["targetId"] for t in pages if t["targetId"] in cur_h),
+                                    pages[0]["targetId"],
+                                )
+                                for t in pages:
+                                    if t["targetId"] != keep_tid:
+                                        try:
+                                            driver.execute_cdp_cmd("Target.closeTarget", {"targetId": t["targetId"]})
+                                        except Exception:
+                                            pass
+                                closed_via_cdp = True
+                        except Exception:
+                            closed_via_cdp = False
+                    if not closed_via_cdp:
+                        keep = handles[0]
+                        for h in handles[1:]:
+                            try:
+                                driver.switch_to.window(h)
+                                driver.close()
+                            except Exception:
+                                pass
+                        try:
+                            driver.switch_to.window(keep)
                         except Exception:
                             pass
-                    try:
-                        driver.switch_to.window(keep)
-                    except Exception:
-                        pass
+                        _hide_browser(driver)
             except Exception:
                 pass
             try:
@@ -1077,6 +1160,28 @@ def close_shared_browser(port: Optional[int] = None, *, respect_lock: bool = Fal
             "port": active_port,
             "message": f"端口 {active_port} 未检测到运行中的共享浏览器实例",
         }
+
+    # macOS 优先通过进程级 SIGTERM 优雅退出（无需再拉起 chromedriver 触发窗口唤醒，Profile 会自动刷盘，Cookie 已在每轮 _release_driver 持久化）
+    if sys.platform == "darwin":
+        pid = _find_scholar_browser_pid_macos()
+        if pid:
+            try:
+                import signal
+                os.kill(pid, signal.SIGTERM)
+                deadline = time.time() + 3.0
+                while time.time() < deadline and _is_debug_port_open(active_port, timeout=0.2):
+                    time.sleep(0.15)
+                if not _is_debug_port_open(active_port, timeout=0.2):
+                    _release_browser_lock(lock_fh)
+                    return {
+                        "status": "success",
+                        "closed": True,
+                        "port": active_port,
+                        "message": f"已静默关闭端口 {active_port} 上的共享浏览器实例",
+                    }
+            except Exception:
+                pass
+
     driver = None
     try:
         browser = _detect_browser()
@@ -1139,6 +1244,9 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
     startup_args = [
         f"--proxy-bypass-list={';'.join(_cnki_proxy_bypass_domains())}",
         "--disable-popup-blocking",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
         "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
         "--disable-dev-shm-usage",
@@ -1178,8 +1286,9 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
                 handles = list(driver.window_handles or [])
                 if not handles:
                     driver.switch_to.new_window("tab")
-                else:
-                    driver.switch_to.window(handles[0])
+                    _hide_browser(driver)
+                # 切勿在此无故调用 driver.switch_to.window(handles[0])！
+                # chromedriver 连接时已默认绑定主标签页，调用 switch_to.window 会发送 Target.activateTarget 导致浏览器弹到前台抢焦点！
                 driver._scholar_reused = True
                 was_already_warm = True
                 _log(f"[cnki] 热复用已就绪浏览器实例 (port={port})")
@@ -1189,6 +1298,8 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
         if driver is None:
             launched = _launch_browser_outside_sandbox(browser, port)
             if launched and _wait_for_debug_port(port, timeout=10):
+                if not headless and sys.platform == "darwin":
+                    _macos_hide_browser()
                 _touch_browser_activity()
                 _spawn_idle_reaper(port)
                 try:
@@ -1273,8 +1384,11 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
     driver._scholar_was_warm = was_already_warm
     _touch_browser_activity()
 
-    if not headless and not was_already_warm:
-        _hide_browser(driver)
+    if not headless:
+        if not was_already_warm:
+            _hide_browser(driver)
+        elif sys.platform == "darwin":
+            _macos_hide_browser()
 
     return driver
 

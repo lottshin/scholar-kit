@@ -14,7 +14,7 @@ description: >-
   知网/CNKI/PubMed/SCI/SSCI/CCF/预警期刊, 批量导出/计量分析, or 导出BibTeX/RIS.
   DO NOT USE for general web search, non-academic content, or code documentation lookup.
 metadata:
-  version: 1.24.0
+  version: 1.24.1
   compatibility:
     platform: any
     python: ">=3.9"

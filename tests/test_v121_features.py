@@ -531,17 +531,12 @@ def test_open_cnki_reading_tab_bypasses_popup_blocker_with_referrer(monkeypatch)
         window_handles = ["detail_tab"]
 
         def __init__(self):
-            drv = self
-
             class _Sw:
                 def new_window(self, kind):
-                    assert kind == "tab"
-                    drv.window_handles.append("reading_tab")
-                    drv.current_window_handle = "reading_tab"
-                    drv.current_url = "about:blank"
+                    raise AssertionError("new_window must NOT be called (would trigger Target.activateTarget foreground steal)")
 
                 def window(self, h):
-                    drv.current_window_handle = h
+                    raise AssertionError("switch_to.window must NOT be called (would trigger Target.activateTarget foreground steal)")
 
             self.switch_to = _Sw()
 
@@ -553,11 +548,11 @@ def test_open_cnki_reading_tab_bypasses_popup_blocker_with_referrer(monkeypatch)
         def execute_script(self, script, *args):
             if "readyState" in script:
                 return "complete"
-            raise AssertionError("window.open should not be used when switch_to.new_window succeeds")
+            raise AssertionError("window.open should not be used")
 
     drv = _TabDrv()
     handle = det_mod._open_cnki_reading_tab(drv, "https://kns.cnki.net/kcms2/article/html?v=html456")
-    assert handle == "reading_tab"
+    assert handle == "detail_tab"
     assert cdp_calls == [
         (
             "Page.navigate",
@@ -729,3 +724,41 @@ def test_shared_browser_file_lock_serializes_and_respects_busy_on_reaper(tmp_pat
         drv_mod._release_browser_lock(fh3)
     finally:
         config.reset()
+
+
+def test_cdp_tab_cleanup_never_calls_switch_to_window(monkeypatch):
+    from cnki import driver as drv_mod
+
+    closed_targets = []
+
+    class _ReusedSilentDrv:
+        _scholar_reused = True
+        _scholar_lock_fh = None
+        current_window_handle = "CDwindow-AAA"
+        window_handles = ["CDwindow-AAA", "CDwindow-BBB"]
+
+        class _Sw:
+            def window(self, h):
+                raise AssertionError("switch_to.window must NOT be called during CDP tab cleanup")
+
+        switch_to = _Sw()
+
+        def get_cookies(self):
+            return []
+
+        def execute_cdp_cmd(self, cmd, params):
+            if cmd == "Target.getTargets":
+                return {
+                    "targetInfos": [
+                        {"type": "page", "targetId": "AAA"},
+                        {"type": "page", "targetId": "BBB"},
+                    ]
+                }
+            if cmd == "Target.closeTarget":
+                closed_targets.append(params["targetId"])
+                return {}
+            return {}
+
+    monkeypatch.setattr(drv_mod, "_save_cookies", lambda d: None)
+    drv_mod._release_driver(_ReusedSilentDrv())
+    assert closed_targets == ["BBB"]

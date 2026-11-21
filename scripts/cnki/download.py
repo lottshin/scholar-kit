@@ -17,6 +17,7 @@ from .driver import (
     _detect_browser,
     _create_driver,
     _detect_cnki_login_wall,
+    _hide_browser,
     _load_cookies,
     _navigate_within_cnki,
     _prepare_cnki_session,
@@ -171,7 +172,7 @@ def _click_download_btn(driver, file_format: str = "pdf") -> Optional[str]:
 
 
 def _check_post_download_auth_wall(driver, pre_handles: set, keep_window: str) -> Optional[str]:
-    """点击下载按钮后快速检查是否弹出了知网登录/付费拦截标签页（避免无权限时傻等 180s 超时）。"""
+    """点击下载按钮后快速检查是否弹出了知网登录/付费拦截标签页（无新增标签页时不调用 switch_to.window，避免唤醒后台浏览器）。"""
     time.sleep(1.8)
     try:
         cur_handles = list(driver.window_handles or [])
@@ -179,10 +180,15 @@ def _check_post_download_auth_wall(driver, pre_handles: set, keep_window: str) -
         return None
 
     extra_handles = [h for h in cur_handles if h not in pre_handles]
+    if not extra_handles:
+        return _detect_cnki_login_wall(driver)
+
     reason: Optional[str] = None
+    switched = False
     for h in extra_handles:
         try:
             driver.switch_to.window(h)
+            switched = True
             hit = _detect_cnki_login_wall(driver)
             if hit:
                 reason = hit
@@ -194,12 +200,17 @@ def _check_post_download_auth_wall(driver, pre_handles: set, keep_window: str) -
             continue
 
     try:
-        if keep_window in (driver.window_handles or []):
+        if switched and keep_window in (driver.window_handles or []):
             driver.switch_to.window(keep_window)
             if not reason:
                 reason = _detect_cnki_login_wall(driver)
     except Exception:
         pass
+    if switched:
+        try:
+            _hide_browser(driver)
+        except Exception:
+            pass
     return reason
 
 
@@ -436,9 +447,8 @@ def _trigger_batch_window(
     global_idx_offset: int, total: int,
     paper_hints: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
-    """并行加载批次：先开 N 个标签页让页面同时加载，再逐个切回去点下载。
-    Phase B 中途异常时 break 并把剩余 URL 推入重试，同时清理所有孤儿标签页。
-    返回 (ok_results, batch_errors, retry_urls)"""
+    """单标签静默触发批次下载：在主标签页顺序带 Referer 访问并触发浏览器异步下载流，
+    避免多标签 `switch_to.window` 触发 `Target.activateTarget` 导致浏览器无故弹到前台。"""
 
     main_window = driver.current_window_handle
     batch_meta: List[Dict[str, Any]] = []
@@ -446,45 +456,15 @@ def _trigger_batch_window(
     retry_urls = []
     snapshot_before = set(os.listdir(save_dir))
     abs_save_dir = os.path.abspath(save_dir)
+    handles_before = set(driver.window_handles or [])
 
-    tab_handles: List[tuple[str, str, int]] = []
-    handles_before = set(driver.window_handles)
+    _enable_download_behavior(driver, abs_save_dir)
 
     for i, url in enumerate(urls_window):
         idx = global_idx_offset + i + 1
         _log(f"[cnki-download] [{idx}/{total}] 打开详情页: {url[:80]}...")
-        orphan_handle = None
         try:
-            orphan_handle = _open_download_tab(driver, url, abs_save_dir)
-            if not orphan_handle:
-                _log(f"[cnki-download] [{idx}/{total}] 未能打开新标签")
-                batch_errors.append({"url": url, "code": "CNKI_DOWNLOAD_FAILED", "error": "无法打开新标签页"})
-                continue
-            tab_handles.append((url, orphan_handle, idx))
-            orphan_handle = None
-            if i < len(urls_window) - 1:
-                time.sleep(random.uniform(1.0, 2.0))
-        except Exception as e:
-            _log(f"[cnki-download] [{idx}/{total}] 开标签失败: {e}")
-            batch_errors.append({"url": url, "code": "CNKI_DOWNLOAD_FAILED", "error": str(e)})
-            retry_urls.append(url)
-            if orphan_handle:
-                try:
-                    driver.switch_to.window(orphan_handle)
-                    driver.close()
-                except Exception:
-                    pass
-            try:
-                driver.switch_to.window(main_window)
-            except Exception:
-                pass
-
-    if tab_handles:
-        time.sleep(REQUEST_INTERVAL)
-
-    for ti, (url, handle, idx) in enumerate(tab_handles):
-        try:
-            driver.switch_to.window(handle)
+            _navigate_within_cnki(driver, url)
             driver = _handle_captcha(driver)
             if paper_hints and url in paper_hints:
                 _heal_expired_download_url(driver, url, paper_hints.get(url))
@@ -495,8 +475,6 @@ def _trigger_batch_window(
             if _is_already_downloaded(title, save_dir):
                 _log(f"[cnki-download] [{idx}/{total}] 已存在，跳过")
                 batch_meta.append({"url": url, "title": title, "skipped": True})
-                driver.close()
-                driver.switch_to.window(main_window)
                 continue
 
             pre_click = set(driver.window_handles or [])
@@ -506,11 +484,9 @@ def _trigger_batch_window(
                 batch_errors.append({"url": url, "title": title,
                                      "code": "DOWNLOAD_BTN_NOT_FOUND", "error": err})
                 retry_urls.append(url)
-                driver.close()
-                driver.switch_to.window(main_window)
                 continue
 
-            auth_err = _check_post_download_auth_wall(driver, pre_click, handle)
+            auth_err = _check_post_download_auth_wall(driver, pre_click, main_window)
             if auth_err:
                 _log(f"[cnki-download] [{idx}/{total}] {auth_err}")
                 driver._cnki_download_auth_blocked = auth_err
@@ -521,24 +497,22 @@ def _trigger_batch_window(
                     "error": auth_err,
                 })
                 _cleanup_orphan_tabs(driver, handles_before, main_window)
+                _hide_browser(driver)
                 break
 
             batch_meta.append({"url": url, "title": title})
             _log(f"[cnki-download] [{idx}/{total}] 下载已触发")
-            time.sleep(random.uniform(0.6, 1.4))
-
-            driver.close()
-            driver.switch_to.window(main_window)
+            time.sleep(random.uniform(0.9, 1.6))
 
         except Exception as e:
             _log(f"[cnki-download] [{idx}/{total}] 失败: {e}")
             batch_errors.append({"url": url, "code": "CNKI_DOWNLOAD_FAILED", "error": str(e)})
             retry_urls.append(url)
-            remaining = tab_handles[ti + 1:]
-            for rem_url, _, rem_idx in remaining:
-                _log(f"[cnki-download] [{rem_idx}/{total}] 因批次异常推迟至重试")
+            for j, rem_url in enumerate(urls_window[i + 1:], start=idx + 1):
+                _log(f"[cnki-download] [{j}/{total}] 因批次异常推迟至重试")
                 retry_urls.append(rem_url)
             _cleanup_orphan_tabs(driver, handles_before, main_window)
+            _hide_browser(driver)
             break
 
     triggered = [m for m in batch_meta if "skipped" not in m]

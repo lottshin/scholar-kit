@@ -19,6 +19,7 @@ from .driver import (
     _detect_browser,
     _detect_cnki_login_wall,
     _handle_captcha,
+    _hide_browser,
     _load_cookies,
     _navigate_within_cnki,
     _prepare_cnki_session,
@@ -659,9 +660,9 @@ def _click_adv_submit_button(driver) -> bool:
                 for btn in btns:
                     if btn.is_displayed() and btn.is_enabled():
                         try:
-                            btn.click()
-                        except ElementClickInterceptedException:
                             driver.execute_script("arguments[0].click();", btn)
+                        except Exception:
+                            btn.click()
                         return True
             except Exception:
                 continue
@@ -2026,10 +2027,12 @@ def _set_per_page(driver, per_page: int = 50) -> bool:
 
 
 def _bulk_export_from_results_page(driver, max_items: int = 50) -> List[Dict[str, Any]]:
-    """尝试勾选当前页结果并通过知网 `Refworks` 题录导出一次性拿全摘要、关键词与卷期页码。
+    """尝试勾选当前页结果并通过同页隐藏 iframe 拦截知网 `Refworks` 导出，一次性静默拿齐摘要、关键词与卷期页码。
 
-    注意：2026 版知网题录导出在仅校园网 IP 登录、未登录个人账号时会重定向至 `login.cnki.net`。
-    本函数会在 <1s 内自动检测该重定向并缓存 `_cnki_export_unavailable=True`，后续翻页或多词检索直接零耗时跳过。
+    关键设计：
+    - 将知网 `window.open` / `<form target="_blank">` 重定向到同源隐藏 `<iframe name="__sk_export_frame">`，
+      全程 **零新建标签页、零 `switch_to.window`（避免触发 Chrome Target.activateTarget 抢占前台焦点）**；
+    - 未登录个人账号发生跨域跳转 `login.cnki.net` 时，iframe 跨域异常在 <0.5s 内即被捕获并记忆跳过。
     """
     if getattr(driver, "_cnki_export_unavailable", False):
         return []
@@ -2038,6 +2041,7 @@ def _bulk_export_from_results_page(driver, max_items: int = 50) -> List[Dict[str
     main_handle = driver.current_window_handle
     before_handles = set(driver.window_handles)
     new_handle = None
+    switched_window = False
     try:
         checked = driver.execute_script(r"""
             var limit = arguments[0];
@@ -2048,6 +2052,7 @@ def _bulk_export_from_results_page(driver, max_items: int = 50) -> List[Dict[str
                 cnt++;
             }
             if (cnt === 0) return 0;
+
             var exp = document.querySelector('a[exporttype="Refworks"], li[exporttype="Refworks"] a, a[exporttype*="Refworks" i]');
             if (!exp) {
                 var allExp = document.querySelectorAll('.BatchOper a, .export-list a, ul.export a, a');
@@ -2058,58 +2063,131 @@ def _bulk_export_from_results_page(driver, max_items: int = 50) -> List[Dict[str
                     }
                 }
             }
-            if (exp) {
+            if (!exp) return 0;
+
+            var oldWrap = document.getElementById('__sk_export_wrap');
+            if (oldWrap) oldWrap.remove();
+            var wrap = document.createElement('div');
+            wrap.id = '__sk_export_wrap';
+            wrap.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:800px;height:600px;opacity:0;pointer-events:none;';
+            // 必须由 HTML 解析器创建带 name 属性的 iframe，Chromium 才会将其注册为合法的 form.target 浏览上下文名称！
+            wrap.innerHTML = '<iframe id="__sk_export_frame" name="__sk_export_frame" src="about:blank" style="width:800px;height:600px;border:0;"></iframe>';
+            document.body.appendChild(wrap);
+            var ifr = document.getElementById('__sk_export_frame');
+
+            var origOpen = window.open;
+            var origSubmit = HTMLFormElement.prototype.submit;
+            window.open = function(url) {
+                if (url && url !== 'about:blank') {
+                    ifr.src = url;
+                }
+                return ifr.contentWindow;
+            };
+            HTMLFormElement.prototype.submit = function() {
+                try {
+                    this.setAttribute('target', '__sk_export_frame');
+                    this.target = '__sk_export_frame';
+                    if (!this.isConnected) document.body.appendChild(this);
+                } catch (e) {}
+                return origSubmit.apply(this, arguments);
+            };
+            var origTarget = exp.getAttribute('target');
+            if (origTarget === '_blank') exp.setAttribute('target', '__sk_export_frame');
+            try {
                 exp.click();
-                return cnt;
+            } finally {
+                setTimeout(function() {
+                    window.open = origOpen;
+                    HTMLFormElement.prototype.submit = origSubmit;
+                    if (origTarget === '_blank') exp.setAttribute('target', '_blank');
+                }, 800);
             }
-            return 0;
+            return cnt;
         """, int(max_items))
         if not checked:
             return []
 
-        deadline = time.time() + 4.5
-        while time.time() < deadline:
-            diff = set(driver.window_handles) - before_handles
-            if diff:
-                new_handle = diff.pop()
-                break
-            time.sleep(0.2)
-
-        if not new_handle:
-            return []
-
-        driver.switch_to.window(new_handle)
         raw_export = ""
         poll_end = time.time() + 6.5
         while time.time() < poll_end:
-            cur_url = (driver.current_url or "").lower()
-            cur_title = driver.title or ""
-            if (
-                "login.cnki.net" in cur_url
-                or "passport.cnki.net" in cur_url
-                or "fsso.cnki.net" in cur_url
-                or "登录" in cur_title
-                or _detect_cnki_login_wall(driver)
-            ):
-                driver._cnki_export_unavailable = True
-                _log("[cnki-export] 批量题录导出需知网个人账号登录，已自动记忆并切换行内引用补全")
-                return []
-            raw_export = driver.execute_script(r"""
-                var sels = ['#litotxt', '.literature-list', '#result', 'pre', 'textarea'];
-                for (var i = 0; i < sels.length; i++) {
-                    var el = document.querySelector(sels[i]);
-                    if (el) {
-                        var t = (el.value || el.innerText || el.textContent || '').trim();
-                        if (t.indexOf('T1 ') >= 0 || t.indexOf('RT ') >= 0) return t;
-                    }
-                }
-                var bodyTxt = (document.body && document.body.innerText) || '';
-                if (bodyTxt.indexOf('T1 ') >= 0) return bodyTxt;
-                return '';
-            """) or ""
-            if raw_export:
+            diff = set(driver.window_handles) - before_handles
+            if diff and not new_handle:
+                new_handle = diff.pop()
                 break
-            time.sleep(0.35)
+
+            frame_state = driver.execute_script(r"""
+                var ifr = document.getElementById('__sk_export_frame');
+                if (!ifr) return 'NO_FRAME';
+                try {
+                    var href = (ifr.contentWindow.location.href || '').toLowerCase();
+                    if (!href || href === 'about:blank') return 'LOADING';
+                    if (href.indexOf('login.cnki.net') >= 0 || href.indexOf('passport.cnki.net') >= 0 || href.indexOf('fsso.cnki.net') >= 0) {
+                        return '__AUTH_WALL__';
+                    }
+                    var doc = ifr.contentDocument;
+                    if (!doc) return 'LOADING';
+                    var title = doc.title || '';
+                    if (title.indexOf('登录') >= 0) return '__AUTH_WALL__';
+                    var sels = ['#litotxt', '.literature-list', '#result', 'pre', 'textarea'];
+                    for (var i = 0; i < sels.length; i++) {
+                        var el = doc.querySelector(sels[i]);
+                        if (el) {
+                            var t = (el.value || el.innerText || el.textContent || '').trim();
+                            if (t.indexOf('T1 ') >= 0 || t.indexOf('RT ') >= 0) return 'DATA:' + t;
+                        }
+                    }
+                    var bodyTxt = (doc.body && doc.body.innerText) || '';
+                    if (bodyTxt.indexOf('T1 ') >= 0) return 'DATA:' + bodyTxt;
+                    return 'LOADING';
+                } catch (err) {
+                    // 同源 kns.cnki.net 跳到跨域 login.cnki.net / passport.cnki.net 会立即抛出 SecurityError
+                    return '__AUTH_WALL__';
+                }
+            """) or ""
+            if frame_state == "__AUTH_WALL__":
+                driver._cnki_export_unavailable = True
+                _log("[cnki-export] 批量题录导出需知网个人账号登录，已静默记忆并切换行内引用补全")
+                return []
+            if frame_state.startswith("DATA:"):
+                raw_export = frame_state[5:]
+                break
+            time.sleep(0.3)
+
+        # 极端情况兜底：若知网未走拦截器而弹出了独立标签页
+        if not raw_export and new_handle:
+            switched_window = True
+            driver.switch_to.window(new_handle)
+            _hide_browser(driver)
+            sub_end = time.time() + 4.5
+            while time.time() < sub_end:
+                cur_url = (driver.current_url or "").lower()
+                cur_title = driver.title or ""
+                if (
+                    "login.cnki.net" in cur_url
+                    or "passport.cnki.net" in cur_url
+                    or "fsso.cnki.net" in cur_url
+                    or "登录" in cur_title
+                    or _detect_cnki_login_wall(driver)
+                ):
+                    driver._cnki_export_unavailable = True
+                    _log("[cnki-export] 批量题录导出需知网个人账号登录，已自动记忆并切换行内引用补全")
+                    return []
+                raw_export = driver.execute_script(r"""
+                    var sels = ['#litotxt', '.literature-list', '#result', 'pre', 'textarea'];
+                    for (var i = 0; i < sels.length; i++) {
+                        var el = document.querySelector(sels[i]);
+                        if (el) {
+                            var t = (el.value || el.innerText || el.textContent || '').trim();
+                            if (t.indexOf('T1 ') >= 0 || t.indexOf('RT ') >= 0) return t;
+                        }
+                    }
+                    var bodyTxt = (document.body && document.body.innerText) || '';
+                    if (bodyTxt.indexOf('T1 ') >= 0) return bodyTxt;
+                    return '';
+                """) or ""
+                if raw_export:
+                    break
+                time.sleep(0.35)
 
         if not raw_export:
             return []
@@ -2123,11 +2201,19 @@ def _bulk_export_from_results_page(driver, max_items: int = 50) -> List[Dict[str
                 if new_handle in driver.window_handles:
                     driver.switch_to.window(new_handle)
                     driver.close()
+                    switched_window = True
+            except Exception:
+                pass
+        if switched_window:
+            try:
+                driver.switch_to.window(main_handle)
+                _hide_browser(driver)
             except Exception:
                 pass
         try:
-            driver.switch_to.window(main_handle)
             driver.execute_script(r"""
+                var oldWrap = document.getElementById('__sk_export_wrap');
+                if (oldWrap) oldWrap.remove();
                 var clearBtn = document.querySelector('a.clearAll, #clearChecked, .BatchOper a[href*="clear"]');
                 if (clearBtn) { clearBtn.click(); return; }
                 document.querySelectorAll('table.result-table-list input.cbItem:checked').forEach(function(cb){ cb.click(); });
