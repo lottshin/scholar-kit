@@ -14,7 +14,7 @@ description: >-
   知网/CNKI/PubMed/SCI/SSCI/CCF/预警期刊, 批量导出/计量分析, or 导出BibTeX/RIS.
   DO NOT USE for general web search, non-academic content, or code documentation lookup.
 metadata:
-  version: 1.22.0
+  version: 1.23.0
   compatibility:
     platform: any
     python: ">=3.9"
@@ -94,7 +94,7 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
 | `batch-search` | 多词知网检索 | `词1 词2` 或 `--query-file`（中文多词推荐） `--core` `--doc-type` `--field` `--year-from` `--year-to` `--sort` `--pages` `--append` `--project` |
 | `read-detail` | 知网/PDF/Zotero 全文与章节切片 | `--indices 1,3,9` `--top-n` `--fulltext` `--toc`（硕博长文先看目录页码字数） `--section "研究设计,实证"`（按章/节精准切片免撑爆上下文） `--max-chars` `--project` |
 | `detail "url"` | 单篇知网详情 | |
-| `auth-cnki` / `close-browser` | 认证预热 / 关闭常驻浏览器 | `auth-cnki --auth-url --institution --wait-seconds --direct-domain`；`close-browser` 释放后台热复用浏览器 |
+| `auth-cnki` / `close-browser` | 认证预热 / 关闭常驻浏览器 | `auth-cnki --auth-url --institution --wait-seconds --direct-domain`；`close-browser` 释放后台热复用浏览器（默认空闲 20 分钟亦会自动回收，可通过 `SCHOLAR_BROWSER_IDLE_MINUTES` 调整） |
 | `download` / `batch-download` | 单篇 / 批量下载 | `--from-session` `--top-n` `--dir` `--doi` `--file-format pdf/caj` `--fallback-format caj` `--citation-style` `--project` |
 | `cite` / `export` | 引用 / 导出（自动补齐页码） | `cite --style` (`gbt7714`顺序编码 / `gbt7714-author-year`国标著者出版年 / `chinese-econ`经管社科顶刊 / `apa` / `mla` / `chicago` / `footnote`) `--from-file <draft.md/tex>` `--rewrite-output <final.md/tex>` `--bibtex-output <refs.bib>` `--in-text` `--indices 9,2,5` `--keep-numbers`；`export --format` (bibtex[纯ASCII键]/ris/markdown/json/excel/...) `--indices` `--output` `--raw` `--project` |
 | `verify-refs` | 题名纠偏与真伪/页码核验 | `verify-refs [--from-file <docx/md>] [--indices 1,3] [--fix-session] [--project <名>]`（支持直接提取文稿末尾参考文献，专治"作者对但题名改名/回译偏差搜不到"及漏页码，输出 `formatted_references`） |
@@ -116,7 +116,7 @@ Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "w
    - 用户未指明偏好时先追问：**下载文件格式**（`pdf` / `caj`，默认推荐 `pdf`）与**下载清单引用格式**（`gbt7714` / `apa` / `mla` / `chicago`）。
    - 明确"搜并下"用 `search ... --download` 一步完成；需先看列表挑选再用 `search` → `batch-download --from-session`。
    - 仅当用户同意兜底时加 `--fallback-format caj`（分目录存 `pdf/` 与 `caj/`，严禁把 CAJ 静默当作 PDF），完成后必须展示 `download_report.path` 及未下载原因。
-3. **校外知网认证与滑块验证协同**：校外/CARSI/VPN 场景优先运行 `auth-cnki` 预热（提前告知用户会打开浏览器手动登录/过验证、请勿关窗），成功后自动保存在 `~/.scholar-kit/browser-profile` 跨项目复用；当知网命令日志提示 `检测到知网安全验证页，弹出浏览器窗口...` 时，脚本会自动解除最小化并将浏览器强制置顶到最前方等待用户手动滑动（最长 180 秒，验证通过后自动重新最小化继续执行）——**Agent 严禁自行点击或绕过验证码，也切勿强杀任务或调用 `close-browser` 中断等待**，应简短提醒用户在已置顶的浏览器窗口中手动完成滑块即可。
+3. **校外知网认证与滑块验证协同**：校外/CARSI/VPN 场景优先运行 `auth-cnki` 预热（提前告知用户会打开浏览器手动登录/过验证、请勿关窗），成功后自动保存在 `~/.scholar-kit/browser-profile` 跨项目复用；未登录时调用 `--fulltext` 或 `download` 会在首篇秒级返回 `CNKI_AUTH_REQUIRED`（仍保留免费摘要与题录），此时引导用户连接校园网/VPN 或运行 `auth-cnki` 即可；当知网命令日志提示 `检测到知网安全验证页，弹出浏览器窗口...` 时，脚本会自动解除最小化并将浏览器强制置顶到最前方等待用户手动滑动（最长 180 秒，验证通过后自动重新最小化继续执行）——**Agent 严禁自行点击或绕过验证码，也切勿强杀任务或调用 `close-browser` 中断等待**，应简短提醒用户在已置顶的浏览器窗口中手动完成滑块即可。
 4. **综述写作闭环**：优先用 `review --cluster --gaps`（缺摘要叠加 `--auto-detail`）获取结构化证据包 → 由 Agent 结合学科语境撰写正文（`write` 命令仅提供证据骨架草稿） → 用 `validate --file` 校验论断与 `[序号]` 支撑度。
 5. **长文档与歧义**：请求模糊（如"帮我找论文/改论文"）先简短追问方向与操作类型；超过 **15,000 字**文稿按 1–2 章分段汇报改写，最后一次 `patch-docx` 提交；**严禁直接 cat/Read `.docx`**，必须用 `read-paper`。
 

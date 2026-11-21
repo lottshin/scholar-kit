@@ -1,5 +1,5 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.22.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.23.0)
 
 模块职责分层:
   - literature.py : CLI 参数解析、搜索/下载/引文/核验/导出路由编排
@@ -14,7 +14,7 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.22.0)
 
 from __future__ import annotations
 
-__version__ = "1.22.0"
+__version__ = "1.23.0"
 
 import argparse
 import hashlib
@@ -1452,9 +1452,23 @@ def cmd_read_detail(args) -> None:
                 entry["fulltext"] = ft_content
         elif do_fulltext:
             entry["fulltext"] = ""
+            if p.get("auth_required"):
+                entry["auth_required"] = True
         results.append(entry)
 
-    _output({"status": "success", "count": len(results), "results": results})
+    auth_reasons = [str(p.get("auth_reason") or "") for p in selected if p.get("auth_required")]
+    out_detail: Dict[str, Any] = {
+        "status": "partial" if (do_fulltext and auth_reasons) else "success",
+        "count": len(results),
+        "results": results,
+    }
+    if do_fulltext and auth_reasons:
+        out_detail["code"] = "CNKI_AUTH_REQUIRED"
+        out_detail["auth_warning"] = (
+            auth_reasons[0]
+            or "当前未检测到知网全文阅读权限，已保留全部论文免费摘要并跳过后续无效全文点击；如需全文请连接校园网/VPN 或运行 auth-cnki"
+        )
+    _output(out_detail)
 
 
 def _is_cnki_citation_target(paper_id: str) -> bool:

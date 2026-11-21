@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple
 
-from .constants import HAS_SELENIUM, _log
+from .constants import HAS_SELENIUM, REQUEST_INTERVAL, _log
 
 if HAS_SELENIUM:
     from selenium import webdriver
@@ -138,14 +138,24 @@ def _save_cookies(driver: "webdriver.Remote"):
         _log(f"[cnki] cookie 保存失败: {e}")
 
 
-def _load_cookies(driver: "webdriver.Remote"):
-    """从持久化文件加载 cookies 到浏览器"""
+def _load_cookies(driver: "webdriver.Remote", *, merge_only: bool = True):
+    """从持久化文件加载 cookies 到浏览器（默认 merge_only=True，绝不覆盖浏览器内存中已有的新鲜会话 Cookie）。"""
     p = _cookie_path(for_write=False)
     if not p.exists():
         return
     try:
+        existing_names = set()
+        if merge_only:
+            try:
+                existing_names = {c.get("name") for c in (driver.get_cookies() or []) if isinstance(c, dict) and c.get("name")}
+            except Exception:
+                existing_names = set()
         cookies = json.loads(p.read_text(encoding="utf-8"))
         for cookie in cookies:
+            if not isinstance(cookie, dict):
+                continue
+            if merge_only and cookie.get("name") in existing_names:
+                continue
             cookie.pop("sameSite", None)
             try:
                 driver.add_cookie(cookie)
@@ -157,6 +167,80 @@ def _load_cookies(driver: "webdriver.Remote"):
                     pass
     except Exception as e:
         _log(f"[cnki] cookie 加载失败: {e}")
+
+
+def _browser_activity_file() -> Path:
+    return _profile_dir(create=False).parent / "browser-last-active.txt"
+
+
+def _touch_browser_activity() -> None:
+    """刷新共享浏览器最近活跃时间戳（供闲置守护进程判断是否超时回收）。"""
+    try:
+        act_p = _browser_activity_file()
+        act_p.parent.mkdir(parents=True, exist_ok=True)
+        act_p.write_text(f"{time.time():.3f}\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _idle_timeout_seconds() -> int:
+    raw = os.environ.get("SCHOLAR_BROWSER_IDLE_MINUTES", "").strip()
+    if not raw:
+        try:
+            from config import get as cfg_get
+            raw = str(cfg_get("browser_idle_minutes", 20))
+        except Exception:
+            raw = "20"
+    try:
+        mins = float(raw)
+        return max(0, int(mins * 60))
+    except (TypeError, ValueError):
+        return 1200
+
+
+def _spawn_idle_reaper(port: int) -> None:
+    """启动极轻量后台守护子进程：共享浏览器连续闲置超过阈值（默认 20 分钟）后自动调用 close_shared_browser 退出，避免程序坞长期残留图标。"""
+    idle_sec = _idle_timeout_seconds()
+    if idle_sec <= 0:
+        return
+    scripts_root = str(Path(__file__).resolve().parents[1])
+    act_file = str(_browser_activity_file())
+    reaper_code = (
+        "import pathlib, socket, sys, time\n"
+        f"sys.path.insert(0, {scripts_root!r})\n"
+        f"port, idle_sec, act_p = {int(port)}, {int(idle_sec)}, pathlib.Path({act_file!r})\n"
+        "def port_alive():\n"
+        "    try:\n"
+        "        with socket.create_connection(('127.0.0.1', port), timeout=0.5): return True\n"
+        "    except Exception: return False\n"
+        "time.sleep(15)\n"
+        "while port_alive():\n"
+        "    try:\n"
+        "        last = float(act_p.read_text(encoding='utf-8').strip())\n"
+        "    except Exception:\n"
+        "        last = time.time()\n"
+        "    if time.time() - last >= idle_sec:\n"
+        "        try:\n"
+        "            from cnki.driver import close_shared_browser\n"
+        "            close_shared_browser(port)\n"
+        "        except Exception: pass\n"
+        "        break\n"
+        "    time.sleep(45)\n"
+    )
+    import subprocess
+    kwargs: dict = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = 0x00000200 | 0x00000008
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen([sys.executable, "-c", reaper_code], **kwargs)
+    except Exception:
+        pass
 
 
 _STEALTH_JS = """
@@ -318,6 +402,7 @@ def _launch_browser_outside_sandbox(browser: str, port: int = _DEFAULT_DEBUG_POR
         f"--proxy-bypass-list={';'.join(_cnki_proxy_bypass_domains())}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-popup-blocking",
         "--disable-blink-features=AutomationControlled",
         f"--window-position={_VISIBLE_POS[0]},{_VISIBLE_POS[1]}",
         "--window-size=1280,900",
@@ -844,6 +929,7 @@ def _release_driver(driver: Optional["webdriver.Remote"], *, force_quit: bool = 
     if driver is None:
         return
     try:
+        _touch_browser_activity()
         _save_cookies(driver)
     except Exception:
         pass
@@ -955,6 +1041,7 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
         options.add_argument("--headless=new")
     startup_args = [
         f"--proxy-bypass-list={';'.join(_cnki_proxy_bypass_domains())}",
+        "--disable-popup-blocking",
         "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
         "--disable-dev-shm-usage",
@@ -1003,6 +1090,8 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
         if driver is None:
             launched = _launch_browser_outside_sandbox(browser, port)
             if launched and _wait_for_debug_port(port, timeout=10):
+                _touch_browser_activity()
+                _spawn_idle_reaper(port)
                 try:
                     driver = _connect_remote_browser(browser, port)
                     driver._scholar_reused = True
@@ -1077,11 +1166,115 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
 
     driver.set_page_load_timeout(30)
     driver.implicitly_wait(3)
+    driver._scholar_was_warm = was_already_warm
+    _touch_browser_activity()
 
     if not headless and not was_already_warm:
         _hide_browser(driver)
 
     return driver
+
+
+def _prepare_cnki_session(driver: "webdriver.Remote") -> None:
+    """初始化或热复用知网会话：
+    - 若热复用实例当前已停留在 cnki.net 正常页面，直接保留内存新鲜会话（不重刷首页、不用旧文件覆盖 Cookie，大幅降低二次滑块触发率）；
+    - 仅在冷启动（如 about:blank）时访问一次知网首页并合并缺失 Cookie。
+    """
+    import random as _random
+    _touch_browser_activity()
+    cur_url = ""
+    try:
+        cur_url = driver.current_url or ""
+    except Exception:
+        cur_url = ""
+
+    if (
+        getattr(driver, "_scholar_was_warm", False)
+        and "cnki.net" in cur_url
+        and not _is_cnki_security_gate(driver)
+    ):
+        _log("[cnki] 复用已就绪知网页面会话，跳过重刷首页与 Cookie 覆盖")
+        return
+
+    _safe_get(driver, "https://kns.cnki.net/")
+    time.sleep(_random.uniform(0.55, 0.95))
+    _load_cookies(driver, merge_only=True)
+
+
+def _navigate_within_cnki(
+    driver: "webdriver.Remote",
+    target_url: str,
+    *,
+    base_delay: Optional[float] = None,
+) -> None:
+    """站内自然跳转：当前已在 cnki.net 时优先通过 window.location.href 导航以携带真实站内 Referer，并附加随机抖动间隔。"""
+    import random as _random
+    _touch_browser_activity()
+    cur_url = ""
+    try:
+        cur_url = driver.current_url or ""
+    except Exception:
+        cur_url = ""
+
+    navigated = False
+    if "cnki.net" in cur_url and target_url.startswith("http"):
+        try:
+            driver.execute_script("window.location.href = arguments[0];", target_url)
+            navigated = True
+        except Exception:
+            navigated = False
+
+    if not navigated:
+        _safe_get(driver, target_url)
+
+    wait_base = base_delay if base_delay is not None else max(1.0, REQUEST_INTERVAL - 1.2)
+    time.sleep(wait_base + _random.uniform(0.35, 1.15))
+
+
+def _detect_cnki_login_wall(driver: "webdriver.Remote") -> Optional[str]:
+    """毫秒级检测当前标签页是否被知网重定向到登录/机构认证/付费拦截页（用于全文与下载快速短路）。"""
+    try:
+        url = (driver.current_url or "").lower()
+        title = (driver.title or "").strip()
+    except Exception:
+        return None
+
+    login_hosts = (
+        "login.cnki.net",
+        "passport.cnki.net",
+        "fsso.cnki.net",
+        "my.cnki.net/login",
+        "ecp.cnki.net",
+    )
+    if any(h in url for h in login_hosts):
+        return "当前未登录知网机构或个人账号（已跳转至登录认证页），全文阅读与下载需连接校园网/VPN 或先运行 auth-cnki"
+
+    login_titles = ("欢迎登录", "会员登录", "账号登录", "机构登录", "个人登录", "统一身份认证", "登录-中国知网")
+    if any(t in title for t in login_titles):
+        return f"知网要求登录认证（页面：{title}），请连接校园网/VPN 或先运行 auth-cnki"
+
+    try:
+        wall_hit = driver.execute_script(r"""
+            var body = (document.body && document.body.innerText) || '';
+            var hasContent = !!(document.querySelector('#ChDivSummary, .article-body, .main-text, canvas'));
+            if (hasContent) return '';
+            var loginEl = document.querySelector('.login-box, #loginBox, form[action*="login"], .ecp_login, .pay-box');
+            if (loginEl && loginEl.offsetParent !== null) {
+                return '检测到知网登录/付费拦截框';
+            }
+            var markers = ['请先登录', '非授权用户', '机构用户登录', '个人账号登录', '购买本篇', '余额不足，请充值'];
+            for (var i = 0; i < markers.length; i++) {
+                if (body.indexOf(markers[i]) >= 0 && body.length < 3500) {
+                    return markers[i];
+                }
+            }
+            return '';
+        """)
+        if wall_hit:
+            return f"知网全文/下载权限受限（{wall_hit}），请连接校园网/VPN 或先运行 auth-cnki"
+    except Exception:
+        pass
+    return None
 
 
 # ── 校园网检测 ────────────────────────────────────────

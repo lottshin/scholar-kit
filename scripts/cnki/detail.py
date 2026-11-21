@@ -13,8 +13,16 @@ from .constants import (
     HAS_SELENIUM, REQUEST_INTERVAL, _log,
 )
 from .driver import (
-    _detect_browser, _create_driver, _load_cookies, _save_cookies,
-    _handle_captcha, _release_driver, _safe_get,
+    _detect_browser,
+    _create_driver,
+    _detect_cnki_login_wall,
+    _load_cookies,
+    _navigate_within_cnki,
+    _prepare_cnki_session,
+    _save_cookies,
+    _handle_captcha,
+    _release_driver,
+    _safe_get,
 )
 
 if HAS_SELENIUM:
@@ -557,6 +565,62 @@ def _has_fulltext_slider(driver) -> bool:
     return False
 
 
+def _open_cnki_reading_tab(driver, href: str) -> Optional[str]:
+    """在知网详情页基础上新建阅读标签页并携带站内 Referer，彻底免疫 Chrome 弹窗拦截。"""
+    referrer = ""
+    try:
+        referrer = driver.current_url or "https://kns.cnki.net/"
+    except Exception:
+        referrer = "https://kns.cnki.net/"
+
+    handles_before = set(getattr(driver, "window_handles", []) or [])
+    switch_to = getattr(driver, "switch_to", None)
+    if switch_to is not None and hasattr(switch_to, "new_window"):
+        try:
+            switch_to.new_window("tab")
+            new_window = driver.current_window_handle
+            navigated_with_ref = False
+            if hasattr(driver, "execute_cdp_cmd"):
+                try:
+                    driver.execute_cdp_cmd(
+                        "Page.navigate",
+                        {"url": href, "referrer": referrer},
+                    )
+                    navigated_with_ref = True
+                except Exception:
+                    navigated_with_ref = False
+            if not navigated_with_ref:
+                _navigate_within_cnki(driver, href, base_delay=0.6)
+
+            deadline = time.time() + 12.0
+            while time.time() < deadline:
+                try:
+                    cur = driver.current_url or ""
+                    state = driver.execute_script("return document.readyState || '';") or ""
+                    if cur and cur != "about:blank" and state in ("interactive", "complete"):
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.3)
+            time.sleep(1.2)
+            return new_window
+        except Exception:
+            pass
+
+    try:
+        driver.execute_script("window.open(arguments[0], '_blank');", href)
+        time.sleep(2.0)
+        new_handles = set(getattr(driver, "window_handles", []) or []) - handles_before
+        if new_handles:
+            new_window = new_handles.pop()
+            driver.switch_to.window(new_window)
+            time.sleep(1.0)
+            return new_window
+    except Exception:
+        pass
+    return None
+
+
 def _read_fulltext_html(driver, detail_url: str) -> Optional[str]:
     """在已打开的详情页上查找并进入 HTML 全文阅读页，提取正文文本。"""
     original_window = driver.current_window_handle
@@ -602,20 +666,14 @@ def _read_fulltext_html(driver, detail_url: str) -> Optional[str]:
         href = html_link.get_attribute("href") or ""
         _log(f"[cnki-fulltext] 找到 HTML 阅读链接: {href[:80]}")
 
-        handles_before = set(driver.window_handles)
-        driver.execute_script("window.open(arguments[0], '_blank');", href)
-        time.sleep(3)
-
-        new_handles = set(driver.window_handles) - handles_before
-        if not new_handles:
+        new_window = _open_cnki_reading_tab(driver, href)
+        if not new_window:
             _log("[cnki-fulltext] 未能打开新标签页")
             return None
 
-        new_window = new_handles.pop()
         fulltext = None
         try:
             driver.switch_to.window(new_window)
-            time.sleep(3)
 
             try:
                 WebDriverWait(driver, 15).until(
@@ -623,6 +681,12 @@ def _read_fulltext_html(driver, detail_url: str) -> Optional[str]:
                 )
             except TimeoutException:
                 _log("[cnki-fulltext] HTML 全文页加载超时")
+                return None
+
+            auth_wall = _detect_cnki_login_wall(driver)
+            if auth_wall:
+                _log(f"[cnki-fulltext] {auth_wall}")
+                driver._cnki_auth_wall_reason = auth_wall
                 return None
 
             driver = _handle_captcha(driver)
@@ -801,25 +865,31 @@ def _read_fulltext_flowpdf(driver, detail_url: str) -> Optional[str]:
 
         _log(f"[cnki-flowpdf] 原版阅读链接: {href[:80]}")
 
-        handles_before = set(driver.window_handles)
-        driver.execute_script("window.open(arguments[0], '_blank');", href)
-        time.sleep(3)
-
-        new_handles = set(driver.window_handles) - handles_before
-        if not new_handles:
+        new_window = _open_cnki_reading_tab(driver, href)
+        if not new_window:
             _log("[cnki-flowpdf] 未能打开新标签页")
             return None
 
-        new_window = new_handles.pop()
         try:
             driver.switch_to.window(new_window)
 
+            auth_wall = _detect_cnki_login_wall(driver)
+            if auth_wall:
+                _log(f"[cnki-flowpdf] {auth_wall}")
+                driver._cnki_auth_wall_reason = auth_wall
+                return None
+
             try:
-                WebDriverWait(driver, 20).until(
+                WebDriverWait(driver, 18).until(
                     EC.presence_of_element_located((By.TAG_NAME, "canvas"))
                 )
             except TimeoutException:
-                _log("[cnki-flowpdf] 页面加载超时（未发现 canvas）")
+                auth_wall_after = _detect_cnki_login_wall(driver)
+                if auth_wall_after:
+                    _log(f"[cnki-flowpdf] {auth_wall_after}")
+                    driver._cnki_auth_wall_reason = auth_wall_after
+                else:
+                    _log("[cnki-flowpdf] 页面加载超时（未发现 canvas）")
                 return None
 
             driver = _handle_captcha(driver)
@@ -1095,18 +1165,16 @@ def batch_read_detail(
         browser = _detect_browser()
         driver = _create_driver(browser=browser)
 
-        _safe_get(driver, "https://kns.cnki.net/")
-        time.sleep(0.6)
-        _load_cookies(driver)
+        _prepare_cnki_session(driver)
         _save_cookies(driver)
+        auth_blocked_reason: Optional[str] = None
 
         for idx, paper in enumerate(need_web_targets):
             url = paper["url"]
             _log(f"\n[cnki-detail] === {idx + 1}/{len(need_web_targets)}: {paper.get('title', '')[:40]} ===")
 
             try:
-                _safe_get(driver, url)
-                time.sleep(max(1.2, REQUEST_INTERVAL - 1))
+                _navigate_within_cnki(driver, url)
                 driver = _handle_captcha(driver)
 
                 if _is_cnki_error_or_404(driver) and paper.get("title"):
@@ -1119,8 +1187,7 @@ def batch_read_detail(
                     if refreshed:
                         url = refreshed
                         paper["url"] = refreshed
-                        _safe_get(driver, url)
-                        time.sleep(max(1.2, REQUEST_INTERVAL - 1))
+                        _navigate_within_cnki(driver, url)
                         driver = _handle_captcha(driver)
 
                 detail = _parse_detail_page(driver)
@@ -1142,11 +1209,20 @@ def batch_read_detail(
                         continue
 
                     ft = _extract_local_pdf_fulltext(paper.get("title", ""), explicit_pdf=paper.get("local_pdf"))
+                    if not ft and auth_blocked_reason:
+                        paper["has_fulltext"] = False
+                        paper["auth_required"] = True
+                        paper["auth_reason"] = auth_blocked_reason
+                        continue
+
                     if not ft:
                         ft = _read_fulltext_html(driver, url)
-                    if not ft:
+                    wall_now = getattr(driver, "_cnki_auth_wall_reason", None)
+                    if not ft and not wall_now:
                         _log("[cnki-detail] HTML阅读不可用，尝试原版阅读(FlowPDF)...")
                         ft = _read_fulltext_flowpdf(driver, url)
+                        wall_now = getattr(driver, "_cnki_auth_wall_reason", None)
+
                     if ft:
                         saved = _save_cached_fulltext(url, {
                             "cnki_id": paper.get("cnki_id", ""),
@@ -1160,6 +1236,12 @@ def batch_read_detail(
                         paper["fulltext_length"] = len(ft)
                         paper["fulltext_cache"] = str(saved)
                         _log(f"[cnki-detail] 全文获取成功: {len(ft)} 字")
+                    elif wall_now:
+                        auth_blocked_reason = str(wall_now)
+                        paper["has_fulltext"] = False
+                        paper["auth_required"] = True
+                        paper["auth_reason"] = auth_blocked_reason
+                        _log("[cnki-detail] 首篇已确认当前无全文权限，后续篇目仅提取免费摘要并跳过重复全文点击")
                     else:
                         _log("[cnki-detail] HTML阅读和原版阅读均失败，仅保留摘要")
                         paper["has_fulltext"] = False
@@ -1425,9 +1507,7 @@ def get_cnki_citations(
         browser = _detect_browser()
         driver = _create_driver(browser=browser)
 
-        _safe_get(driver, "https://kns.cnki.net/")
-        time.sleep(0.6)
-        _load_cookies(driver)
+        _prepare_cnki_session(driver)
 
         detail_url = raw_target if raw_target.lower().startswith("http") else ""
         if not detail_url:
@@ -1443,8 +1523,7 @@ def get_cnki_citations(
         cit_url = detail_url if "anchor=citnet" in detail_url else (
             f"{detail_url}&anchor=citnet" if "?" in detail_url else f"{detail_url}?anchor=citnet"
         )
-        _safe_get(driver, cit_url)
-        time.sleep(max(1.5, REQUEST_INTERVAL - 1))
+        _navigate_within_cnki(driver, cit_url)
         driver = _handle_captcha(driver)
 
         if _is_cnki_error_or_404(driver) and not raw_target.lower().startswith("http"):

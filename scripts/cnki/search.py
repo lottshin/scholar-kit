@@ -19,6 +19,7 @@ from .driver import (
     _detect_browser,
     _handle_captcha,
     _load_cookies,
+    _prepare_cnki_session,
     _release_driver,
     _safe_get,
     _save_cookies,
@@ -1100,9 +1101,7 @@ def reconcile_cnki_paper(
         if owns_driver:
             browser = _detect_browser()
             driver = _create_driver(browser=browser)
-            _safe_get(driver, "https://kns.cnki.net/")
-            time.sleep(0.6)
-            _load_cookies(driver)
+            _prepare_cnki_session(driver)
 
         def _run_expr_once(expr_str: str, use_50: bool = False) -> List[Dict[str, Any]]:
             _safe_get(driver, CNKI_ADV_SEARCH_URL)
@@ -1302,9 +1301,7 @@ def search_cnki(
         _log(f"[cnki] 浏览器: {browser}，正在准备会话...")
         driver = _create_driver(browser=browser)
 
-        _safe_get(driver, "https://kns.cnki.net/")
-        time.sleep(0.6)
-        _load_cookies(driver)
+        _prepare_cnki_session(driver)
 
         doctype_done = False
         core_filter_ok = False
@@ -1529,9 +1526,7 @@ def batch_search_cnki(
         browser = _detect_browser()
         driver = _create_driver(browser=browser)
 
-        _safe_get(driver, "https://kns.cnki.net/")
-        time.sleep(0.6)
-        _load_cookies(driver)
+        _prepare_cnki_session(driver)
 
         for idx, keyword in enumerate(keywords):
             _log(f"\n[cnki-batch] === 搜索 {idx + 1}/{len(keywords)}: {keyword} ===")

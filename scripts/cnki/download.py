@@ -14,8 +14,17 @@ from .constants import (
     HAS_SELENIUM, REQUEST_INTERVAL, _log,
 )
 from .driver import (
-    _detect_browser, _create_driver, _load_cookies, _save_cookies,
-    _handle_captcha, check_cnki_access, _release_driver, _safe_get,
+    _detect_browser,
+    _create_driver,
+    _detect_cnki_login_wall,
+    _load_cookies,
+    _navigate_within_cnki,
+    _prepare_cnki_session,
+    _save_cookies,
+    _handle_captcha,
+    check_cnki_access,
+    _release_driver,
+    _safe_get,
 )
 
 def _get_batch_window_size() -> int:
@@ -161,6 +170,39 @@ def _click_download_btn(driver, file_format: str = "pdf") -> Optional[str]:
     return None
 
 
+def _check_post_download_auth_wall(driver, pre_handles: set, keep_window: str) -> Optional[str]:
+    """点击下载按钮后快速检查是否弹出了知网登录/付费拦截标签页（避免无权限时傻等 180s 超时）。"""
+    time.sleep(1.8)
+    try:
+        cur_handles = list(driver.window_handles or [])
+    except Exception:
+        return None
+
+    extra_handles = [h for h in cur_handles if h not in pre_handles]
+    reason: Optional[str] = None
+    for h in extra_handles:
+        try:
+            driver.switch_to.window(h)
+            hit = _detect_cnki_login_wall(driver)
+            if hit:
+                reason = hit
+                try:
+                    driver.close()
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+    try:
+        if keep_window in (driver.window_handles or []):
+            driver.switch_to.window(keep_window)
+            if not reason:
+                reason = _detect_cnki_login_wall(driver)
+    except Exception:
+        pass
+    return reason
+
+
 def _format_save_dir(save_dir: str, file_format: str, separate_formats: bool = True) -> str:
     if not separate_formats:
         return save_dir
@@ -196,18 +238,17 @@ def download_cnki(
         browser = _detect_browser()
         driver = _create_driver(browser=browser)
 
-        _safe_get(driver, "https://kns.cnki.net/")
-        time.sleep(0.6)
-        _load_cookies(driver)
+        _prepare_cnki_session(driver)
 
         _enable_download_behavior(driver, abs_save_dir)
 
-        _safe_get(driver, url)
-        time.sleep(REQUEST_INTERVAL)
+        _navigate_within_cnki(driver, url)
         driver = _handle_captcha(driver)
 
         title = _get_title(driver)
         snapshot = set(os.listdir(active_save_dir))
+        main_win = driver.current_window_handle
+        pre_click_handles = set(driver.window_handles or [])
 
         actual_format = _click_download_btn(driver, requested_format)
         fallback_used = False
@@ -218,6 +259,7 @@ def download_cnki(
             abs_save_dir = os.path.abspath(active_save_dir)
             _enable_download_behavior(driver, abs_save_dir)
             snapshot = set(os.listdir(active_save_dir))
+            pre_click_handles = set(driver.window_handles or [])
             actual_format = _click_download_btn(driver, fallback_format)
             fallback_used = bool(actual_format)
 
@@ -226,6 +268,16 @@ def download_cnki(
                     "message": "未找到{}下载按钮".format(requested_format),
                     "requested_format": requested_format,
                     "fallback_format": fallback_format}
+
+        auth_err = _check_post_download_auth_wall(driver, pre_click_handles, main_win)
+        if auth_err:
+            return {
+                "status": "error",
+                "code": "CNKI_AUTH_REQUIRED",
+                "title": title,
+                "message": auth_err,
+                "requested_format": requested_format,
+            }
 
         downloaded = _wait_for_download(active_save_dir, timeout=180, before=snapshot)
 
@@ -373,6 +425,7 @@ def _trigger_batch_window(
                 driver.switch_to.window(main_window)
                 continue
 
+            pre_click = set(driver.window_handles or [])
             if not _click_download_btn(driver, file_format):
                 err = f"未找到{file_format}下载按钮"
                 _log(f"[cnki-download] [{idx}/{total}] {err}")
@@ -382,6 +435,19 @@ def _trigger_batch_window(
                 driver.close()
                 driver.switch_to.window(main_window)
                 continue
+
+            auth_err = _check_post_download_auth_wall(driver, pre_click, handle)
+            if auth_err:
+                _log(f"[cnki-download] [{idx}/{total}] {auth_err}")
+                driver._cnki_download_auth_blocked = auth_err
+                batch_errors.append({
+                    "url": url,
+                    "title": title,
+                    "code": "CNKI_AUTH_REQUIRED",
+                    "error": auth_err,
+                })
+                _cleanup_orphan_tabs(driver, handles_before, main_window)
+                break
 
             batch_meta.append({"url": url, "title": title})
             _log(f"[cnki-download] [{idx}/{total}] 下载已触发")
@@ -552,10 +618,7 @@ def batch_download_cnki(
             browser = _detect_browser()
             driver = _create_driver(browser=browser)
 
-            _safe_get(driver, "https://kns.cnki.net/")
-            time.sleep(0.6)
-            _load_cookies(driver)
-
+            _prepare_cnki_session(driver)
             driver = _handle_captcha(driver)
             _save_cookies(driver)
 
@@ -579,6 +642,14 @@ def batch_download_cnki(
             all_ok.extend(ok)
             all_errors.extend(errs)
             all_retry.extend(retries)
+
+            if getattr(driver, "_cnki_download_auth_blocked", None):
+                auth_msg = str(driver._cnki_download_auth_blocked)
+                for rem_b in batches[batch_idx + 1:]:
+                    for rem_u in rem_b:
+                        all_errors.append({"url": rem_u, "code": "CNKI_AUTH_REQUIRED", "error": auth_msg})
+                all_retry.clear()
+                break
 
             # 保存断点进度
             for r in ok:

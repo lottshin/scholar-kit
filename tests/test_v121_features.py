@@ -361,3 +361,209 @@ def test_smoke_upstream_probes_and_dblp_bot_gate_graceful_handling(monkeypatch):
     monkeypatch.setattr(search_mod, "_http_get", lambda *a, **k: "<html>Making sure you're not a bot! result</html>")
     monkeypatch.setattr(search_mod, "_cache_get", lambda *a, **k: None)
     assert search_mod.search_dblp("ResNet", limit=2) == []
+
+
+def test_prepare_cnki_session_skips_reload_when_warm_and_preserves_fresh_cookies(tmp_path, monkeypatch):
+    from cnki import driver as drv_mod
+
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text(
+        json.dumps([
+            {"name": "SID_kns", "value": "stale_from_disk"},
+            {"name": "extra_ck", "value": "disk_val"},
+        ]),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(drv_mod, "_cookie_path", lambda for_write=False: cookie_file)
+    monkeypatch.setattr(drv_mod, "_browser_activity_file", lambda: tmp_path / "browser-last-active.txt")
+
+    added = []
+    nav_urls = []
+
+    class _WarmDrv:
+        _scholar_was_warm = True
+        current_url = "https://kns.cnki.net/kns8s/AdvSearch"
+        title = "高级检索-中国知网"
+
+        def get(self, u):
+            nav_urls.append(u)
+
+        def get_cookies(self):
+            return [{"name": "SID_kns", "value": "fresh_live_cookie"}]
+
+        def add_cookie(self, ck):
+            added.append(ck)
+
+    warm = _WarmDrv()
+    drv_mod._prepare_cnki_session(warm)
+    # 热复用且已在 cnki.net：绝不重刷首页，也不注入旧 cookie
+    assert nav_urls == []
+    assert added == []
+    assert (tmp_path / "browser-last-active.txt").is_file()
+
+    # 冷启动（about:blank）：访问首页一次，且 merge_only 保留内存中已有的 SID_kns，仅补入缺失的 extra_ck
+    warm._scholar_was_warm = False
+    warm.current_url = "about:blank"
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    drv_mod._prepare_cnki_session(warm)
+    assert nav_urls == ["https://kns.cnki.net/"]
+    assert [c["name"] for c in added] == ["extra_ck"]
+
+
+def test_navigate_within_cnki_uses_same_site_location_href_for_referer(monkeypatch, tmp_path):
+    from cnki import driver as drv_mod
+
+    monkeypatch.setattr(drv_mod, "_browser_activity_file", lambda: tmp_path / "act.txt")
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+
+    js_calls = []
+    get_calls = []
+
+    class _NavDrv:
+        current_url = "https://kns.cnki.net/kns8s/AdvSearch"
+
+        def execute_script(self, script, *args):
+            js_calls.append((script, args))
+
+        def get(self, u):
+            get_calls.append(u)
+
+    nd = _NavDrv()
+    target = "https://kns.cnki.net/kcms2/article/abstract?v=123"
+    drv_mod._navigate_within_cnki(nd, target)
+    assert len(js_calls) == 1
+    assert "window.location.href" in js_calls[0][0]
+    assert js_calls[0][1] == (target,)
+    assert get_calls == []
+
+
+def test_detect_cnki_login_wall_short_circuits_fulltext_and_download(monkeypatch):
+    from cnki import detail as det_mod
+    from cnki import download as dl_mod
+    from cnki import driver as drv_mod
+
+    class _LoginTabDrv:
+        current_url = "https://login.cnki.net/login/?platform=kns"
+        title = "欢迎登录-中国知网"
+        window_handles = ["main", "login_popup"]
+        current_window_handle = "main"
+
+        def switch_to(self):
+            return self
+
+        def close(self):
+            self.window_handles.remove("login_popup")
+
+        def execute_script(self, *a, **k):
+            return ""
+
+    ldrv = _LoginTabDrv()
+    ldrv.switch_to = type("Sw", (), {"window": lambda self, h: setattr(ldrv, "current_window_handle", h)})()
+
+    reason = drv_mod._detect_cnki_login_wall(ldrv)
+    assert reason and "登录" in reason
+
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    dl_reason = dl_mod._check_post_download_auth_wall(ldrv, {"main"}, "main")
+    assert dl_reason and "登录" in dl_reason
+    assert "login_popup" not in ldrv.window_handles
+
+    # 验证 batch_read_detail 首篇遇到全文登录墙后短路后续篇目的全文点击，但仍完整保留所有篇目的免费摘要
+    html_attempts = []
+
+    class _BatchDrv:
+        current_url = "https://kns.cnki.net/kns8s/AdvSearch"
+        _scholar_was_warm = True
+        title = "高级检索-中国知网"
+
+        def execute_script(self, *a, **k):
+            return None
+
+    bdrv = _BatchDrv()
+    monkeypatch.setattr(det_mod, "_detect_browser", lambda: "chrome")
+    monkeypatch.setattr(det_mod, "_create_driver", lambda browser=None: bdrv)
+    monkeypatch.setattr(det_mod, "_prepare_cnki_session", lambda d: None)
+    monkeypatch.setattr(det_mod, "_save_cookies", lambda d: None)
+    monkeypatch.setattr(det_mod, "_navigate_within_cnki", lambda d, u, **k: None)
+    monkeypatch.setattr(det_mod, "_handle_captcha", lambda d: d)
+    monkeypatch.setattr(det_mod, "_is_cnki_error_or_404", lambda d: False)
+    monkeypatch.setattr(det_mod, "_parse_detail_page", lambda d: {"abstract": "免费摘要正常提取", "pages": "10-18"})
+    monkeypatch.setattr(det_mod, "_load_cached_fulltext", lambda *a, **k: None)
+    monkeypatch.setattr(det_mod, "_extract_local_pdf_fulltext", lambda *a, **k: None)
+    monkeypatch.setattr(det_mod, "_release_driver", lambda d: None)
+
+    def _fake_read_html(drv, u):
+        html_attempts.append(u)
+        drv._cnki_auth_wall_reason = "当前未登录知网机构账号"
+        return None
+
+    monkeypatch.setattr(det_mod, "_read_fulltext_html", _fake_read_html)
+
+    papers = [
+        {"title": f"测试论文{i}", "source": "CNKI", "url": f"https://kns.cnki.net/kcms2/article/abstract?v={i}"}
+        for i in range(1, 5)
+    ]
+    det_mod.batch_read_detail(papers, top_n=4, fulltext=True)
+    # 4 篇全部仅在第 1 篇尝试了 1 次 HTML 全文点击即短路，且 4 篇免费摘要与页码全部正常拿到
+    assert len(html_attempts) == 1
+    assert all(p.get("abstract") == "免费摘要正常提取" for p in papers)
+    assert all(p.get("auth_required") is True for p in papers)
+
+
+def test_browser_idle_timeout_env_override(monkeypatch):
+    from cnki import driver as drv_mod
+
+    monkeypatch.setenv("SCHOLAR_BROWSER_IDLE_MINUTES", "15")
+    assert drv_mod._idle_timeout_seconds() == 900
+    monkeypatch.setenv("SCHOLAR_BROWSER_IDLE_MINUTES", "0")
+    assert drv_mod._idle_timeout_seconds() == 0
+
+
+def test_open_cnki_reading_tab_bypasses_popup_blocker_with_referrer(monkeypatch):
+    from cnki import detail as det_mod
+
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    cdp_calls = []
+
+    class _TabDrv:
+        current_url = "https://kns.cnki.net/kcms2/article/abstract?v=detail123"
+        current_window_handle = "detail_tab"
+        window_handles = ["detail_tab"]
+
+        def __init__(self):
+            drv = self
+
+            class _Sw:
+                def new_window(self, kind):
+                    assert kind == "tab"
+                    drv.window_handles.append("reading_tab")
+                    drv.current_window_handle = "reading_tab"
+                    drv.current_url = "about:blank"
+
+                def window(self, h):
+                    drv.current_window_handle = h
+
+            self.switch_to = _Sw()
+
+        def execute_cdp_cmd(self, cmd, params):
+            cdp_calls.append((cmd, params))
+            self.current_url = params["url"]
+            return {}
+
+        def execute_script(self, script, *args):
+            if "readyState" in script:
+                return "complete"
+            raise AssertionError("window.open should not be used when switch_to.new_window succeeds")
+
+    drv = _TabDrv()
+    handle = det_mod._open_cnki_reading_tab(drv, "https://kns.cnki.net/kcms2/article/html?v=html456")
+    assert handle == "reading_tab"
+    assert cdp_calls == [
+        (
+            "Page.navigate",
+            {
+                "url": "https://kns.cnki.net/kcms2/article/html?v=html456",
+                "referrer": "https://kns.cnki.net/kcms2/article/abstract?v=detail123",
+            },
+        )
+    ]
