@@ -1,150 +1,101 @@
 ---
 name: scholar-kit
 description: >-
-  Search, download, and manage academic papers from CNKI (知网), OpenAlex,
-  Semantic Scholar, arXiv, PubMed (Europe PMC), NSSD, DBLP, BASE, and local Zotero libraries;
-  offline-identifies SCI/SSCI/A&HCI/ESCI, CCF-A/B/C (2026), and CAS Early Warning journals;
-  enriches metadata via Crossref and resolves OA links via Unpaywall. Generates citations
-  (GB/T 7714, APA, MLA, Chicago, pure-ASCII BibTeX, RIS), verifies & reconciles drifted titles,
-  builds structured literature comparison matrices & search-verified research gaps, audits claim
-  polarity & unbacked statistics, generates publication-ready empirical/regression/benchmark tables
-  (Markdown, LaTeX booktabs, Word three-line docx), recommends submission journals (quarantining CAS warnings),
-  and drafts point-by-point peer-review rebuttal letters linked to manuscript anchors.
-  Use when the user asks to 搜索/检索/查找 文献/论文, 下载论文/全文, 写文献综述,
-  引用建议/插入文献, 选题分析/研究选题/研究问题, 格式化参考文献, 参考文献/核验引用/题名核对, 引文追踪/引用网络/共引/同被引,
-  研究趋势/热点分析, 文献对比/对比矩阵, 阅读笔记, Zotero/LaTeX/BibTeX,
-  描述性统计/相关系数矩阵/回归表/三线表/实验对比表, 投稿选刊/期刊推荐/目标期刊, 审稿意见/返修/Rebuttal/Response Letter,
-  学术表达优化/论文改写/提升原创性, 查重/降重/降低重复率/重复率,
-  知网/CNKI/PubMed/SCI/SSCI/CCF/预警期刊, 批量导出/计量分析, or 导出BibTeX/RIS.
-  DO NOT USE for general web search, non-academic content, or code documentation lookup.
+  Full-lifecycle academic research skill: search & download papers from CNKI (知网), OpenAlex,
+  Semantic Scholar, arXiv, PubMed, NSSD, DBLP, BASE, and local Zotero/PDF libraries; offline-screen
+  SCI/SSCI/A&HCI/ESCI, CCF-A/B/C, and CAS Early Warning journals; slice long theses; build structured
+  comparison matrices & search-verified gaps; audit claim polarity & unbacked statistics; generate
+  empirical/regression/benchmark tables (Markdown, LaTeX, Word three-line docx); format GB/T 7714,
+  APA, pure-ASCII BibTeX & reconcile drifted titles; match submission venues and draft peer-review
+  rebuttals. Use when asked to 搜索/下载论文, 写文献综述/对比矩阵, 选题/引文追踪, 格式化或核验参考文献,
+  生成描述统计/相关矩阵/回归表/实验对比表, 投稿选刊/预警排查, 审稿返修/Rebuttal, or 学术润色/改写Word.
+  DO NOT USE for general web search or code documentation lookup.
+license: MIT
+compatibility: Python >=3.9 on macOS, Windows, or Linux; Chrome/Edge required only for CNKI automation.
 metadata:
-  version: 1.25.0
-  compatibility:
-    platform: any
-    python: ">=3.9"
-    os: windows, macos, linux
+  version: "1.25.1"
 ---
 
 # Scholar Kit
 
-学术文献检索与科研辅助工具。**脚本是"手"（确定性检索、抓取、排版与核验），Agent 是"脑"（理解意图、筛选综合与学术写作）**。
+面向学术研究全流程的确定性辅助工具：**脚本是"手"（检索、统计、核验、排版），Agent 是"脑"（理解意图、筛选综合与学术写作）**。
 
 ## Quick Start
 
 ```bash
-# 0. 环境自检与自动修复（同一会话首次调用前运行一次；支持 PEP 668 隔离虚拟环境）
+# 0. 环境自检（同会话首次调用前跑一次；自动适配 PEP 668 虚拟环境）
 <python> <skill_path>/scripts/literature.py check --fix
 
-# 1. 搜索（仅当用户明确要求核心期刊时加 --core）
-<python> <skill_path>/scripts/literature.py search "乡村振兴" --core 北大核心,CSSCI
+# 1. 检索入库（按需加 --core 北大核心,CSSCI 或 --core SCI,SSCI --exclude-warning）
+<python> <skill_path>/scripts/literature.py search "新质生产力" --core 北大核心,CSSCI --project topic1
 
-# 2. 获取详情/全文（优先用 --indices 精确指定序号）
-<python> <skill_path>/scripts/literature.py read-detail --indices 1,3,9 --fulltext
+# 2. 硕博目录预览与精读切片（本地已下载 PDF 离线秒级读取）
+<python> <skill_path>/scripts/literature.py read-detail --indices 1,3 --toc --project topic1
+<python> <skill_path>/scripts/literature.py read-detail --indices 1 --section "研究设计,实证" --project topic1
 
-# 3. 导出标准引用（严禁手拼 GB/T 7714；支持按正文首次出现顺序一键重排角标并附参考文献）
-<python> <skill_path>/scripts/literature.py cite --indices 1,3,9 --style gbt7714
+# 3. 综述对比矩阵 + 空白检索核验 + 正文极性/统计校验
+<python> <skill_path>/scripts/literature.py review --project topic1 --cluster --gaps --verify-gaps
+<python> <skill_path>/scripts/literature.py validate draft.docx --project topic1
+
+# 4. 实证制表、标准引用重排、投稿选刊与审稿返修
+<python> <skill_path>/scripts/literature.py data-table panel.csv --type corr --format docx -o table.docx
 <python> <skill_path>/scripts/literature.py cite --from-file draft.md --rewrite-output final.md --style gbt7714
+<python> <skill_path>/scripts/literature.py match-journal --project topic1 --live
+<python> <skill_path>/scripts/literature.py rebuttal reviewers.txt --manuscript draft.docx --init-patch patch.json -o reply.docx
 ```
 
-### Python 解释器解析与前置自检
+### Python 解析与能力路由（必读）
 
-首次调用脚本前，按以下优先级确定 `<python>` 并在同一会话复用：
-1. 若 `~/.scholar-kit/.venv` 已存在（或 `check` 返回 `capabilities.recommended_python`），优先使用该隔离环境 Python
-2. 环境变量 `$PYTHON` → Windows `py -3` → `python3` → `python`（遇 Exit code 127 须按序重新解析）
-3. 若依赖缺失，执行 `<python> -m pip install -r <skill_path>/scripts/requirements.txt`；若遇 PEP 668 `externally-managed-environment`，创建 `~/.scholar-kit/.venv`（或运行 `check --fix` 自动引导）并在该环境安装。
+1. **解释器优先级**：`~/.scholar-kit/.venv`（或 `check` 返回的 `capabilities.recommended_python`）→ `$PYTHON` → Windows `py -3` → `python3` → `python`。依赖缺失时运行 `check --fix` 或安装 `scripts/requirements.txt`。
+2. **沙盒授权与降级**：不要因 `check` 返回 `warning` 直接退出：
+   - `needs_escalation: true` 或沙盒拦截网络/浏览器时，先通过宿主平台**标准授权/提权机制**携带 `recommended_env` 重跑 `retry_command`（见 [environment.md](references/environment.md#沙箱环境与知网)），切勿跳过授权直接判知网不可用。
+   - 提权后仍无桌面浏览器/校园网：知网专属任务提示连接校园网/VPN 或运行 `auth-cnki`；通用文献检索切换 `--source openalex`（或 `--source all --async-search`）并如实告知。
+   - 仅用 API 源、Zotero/PDF 本地库、`data-table`、`rebuttal`、`validate` 均**无需浏览器**；`docx_tools: false` 时降级输出 Markdown。
 
-### 能力路由与沙盒授权（重要）
+## 状态目录分层
 
-Agent 根据 `check` 返回的 `capabilities` 决策，**不得因 `status == "warning"` 直接退出**：
-- **`cnki_feasible: true`**：全部知网与 API 命令可用。
-- **`needs_escalation: true` 或沙盒拦截网络/浏览器**：
-  - 知网自动化需联网与本机浏览器。请通过宿主平台的**标准授权/提权机制**（弹窗审批、unsandboxed retry 等，详见 [沙盒与权限配置](references/environment.md#沙箱环境与知网)）携带 `recommended_env` 重跑 `retry_command`。
-  - 未尝试宿主授权重试前，不要把知网直接判定为不可用。
-  - 若提权后仍不可达（或处于无桌面浏览器的纯云端容器）：硕博论文/知网全文等**知网专属任务**须告知用户连接校园网/VPN 或运行 `auth-cnki`；**通用文献检索**可切换 `--source openalex`（或 `--source all --async-search`）并告知用户。
-- **仅使用 API 源**（OpenAlex / Semantic Scholar / arXiv / NSSD / DBLP / BASE）无需浏览器，仅需基础 HTTP 网络访问。
-- **`docx_tools: false`** 时降级输出 Markdown；`update.update_available: true` 时顺带提示用户可 `git pull` 更新。
+| 层级 | 默认路径 | 存放内容 |
+|------|----------|----------|
+| **全局共享** | `~/.scholar-kit/`（`SCHOLAR_HOME` 可覆盖） | `browser-profile/`、`cookies.json`、`cache/`、`fulltext/`、`.venv/`、全局 `config.json`（知网一次登录跨项目共享） |
+| **工作区会话** | `./.scholar-kit/`（自动生成 `.gitignore`） | 当前 `session.json`、课题库 `projects/<课题>/session.json`、工作区 `config.json` |
 
-## 状态目录与配置分层
+## 决策指南（全流程路由）
 
-| 目录层级 | 默认路径 | 存放内容 |
-|----------|----------|----------|
-| **全局共享目录** | `~/.scholar-kit/`（支持 `SCHOLAR_HOME` 覆盖） | `browser-profile/`、`cookies.json`、`cache/`、`fulltext/`、`selenium-cache/`、`.venv/`、全局 `config.json`（一次登录知网，跨所有工作目录共享） |
-| **工作区会话目录** | `./.scholar-kit/`（自动生成 `.gitignore` 防误提交） | 当前会话 `session.json`、课题库 `projects/<课题>/session.json`、工作区 `config.json` |
+| 用户意图 | 首选命令组合（完整参数见 [cli-reference.md](references/cli-reference.md)） |
+|----------|---------------------------------------------------------------------------|
+| 中文/多源文献检索 | `search "词"`（复杂同义词优先 `search --expr "TKA=('A'+'B') AND ..."` 降风控；无知网改 `--source openalex` 或 `--source all --async-search`；独立多词用 `batch-search`） |
+| 核心期刊与预警把关 | 叠加 `--core`（中文 `北大核心,CSSCI,CSCD,AMI,EI`；英文 `SCI,SSCI,AHCI,ESCI,CCF-A/B`）与 `--exclude-warning`（规则见 [core-journals.md](references/core-journals.md)） |
+| 本机 Zotero / 本地 PDF | `zotero [词] --save --project <课题>` 或 `import <PDF目录> --project <课题>` → 直接复用 `read-detail`、`review`、`cite` |
+| 论文下载与引文滚雪球 | 先确认 `pdf`/`caj` 与引文格式后 `search --download` 或 `batch-download`（无知网用 `download --doi`）；追踪引文用 `citations <URL/题名/DOI> --save both --append` |
+| 硕博精读 / 文献综述 / 长文 | `library --dedupe/--remove` 去噪 → `read-detail --toc` + `--section` 切片 → `review --auto-detail --cluster --gaps --verify-gaps` → 撰写（见 [workflows.md](references/workflows.md#撰写完整学术论文)）→ `validate` → `cite --from-file` → `write-docx` |
+| 参考文献核验与格式导出 | 核对错名/改名/漏页码用 `verify-refs [--from-file <文稿>] --fix-session`；导出/重排统一用 `cite`（支持顺序编码、著者-出版年、经管顶刊、LaTeX `\cite` + 纯 ASCII `.bib`）或 `export` |
+| 实证统计 / 回归 / 实验制表 | `data-table <csv/tsv/json> --type summary/corr/regression/comparison --format markdown/latex/docx`（纯本地精确计算，零手算） |
+| 学术表达优化 / Word 修补 | 先读 [style-audit.md](references/style-audit.md)：`read-paper --numbered` → 审计 → 改写 → `patch-docx --dry-run` → 正式写回并附变更日志 |
+| 投稿选刊与审稿返修 | 选刊：`match-journal [--project] [--from-file] [--topic --live]`（隔离在榜预警刊）；返修：`rebuttal <意见文件> --manuscript <原稿.docx> --init-patch patch.json -o reply.docx` → `patch-docx --dry-run` |
 
-配置优先级：**环境变量 > `./.scholar-kit/config.json` > `~/.scholar-kit/config.json` > 默认值**（`SCHOLAR_REQUEST_INTERVAL=3`、`SCHOLAR_CACHE_TTL_DAYS=30`、`SCHOLAR_MAILTO`、`SCHOLAR_SAVE_DIR=./papers`、`SCHOLAR_BROWSER=auto`、`SCHOLAR_DRIVER_PATH`、`SCHOLAR_SKIP_NETWORK_CHECK`）。
-
-## 决策指南
-
-| 用户意图 | `cnki_feasible: true` | `cnki_feasible: false`（确认无法用知网后） |
-|----------|----------------------|--------------------------------------------|
-| 单词/高级搜索 | `search "词"`（支持 `--field 篇关摘`、`--author`、`--first-author`、`--affiliation`、`--journal`、`--fund`、`--fuzzy`） | `search "词" --source openalex`（多源用 `--source all --async-search`） |
-| 复杂同义词/布尔搜索 | **优先**单次专业检索式 `search --expr "TKA=('词1' + '词2') AND ..."`（快且不易弹滑块）；确实独立的多主题再用 `batch-search` | 逐组 `search --source openalex --append` |
-| 核心期刊与预警筛选 | 加 `--core`（知网支持 `北大核心,CSSCI,CSCD,AMI,EI`；英文源离线支持 `SCI,SSCI,AHCI,ESCI,CCF-A,CCF-B`）及 `--exclude-warning`（读 [core-journals.md](references/core-journals.md)） | API 源支持 `SCI/SSCI/AHCI/CCF` 与中科院预警期刊过滤；不支持中国知网核心体系筛选（须如实说明） |
-| 写文献综述 / 完整学术论文 | 核心优先检索入库 (`--project`) → `library --remove/--keep/--dedupe` 去噪 → `review --auto-detail --cluster --gaps --verify-gaps` + 重点篇目 `read-detail` → 按 [workflows.md](references/workflows.md#撰写完整学术论文) 撰写（严禁虚构一手数据） → `validate draft.md` 校验极性与统计支撑 → `cite --from-file draft.md --rewrite-output final.md` → `write-docx` | 同左，检索改用 API 源（关注 `venue_tier`）或 `import <PDF目录>` |
-| 选题分析 | `topics --project <课题> --topic <方向> [--verify-gaps]` | 同左 |
-| 论文下载 | 先确认格式后 `search --download` 或 `batch-download` | 仅 `download --doi <DOI>`（开放获取 OA） |
-| 实证统计 / 回归 / 实验对比制表 | `data-table <csv/tsv/json> --type summary/corr/regression/comparison --format markdown/latex/docx` | 同左（纯本地标准库确定性计算） |
-| 投稿目标选刊匹配 | `match-journal [--project <课题>] [--from-file <文稿>] [--topic <方向> --live]`（自动分层冲刺/主投/稳健并隔离中科院在榜预警刊） | 同左 |
-| 审稿意见返修（Rebuttal） | `rebuttal <意见文件> [--manuscript <原稿.docx> --init-patch patch.json -o response.docx]` → 完善补丁与回复 → `patch-docx --dry-run` → 正式写回 | 同左 |
-| 学术表达优化 / Word 改写 | 先读 [style-audit.md](references/style-audit.md)：`read-paper --numbered` 读入段落锚点 → 审计 → 改写 → `patch-docx --dry-run` 预检 → 正式写回与变更报告 | 同左（不依赖知网） |
-| 引文追踪（滚雪球） / 趋势 | `citations <知网URL/中文题名/DOI> [--save both --append --project <课题>]` / `trends` | `citations <DOI/arXiv> [--save both --append]` / `trends` |
-| 本地 PDF 文献库导入 | `import <PDF文件夹或文件> --project <课题> [--append]` → 直接复用 `read-detail --fulltext`、`review`、`cite` | 同左 |
-| 对比矩阵 / 笔记 | `review`（自带结构化 `comparison_matrix` 与结论极性分歧提示）+ 读 [workflows.md](references/workflows.md#文献对比矩阵) | 同左 |
-
-> 搜索结果为 `0` 时：主动尝试同义词、中英文切换、放宽年份或 `--source all --async-search` / `--enable-fallback`，不要第一次无结果就直接放弃。
-
-## CLI 命令速查（默认输出 JSON；`--raw` 输出纯文本）
-
-| 命令 | 用途 | 常用参数 |
-|------|------|----------|
-| `search [词]` | 单次/专业检索 | `--source` (cnki/openalex/semantic/arxiv/pubmed/nssd/dblp/base/all) `--expr`（知网专业检索布尔式） `--field` (主题/篇关摘/篇名/关键词/摘要/全文/...) `--author` `--first-author` `--affiliation` `--journal` `--fund` `--fuzzy` `--core` `--doc-type` `--year-from` `--year-to` `--sort` (relevance/date/citations/downloads/quality) `--pages` `--per-page 50` `--limit` `--bulk-abstract` `--cite-enrich N` `--enrich N` `--author-filter` `--journal-filter` `--field-of-study` `--page` `--enable-fallback` `--async-search` `--download` `--download-fallback-format caj` `--append` `--project` |
-| `batch-search` | 多词知网检索 | `词1 词2` 或 `--query-file`（中文多词推荐） `--core` `--doc-type` `--field` `--year-from` `--year-to` `--sort` `--pages` `--append` `--project` |
-| `read-detail` | 知网/PDF/Zotero 全文与章节切片 | `--indices 1,3,9` `--top-n` `--fulltext` `--toc`（硕博长文先看目录页码字数） `--section "研究设计,实证"`（按章/节精准切片免撑爆上下文） `--max-chars` `--project` |
-| `detail "url"` | 单篇知网详情 | |
-| `auth-cnki` / `close-browser` | 认证预热 / 关闭常驻浏览器 | `auth-cnki --auth-url --institution --wait-seconds --direct-domain`；`close-browser` 释放后台热复用浏览器（默认空闲 20 分钟亦会自动回收，可通过 `SCHOLAR_BROWSER_IDLE_MINUTES` 调整） |
-| `download` / `batch-download` | 单篇 / 批量下载 | `--from-session` `--top-n` `--dir` `--doi` `--file-format pdf/caj` `--fallback-format caj` `--citation-style` `--project` |
-| `cite` / `export` | 引用 / 导出（自动补齐页码） | `cite --style` (`gbt7714`顺序编码 / `gbt7714-author-year`国标著者出版年 / `chinese-econ`经管社科顶刊 / `apa` / `mla` / `chicago` / `footnote`) `--from-file <draft.md/tex>` `--rewrite-output <final.md/tex>` `--bibtex-output <refs.bib>` `--in-text` `--indices 9,2,5` `--keep-numbers`；`export --format` (bibtex[纯ASCII键]/ris/markdown/json/excel/...) `--indices` `--output` `--raw` `--project` |
-| `verify-refs` | 题名纠偏与真伪/页码核验 | `verify-refs [--from-file <docx/md>] [--indices 1,3] [--fix-session] [--project <名>]`（支持直接提取文稿末尾参考文献，专治"作者对但题名改名/回译偏差搜不到"及漏页码，输出 `formatted_references`） |
-| `zotero [词]` | 本机 Zotero 文献库直连 | `zotero [query] [--collection <集合>] [--list-collections] [--save --append --project <名>]` |
-| `import "path"` | 导入题录或 PDF 库 | 支持 NoteExpress / Refworks / BibTeX 及**本地 PDF 文件或文件夹**，`--append` `--project` |
-| `projects` / `library` | 课题库整理与批注 | `library --project <名> [--keep 1,3,5-8] [--remove 4,9] [--dedupe] [--indices 1,3 --tag "核心实证" --note "批注"]` |
-| `review` | 生成综述证据包与对比矩阵 | `--project` `--topic` `--limit` `--auto-detail` `--detail-top-n` `--cluster` `--gaps` `--verify-gaps`（联网核验外部命中篇数纠偏伪空白） `-o/--output` `--raw` |
-| `write` | 生成综述证据骨架 | `--project` `--topic` `--mode outline/draft/section` `--section` `--format markdown/docx` `--with-citations` `--validate` `-o/--output` |
-| `validate [file]` | 校验证据、极性冲突与统计归属 | `[filepath]` / `--file <md/docx/pdf>` `--project` `--topic` `--allow-primary-data`（检测反写正负向结论、年份错位及无引文裸统计数字） |
-| `data-table <file>` | 实证统计/回归/实验对比制表 | `<csv/tsv/json>` `--type/--mode summary/corr/regression/comparison` `--columns` `--digits` `--lang zh/en` `--caption` `--format markdown/latex/docx` `-o/--output` `--raw` |
-| `match-journal` | 投稿目标期刊分层匹配与避雷 | `--project` `--from-file <docx/md>` `--topic` `--live` `--lang all/zh/en` `--limit` `--raw`（隔离中科院在榜预警刊，标注历史调出刊） |
-| `rebuttal <file>` | 审稿意见拆解与回复函生成 | `<comments.txt/md/docx>` `--manuscript <原稿.docx/md>` `--title` `--lang auto/zh/en` `--format markdown/docx` `--init-patch <patch.json>` `-o/--output` `--raw` |
-| `topics` / `trends` / `citations` | 选题 / 趋势 / 深度引文 | `topics [--verify-gaps]`；`citations <知网URL/中文题名/DOI> --direction citing/cited/both/coref/cocited --limit 20 [--save both --append --project <名>]` |
-| `read-paper` / `pdf-meta` | 读用户文稿 / PDF 元数据 | `read-paper <docx/txt/md/tex/pdf> [--numbered] [--toc] [--section "第3章,4.2"] [--max-chars] [--output] [--raw]`；`pdf-meta <file.pdf>` |
-| `write-docx` / `patch-docx` | 生成 / 修补 Word | `write-docx <md> [--output] [--no-superscript]`（自动三线表、正文角标原生上标、摘要楷体、表题居中与页脚页码）；`patch-docx <docx> --patch patch.json [--dry-run] [--output]`（支持 `replace_references` 与 `superscript_citations`） |
-| `workflows` / `check` / `clean-cache` | 模板 / 自检 / 清缓存 | `check [--fix] [--cnki-dom]`（`--cnki-dom` 巡检知网页面改版契约）；`clean-cache [--all] [--dry-run]` |
+> 搜索返回 `0` 结果时：主动切换同义词、中英文、`%` 模糊检索或 `--source all --async-search` / `--enable-fallback`，不要首次空结果就放弃。
 
 ## 交互规范
 
-1. **结果展示**：搜索默认展示前 **10 条**表格（序号、标题、作者、来源/期刊、年份、被引）；阅读知网硕博学位论文或长文时优先先用 `read-detail --indices ... --toc` 查看章节结构，再用 `--section "研究设计,实证"` 按需切片精读（避免十万字全文淹没上下文）；`cite` / `export` 完整展示不截断。
-2. **搜索与下载联动**：
-   - 用户未指明偏好时先追问：**下载文件格式**（`pdf` / `caj`，默认推荐 `pdf`）与**下载清单引用格式**（`gbt7714` / `apa` / `mla` / `chicago`）。
-   - 明确"搜并下"用 `search ... --download` 一步完成；需先看列表挑选再用 `search` → `batch-download --from-session`。
-   - 仅当用户同意兜底时加 `--fallback-format caj`（分目录存 `pdf/` 与 `caj/`，严禁把 CAJ 静默当作 PDF），完成后必须展示 `download_report.path` 及未下载原因。
-3. **校外知网认证与滑块验证协同**：校外/CARSI/VPN 场景优先运行 `auth-cnki` 预热（提前告知用户会打开浏览器手动登录/过验证、请勿关窗），成功后自动保存在 `~/.scholar-kit/browser-profile` 跨项目复用；未登录时调用 `--fulltext` 或 `download` 会在首篇秒级返回 `CNKI_AUTH_REQUIRED`（仍保留免费摘要与题录），此时引导用户连接校园网/VPN 或运行 `auth-cnki` 即可；当知网命令日志提示 `检测到知网安全验证页，弹出浏览器窗口...` 时，脚本会自动解除最小化并将浏览器强制置顶到最前方等待用户手动滑动（最长 180 秒，验证通过后自动重新最小化继续执行）——**Agent 严禁自行点击或绕过验证码，也切勿强杀任务或调用 `close-browser` 中断等待**，应简短提醒用户在已置顶的浏览器窗口中手动完成滑块即可。
-4. **综述写作闭环**：优先用 `review --cluster --gaps`（缺摘要叠加 `--auto-detail`）获取结构化证据包 → 由 Agent 结合学科语境撰写正文（`write` 命令仅提供证据骨架草稿） → 用 `validate --file` 校验论断与 `[序号]` 支撑度。
-5. **长文档与歧义**：请求模糊（如"帮我找论文/改论文"）先简短追问方向与操作类型；超过 **15,000 字**文稿按 1–2 章分段汇报改写，最后一次 `patch-docx` 提交；**严禁直接 cat/Read `.docx`**，必须用 `read-paper`。
+1. **展示与长文切片**：搜索默认展示前 10 条表格；阅读硕博论文或长文先用 `read-detail --toc` 看目录再用 `--section` 切片；`cite` / `export` 完整输出不截断；超过 **15,000 字**文稿分段汇报改写再一次性 `patch-docx`；**严禁直接读取 `.docx` 二进制**，须用 `read-paper`。
+2. **下载确认**：未指定格式时先确认 `pdf`/`caj` 与清单引文格式；仅用户同意兜底时加 `--fallback-format caj`（分目录存放，严禁静默把 CAJ 当 PDF），完成后汇报 `download_report.path` 与失败原因。
+3. **知网认证与滑块协同**：校外/CARSI/VPN 优先用 `auth-cnki` 预热（提前提醒用户浏览器会打开并勿关窗）；未登录执行全文/下载会秒级返回 `CNKI_AUTH_REQUIRED`；当日志提示安全验证页已置顶弹窗等待手动滑块（最长 180 秒）时，**严禁自行点击/绕过验证码，也勿强杀任务或调用 `close-browser`**，简短提醒用户在置顶窗口完成滑动即可。
 
-## 硬性规则
+## 硬性规则（不可违背）
 
-1. **禁止编造文献、改译中文题名与漏填页码**：API/检索失败如实报错；**严禁把英文源（OpenAlex/Crossref）的英文标题自行意译成中文当作知网文献引用**（这会导致作者对但知网搜不到该题名），不确定真实中文题名时必须运行 `verify-refs --fix-session` 按作者锚定找回知网真实发表题名；引用输出统一调用 `cite` 或 `export`（切勿直接复制缺页码的 `citation_preview`）。
-2. **"研究空白"须附检索证据**：必须标明数据库、关键词、时间范围与命中篇数，不得把单次漏检断言为学界空白。
-3. **核心期刊标明体系与论文选刊质量把关**：普通单次检索在用户要求核心期刊时加 `--core`；**当执行学术论文或文献综述写作时**，中文检索（即便是个案文献如特定非遗、县域、企业）也须**优先加 `--core 北大核心,CSSCI`（理工医用 `CSCD`）检索核心期刊**并辅以高校博硕士学位论文，仅当核心与学位论文确无覆盖时才补充普刊并向用户说明；英文检索须核查 `venue_tier`、`publisher` 与被引数，优先选用 `mainstream` 主流学术出版商及高被引论文，剔除零被引低门槛 OA 水刊。展示核心期刊时标明体系名称，未匹配答"未匹配"。
-4. **概括观点须可追溯**：严格基于摘要或 `read-detail` 全文，仅题录条目必须标注"待核对原文"；预印本（arXiv 等）须标注版本号与"非同行评议终稿"。
-5. **严禁捏造一手实证样本与统计数值**：用户未提供调查问卷、实验记录或平台抓取数据集时，**严禁在论文正文中编造样本量（如 `N=500`）、抽样百分比、回归系数或显著性检验结果**；须采用基于文献与公开典型案例的质性/文本符号学分析写法，或请用户补充实证数据。
-6. **引用格式统一由脚本生成**：Agent 不手拼 GB/T 7714，统一调用 `cite` 命令（长文推荐 `cite --from-file draft.md --rewrite-output final.md` 原子重编号）。
-7. **合规执行学术表达优化**：用户提出"降重/降低重复率/去 AI 腔/润色"时，按"学术表达优化"正常执行（严格遵循 [style-audit.md](references/style-audit.md) 的审计→改写→报告三步法，不改数字、公式与引文，并说明不提供查重比数值检测）。
+1. **禁止编造文献、意译中文题名与漏填页码**：检索失败如实报错；严禁把英文库标题自行翻成中文冒充知网题名，不确定真实题名须运行 `verify-refs --fix-session`；引用统一由 `cite` / `export` 生成（勿手拼 GB/T 7714 或复制缺页码预览）。
+2. **"研究空白"须附检索证据**：标明数据库、关键词、时间区间与命中篇数（优先用 `review --verify-gaps` / `topics --verify-gaps` 核验），不得把单次漏检断言为学界空白。
+3. **写综述与论文须把关选刊质量**：中文优先加 `--core 北大核心,CSSCI`（理工医 `CSCD`）辅以高校博硕论文，确无覆盖再补普刊并说明；英文核查 `venue_tier`、核心索引与预警标签，剔除中科院在榜预警刊与零被引水刊。
+4. **概括观点可追溯**：严格基于摘要或 `read-detail` 全文，仅题录条目须标"待核对原文"；预印本标明版本号与"非同行评议终稿"。
+5. **严禁捏造一手实证数据与统计数值**：用户未提供真实数据时，禁止编造 `N=...`、百分比、回归系数或 $p$ 值；有真实数据文件时统一用 `data-table` 确定性制表，正文校验可显式加 `--allow-primary-data`。
+6. **合规执行学术表达优化**：用户提"降重/去 AI 腔/润色"时严格按 [style-audit.md](references/style-audit.md) 三步法执行，**绝不改动数字、公式与引文**，并说明不提供查重比数值检测。
 
 ## 按需参考文档（不要一次性全部预加载）
 
-- [工作流详解](references/workflows.md) — 综述、引用建议、Word 改写与补丁、对比矩阵、阅读笔记步骤
+- [CLI 命令与参数速查](references/cli-reference.md) — 全部子命令完整参数、短旗标与环境变量说明
+- [工作流详解](references/workflows.md) — 综述、万字长文、实证制表、投稿选刊、审稿返修、Word 补丁与对比矩阵步骤
 - [表达审计规则](references/style-audit.md) — 学术表达优化、去 AI 腔清单、保留清单与变更日志模板
-- [API 源检索最佳实践](references/api-search-best-practices.md) — 高级过滤参数、`quality_score` 评分细则、分页与多源组合策略
+- [API 源检索最佳实践](references/api-search-best-practices.md) — 高级过滤、`quality_score` 评分细则、分页与多源组合
 - [核心期刊知识](references/core-journals.md) — 学科与 `--core`（北大核心/CSSCI/CSCD/AMI/WJCI/EI）映射规则
-- [环境约束与沙盒故障排查](references/environment.md) — 各平台沙盒授权表、Windows 编码、超时计算与代理排查
-- [错误码对照表](references/error-codes.md) — 脚本 `status: error/warning` 时的标准处置指引
+- [环境与沙盒排查](references/environment.md) — 各平台沙盒授权表、Windows 编码、浏览器热复用与网络代理排查
+- [错误码对照表](references/error-codes.md) — 脚本 `status: error/warning` 标准处置指引

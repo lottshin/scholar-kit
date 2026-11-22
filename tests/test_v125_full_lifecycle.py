@@ -1,6 +1,7 @@
 import argparse
 import io
 import json
+import re
 import sys
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -406,3 +407,72 @@ def test_rebuttal_parses_comments_matches_docx_anchors_and_dry_runs_patch(tmp_pa
         },
     )
     assert wf_argv[0][:2] == ["rebuttal", "rev.txt"]
+
+
+def test_regression_flat_schema_and_significance_stars_preserved_in_latex_and_docx(tmp_path):
+    spec_path = tmp_path / "flat_reg.json"
+    spec_path.write_text(json.dumps({
+        "models": [
+            {
+                "name": "(1) OLS",
+                "coefs": {"Digital": 0.1426, "Size": 0.0834},
+                "ses": {"Digital": 0.0312, "Size": 0.0215},
+                "n": 18420,
+                "r2": 0.284,
+                "fe": {"Firm FE": "Yes", "Year FE": "Yes"},
+            },
+            {
+                "name": "(2) IV-2SLS",
+                "coefs": {"Digital": 0.1685, "Size": 0.0791},
+                "ses": {"Digital": 0.0485, "Size": 0.0209},
+                "n": 18420,
+                "r2": 0.317,
+                "fe": {"Firm FE": "Yes", "Year FE": "Yes"},
+            },
+        ]
+    }), encoding="utf-8")
+
+    docx_path = tmp_path / "reg_table.docx"
+    out = {}
+    research_tools.cmd_data_table(
+        argparse.Namespace(
+            filepath=str(spec_path),
+            type="regression",
+            columns=None,
+            digits=4,
+            lang="zh",
+            caption="表3 基准回归",
+            format="docx",
+            output=str(docx_path),
+            raw=False,
+        ),
+        output_fn=out.update,
+    )
+    assert out["status"] == "success"
+    assert "0.1426***" in out["markdown"]
+    assert "(0.0312)" in out["markdown"]
+    assert "Firm FE" in out["markdown"]
+    # 显著性星号 ***、**、* 在 LaTeX 表注与 Word 表注中均不得被 Markdown 加粗正则破坏
+    assert "***、**、*" in out["latex"]
+    assert r"\textbf{*、" not in out["latex"]
+
+    doc = Document(str(docx_path))
+    all_para_text = "\n".join(p.text for p in doc.paragraphs)
+    assert "***、**、*" in all_para_text
+    assert len(doc.tables) == 1
+    tbl_xml = doc.tables[0]._tbl.xml
+    assert 'w:type="fixed"' in tbl_xml
+    assert 'w:w="8311"' in tbl_xml
+
+
+def test_skill_md_frontmatter_conforms_to_agent_skills_spec():
+    skill_md = Path(__file__).resolve().parent.parent / "SKILL.md"
+    txt = skill_md.read_text(encoding="utf-8")
+    assert txt.startswith("---\n")
+    fm = txt.split("---", 2)[1]
+    assert "name: scholar-kit" in fm
+    assert "license: MIT" in fm
+    m = re.search(r"description:\s*>-\n((?:  .*\n)+)", fm)
+    assert m is not None
+    desc = " ".join(line.strip() for line in m.group(1).splitlines())
+    assert 50 <= len(desc) <= 1024, f"SKILL.md description 长度超出 Agent Skills 1024 字符规范: {len(desc)}"

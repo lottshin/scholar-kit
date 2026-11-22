@@ -1,5 +1,7 @@
 # Scholar Kit
 
+**中文** | [English](README_EN.md)
+
 [![CI](https://github.com/lottshin/scholar-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/lottshin/scholar-kit/actions/workflows/ci.yml)
 [![Upstream API Smoke](https://github.com/lottshin/scholar-kit/actions/workflows/upstream-smoke.yml/badge.svg)](https://github.com/lottshin/scholar-kit/actions/workflows/upstream-smoke.yml)
 [![Release](https://img.shields.io/github/v/release/lottshin/scholar-kit)](https://github.com/lottshin/scholar-kit/releases)
@@ -22,15 +24,21 @@ flowchart LR
 
 ## 快速安装
 
-### 一句话安装（所有平台通用）
+### 方式一：CLI 一键安装（推荐，兼容主流 Agent Skills 生态）
 
-在任意 Agent 对话框发送：
+```bash
+npx skills add lottshin/scholar-kit
+```
+
+### 方式二：一句话自然语言安装（所有平台通用）
+
+在任意 Agent 对话框直接发送：
 
 ```text
 Fetch and follow instructions from https://raw.githubusercontent.com/lottshin/scholar-kit/main/setup.md
 ```
 
-### 手动安装
+### 方式三：手动 Git 安装
 
 <details>
 <summary>展开各平台手动安装步骤</summary>
@@ -99,6 +107,75 @@ python3 <安装路径>/scripts/literature.py check --fix
 
 ---
 
+## 真实输出预览
+
+以下是脚本在真实数据与实网 OpenAlex 环境下的确定性输出示例：
+
+<details open>
+<summary><strong>1. 实证回归三线表（<code>data-table --type regression</code> → 同步输出 Markdown / LaTeX booktabs / Word 三线表）</strong></summary>
+
+表 3  数字化转型对企业全要素生产率的基准回归与稳健性检验
+
+| 变量 | (1) Baseline OLS | (2) IV-2SLS | (3) PSM-DID |
+| --- | ---: | ---: | ---: |
+| Digital_Trans | 0.1426*** | 0.1685*** | 0.1358*** |
+|  | (0.0312) | (0.0485) | (0.0341) |
+| Firm_Size | 0.0834*** | 0.0791*** | 0.0812*** |
+|  | (0.0215) | (0.0209) | (0.0224) |
+| Leverage | -0.1942*** | -0.2105*** | -0.1870*** |
+|  | (0.0748) | (0.0812) | (0.0785) |
+| Firm FE / Year FE | Yes | Yes | Yes |
+| 观测值 (N) | 18420 | 18420 | 14210 |
+| R² / Adj. R² | 0.2840 | 0.3170 | 0.3310 |
+
+> 注：圆括号内为稳健标准误；***、**、* 分别表示在 1%、5%、10% 水平上显著。同时自动生成可直接编译的 LaTeX `booktabs` 代码与 A4 版心全宽原生 Word 三线表（`.docx`）。
+
+</details>
+
+<details>
+<summary><strong>2. 外部空白实证核验 &amp; 结论极性/统计幻觉拦截（<code>review --verify-gaps</code> + <code>validate</code>）</strong></summary>
+
+```json
+// review --verify-gaps 实时检索 OpenAlex，阻止把"当前库没搜到"误写为"学界空白"
+{
+  "dimension": "方法支撑",
+  "search_proof": {
+    "database": "OpenAlex",
+    "query": "digital transformation firm productivity empirical experiment",
+    "year_range": "2022-2026",
+    "total_hits": 31391,
+    "verdict": "already_crowded"
+  }
+}
+
+// validate 核查 .docx/.md 成稿：精准抓出"结论写反"与"无引文裸统计数据"
+{
+  "status": "warning",
+  "issues": [
+    {
+      "type": "polarity_conflict",
+      "note": "正文表述为正向促进，但所引文献原文核心结论为负向/倒U型门槛效应（contradicted）"
+    },
+    {
+      "type": "unbacked_statistics",
+      "note": "检测到未挂引文的统计数值（如 73.6%, p < 0.01），请核实是否来自真实一手数据"
+    }
+  ]
+}
+```
+
+</details>
+
+<details>
+<summary><strong>3. 投稿选刊分层避雷 &amp; 审稿返修补丁联动（<code>match-journal</code> + <code>rebuttal</code>）</strong></summary>
+
+- **`match-journal`**：聚合文稿/课题引文母刊并结合 30,300+ 条离线核心索引，分为 **冲刺顶刊（Tier 1）** / **主投高契合核心（Tier 2）** / **稳健拓展核心（Tier 3）**；自动将中科院在榜预警期刊（如 *Computers and Electrical Engineering*）隔离至 `excluded_warning_venues`，对曾上榜已调出期刊附加历史谨慎提示。
+- **`rebuttal`**：自动解析 `Editor` / `Reviewer #N` / `审稿专家` 意见为 `R1-C1`、`R1-C2`...，自动匹配原稿对应段落 `[P2]`、`[P5]`，一键生成中/英文 **Response Letter（.docx / .md）** 与可直接通过 `patch-docx --dry-run` 预检的原稿修订补丁 JSON。
+
+</details>
+
+---
+
 ## 核心能力（按科研工作流）
 
 ### 1. 多源文献检索与深层引文网络
@@ -158,12 +235,14 @@ Scholar Kit 将运行时数据分为两层，既避免切换项目重复登录�
 
 ```text
 scholar-kit/
-├── SKILL.md                  ← Agent 核心指令与行为边界（渐进式披露）
+├── SKILL.md                  ← Agent 核心指令与行为边界（严守 Agent Skills 规范，渐进式披露）
 ├── setup.md                  ← 一句话自动安装脚本指引
-├── README.md
+├── README.md                 ← 中文说明文档
+├── README_EN.md              ← English Documentation
 ├── LICENSE
 ├── references/               ← Agent 按需加载的领域参考知识
-│   ├── workflows.md          ← 综述、引文推荐、Word 修补、对比矩阵步骤
+│   ├── cli-reference.md      ← 全部子命令完整参数与环境变量速查手册
+│   ├── workflows.md          ← 综述、万字长文、实证制表、选刊返修与 Word 修补步骤
 │   ├── style-audit.md        ← 学术表达审计规则与去 AI 腔清单
 │   ├── core-journals.md      ← 学科与核心期刊体系映射规则
 │   ├── api-search-best-practices.md
@@ -185,7 +264,7 @@ scholar-kit/
 │   ├── workflows.py          ← 标准化流水线模板
 │   ├── smoke_upstream.py     ← 外部学术 API 每周线上契约巡检探针
 │   └── cnki/                 ← 知网自动化模块（双引擎检索/静默后台复用/内联摘要导出/防风控下载）
-└── tests/                    ← pytest 自动化回归测试套件（102 项用例）
+└── tests/                    ← pytest 自动化回归测试套件（104 项用例）
 ```
 
 </details>

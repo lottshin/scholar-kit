@@ -1,5 +1,5 @@
 """
-literature.py - Scholar Kit 统一 CLI 入口 (v1.25.0)
+literature.py - Scholar Kit 统一 CLI 入口 (v1.25.1)
 
 模块职责分层:
   - literature.py     : CLI 参数解析、搜索/下载/引文/核验/导出路由编排
@@ -15,7 +15,7 @@ literature.py - Scholar Kit 统一 CLI 入口 (v1.25.0)
 
 from __future__ import annotations
 
-__version__ = "1.25.0"
+__version__ = "1.25.1"
 
 import argparse
 import hashlib

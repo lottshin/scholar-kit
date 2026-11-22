@@ -173,7 +173,7 @@ def _extract_numeric_columns(rows: List[Dict[str, Any]], requested_cols: Optiona
     return numeric_map
 
 
-def _escape_latex(text: str) -> str:
+def _escape_latex(text: str, *, allow_markup: bool = True) -> str:
     s = str(text)
     repl = {
         "\\": r"\textbackslash{}",
@@ -186,9 +186,10 @@ def _escape_latex(text: str) -> str:
         "}": r"\}",
     }
     out = "".join(repl.get(ch, ch) for ch in s)
-    # 恢复加粗与下划线标记（用于对比表最优/次优指标）
-    out = re.sub(r"\*\*(.+?)\*\*", r"\\textbf{\1}", out)
-    out = re.sub(r"<u>(.+?)</u>", r"\\underline{\1}", out)
+    if allow_markup:
+        # 仅对单元格内明确成对包裹的非星号内容恢复加粗/下划线，避免误伤显著性星号 ***、**、*
+        out = re.sub(r"(?<!\*)\*\*(?!\*)([^*]+?)(?<!\*)\*\*(?!\*)", r"\\textbf{\1}", out)
+        out = re.sub(r"<u>(.+?)</u>", r"\\underline{\1}", out)
     return out
 
 
@@ -212,17 +213,17 @@ def _render_booktabs_latex(headers: List[str], rows: List[List[str]], caption: s
         r"  \centering",
     ]
     if caption:
-        lines.append(f"  \\caption{{{_escape_latex(caption)}}}")
+        lines.append(f"  \\caption{{{_escape_latex(caption, allow_markup=False)}}}")
     lines.append(f"  \\begin{{tabular}}{{{col_spec}}}")
     lines.append(r"    \toprule")
-    lines.append("    " + " & ".join(_escape_latex(h) for h in headers) + r" \\")
+    lines.append("    " + " & ".join(_escape_latex(h, allow_markup=False) for h in headers) + r" \\")
     lines.append(r"    \midrule")
     for r in rows:
-        lines.append("    " + " & ".join(_escape_latex(c) for c in r) + r" \\")
+        lines.append("    " + " & ".join(_escape_latex(c, allow_markup=True) for c in r) + r" \\")
     lines.append(r"    \bottomrule")
     lines.append(r"  \end{tabular}")
     if note:
-        lines.append(f"  \\\\[4pt]\\footnotesize{{{_escape_latex(note)}}}")
+        lines.append(f"  \\\\[4pt]\\footnotesize{{{_escape_latex(note, allow_markup=False)}}}")
     lines.append(r"\end{table}")
     return "\n".join(lines)
 
@@ -368,18 +369,43 @@ def build_regression_table(spec: Dict[str, Any], *, digits: int = 4, lang: str =
 
     var_order: List[str] = []
     control_order: List[str] = []
+
+    def _model_controls(m: Dict[str, Any]) -> Dict[str, Any]:
+        merged: Dict[str, Any] = {}
+        for k in ("controls", "fe", "fixed_effects"):
+            val = m.get(k)
+            if isinstance(val, dict):
+                merged.update(val)
+        return merged
+
+    def _coef_entry(m: Dict[str, Any], var: str) -> Optional[Dict[str, Any]]:
+        raw = (m.get("coefs") or {}).get(var)
+        if isinstance(raw, dict):
+            return raw if raw.get("coef") is not None else None
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            entry: Dict[str, Any] = {"coef": float(raw)}
+            for src_key, dst_key in (("ses", "se"), ("ts", "t"), ("t_stats", "t"), ("pvals", "p"), ("p_values", "p"), ("stars", "stars")):
+                bucket = m.get(src_key)
+                if isinstance(bucket, dict) and bucket.get(var) is not None:
+                    entry[dst_key] = bucket[var]
+            return entry
+        return None
+
     for m in models:
         for v in (m.get("coefs") or {}).keys():
             if v not in var_order:
                 var_order.append(v)
-        for c in (m.get("controls") or {}).keys():
+        for c in _model_controls(m).keys():
             if c not in control_order:
                 control_order.append(c)
 
     fmt = f"{{:.{digits}f}}"
     use_t = any(
-        "t" in info and "se" not in info
-        for m in models for info in (m.get("coefs") or {}).values() if isinstance(info, dict)
+        ("t" in entry and "se" not in entry)
+        for m in models
+        for v in (m.get("coefs") or {}).keys()
+        for entry in [_coef_entry(m, v)]
+        if entry
     )
     table_rows: List[List[str]] = []
 
@@ -387,8 +413,8 @@ def build_regression_table(spec: Dict[str, Any], *, digits: int = 4, lang: str =
         coef_row = [var]
         sub_row = [""]
         for m in models:
-            info = (m.get("coefs") or {}).get(var)
-            if not isinstance(info, dict) or info.get("coef") is None:
+            info = _coef_entry(m, var)
+            if not info or info.get("coef") is None:
                 coef_row.append("")
                 sub_row.append("")
                 continue
@@ -412,7 +438,7 @@ def build_regression_table(spec: Dict[str, Any], *, digits: int = 4, lang: str =
             table_rows.append(sub_row)
 
     for ctrl in control_order:
-        table_rows.append([ctrl] + [str((m.get("controls") or {}).get(ctrl, "")) for m in models])
+        table_rows.append([ctrl] + [str(_model_controls(m).get(ctrl, "")) for m in models])
 
     if any(m.get("n") is not None for m in models):
         n_label = "观测值 (N)" if lang == "zh" else "Observations"

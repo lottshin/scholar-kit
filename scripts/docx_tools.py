@@ -884,7 +884,11 @@ def _write_docx_from_markdown(
             _set_run_east_asia(r_tail, font_cn)
 
     def _parse_inline(paragraph, text, allow_sup: bool = True, font_cn: Optional[str] = None, pt_size: Optional[float] = None):
-        pattern = re.compile(r"(\*\*(.+?)\*\*|\*(.+?)\*|\[\^(\d+)\])")
+        pattern = re.compile(
+            r"((?<!\*)\*\*(?!\*)(?!\s)([^*]+?)(?<!\s)(?<!\*)\*\*(?!\*)"
+            r"|(?<!\*)\*(?!\*)(?!\s)([^*、，,。;；\s][^*]*?)(?<!\s)(?<!\*)\*(?!\*)"
+            r"|\[\^(\d+)\])"
+        )
         last = 0
         for m in pattern.finditer(text):
             if m.start() > last:
@@ -905,8 +909,61 @@ def _write_docx_from_markdown(
             _emit_plain_or_sup(paragraph, text[last:], allow_sup=allow_sup, font_cn=font_cn, pt_size=pt_size)
 
     def _set_three_line_table_borders(table):
-        """为 Word 原生表格设置标准中文学术三线表边框（顶底 1.5pt 粗线，表头下 0.75pt 细线，跨页重复表头与防拆行）。"""
+        """为 Word 原生表格设置标准中文学术三线表边框（A4 版心全宽、顶底 1.5pt 粗线，表头下 0.75pt 细线，跨页重复表头与防拆行）。"""
         tbl_pr = table._tbl.tblPr
+        # A4 版心宽度 = 21.0 - 3.17*2 = 14.66 cm ≈ 8311 dxa；显式 dxa 宽度兼容 Word / WPS / Pages / QuickLook
+        full_dxa = 8311
+        for old_w in tbl_pr.findall(qn("w:tblW")):
+            tbl_pr.remove(old_w)
+        tbl_w = OxmlElement("w:tblW")
+        tbl_w.set(qn("w:w"), str(full_dxa))
+        tbl_w.set(qn("w:type"), "dxa")
+        tbl_pr.append(tbl_w)
+
+        table.autofit = False
+        for old_lo in tbl_pr.findall(qn("w:tblLayout")):
+            tbl_pr.remove(old_lo)
+        tbl_lo = OxmlElement("w:tblLayout")
+        tbl_lo.set(qn("w:type"), "fixed")
+        tbl_pr.append(tbl_lo)
+
+        tbl_cell_mar = OxmlElement("w:tblCellMar")
+        for side, dxa in (("top", "55"), ("bottom", "55"), ("left", "110"), ("right", "110")):
+            m_el = OxmlElement(f"w:{side}")
+            m_el.set(qn("w:w"), dxa)
+            m_el.set(qn("w:type"), "dxa")
+            tbl_cell_mar.append(m_el)
+        tbl_pr.append(tbl_cell_mar)
+
+        num_cols = len(table.columns)
+        if num_cols > 0:
+            if num_cols == 1:
+                col_widths = [full_dxa]
+            else:
+                first_w = int(full_dxa * (0.30 if num_cols <= 4 else 0.24))
+                other_w = max(800, (full_dxa - first_w) // (num_cols - 1))
+                col_widths = [first_w] + [other_w] * (num_cols - 1)
+                col_widths[-1] += full_dxa - sum(col_widths)
+            old_grid = table._tbl.find(qn("w:tblGrid"))
+            if old_grid is not None:
+                table._tbl.remove(old_grid)
+            new_grid = OxmlElement("w:tblGrid")
+            for w_dxa in col_widths:
+                gc = OxmlElement("w:gridCol")
+                gc.set(qn("w:w"), str(w_dxa))
+                new_grid.append(gc)
+            tbl_pr.addnext(new_grid)
+            for row in table.rows:
+                for c_idx, cell in enumerate(row.cells):
+                    if c_idx < len(col_widths):
+                        tc_pr = cell._tc.get_or_add_tcPr()
+                        for old_tcw in tc_pr.findall(qn("w:tcW")):
+                            tc_pr.remove(old_tcw)
+                        tc_w = OxmlElement("w:tcW")
+                        tc_w.set(qn("w:w"), str(col_widths[c_idx]))
+                        tc_w.set(qn("w:type"), "dxa")
+                        tc_pr.append(tc_w)
+
         borders = OxmlElement("w:tblBorders")
         for edge, val, sz in (
             ("top", "single", "12"),
@@ -965,6 +1022,7 @@ def _write_docx_from_markdown(
                 tbl_raw_lines.append(body_lines[idx_ln].strip())
                 idx_ln += 1
             parsed_rows = [_split_md_table_row(r) for r in tbl_raw_lines]
+            sep_row = next((r for r in parsed_rows if _is_md_table_sep(r)), [])
             data_rows = [r for r in parsed_rows if not _is_md_table_sep(r)]
             if len(data_rows) >= 2:
                 col_cnt = max(len(r) for r in data_rows)
@@ -982,6 +1040,9 @@ def _write_docx_from_markdown(
                             cp = cell.paragraphs[0]
                             cp.paragraph_format.first_line_indent = Cm(0)
                             cp.paragraph_format.line_spacing = 1.25
+                            sep_spec = sep_row[c_i].strip() if c_i < len(sep_row) else ""
+                            if c_i > 0 and (sep_spec.endswith(":") or sep_spec.startswith(":")):
+                                cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
                             _parse_inline(cp, val_txt, allow_sup=(r_i > 0), pt_size=10.5)
                             if r_i == 0:
                                 for run in cp.runs:
@@ -1052,6 +1113,16 @@ def _write_docx_from_markdown(
             r_cap.font.name = "Times New Roman"
             r_cap.font.size = Pt(10.5)
             _set_run_east_asia(r_cap, "黑体")
+            continue
+
+        # 表注 / 图注 / 资料来源（如「注：...」「Note: ...」）：顶格小五号宋体/Times New Roman
+        if re.match(r"^(?:注|表注|图注|资料来源|数据来源|Notes?)\s*[：:]", stripped_ln, re.I):
+            p = doc.add_paragraph()
+            p.paragraph_format.first_line_indent = Cm(0)
+            p.paragraph_format.line_spacing = 1.25
+            p.paragraph_format.space_before = Pt(3)
+            p.paragraph_format.space_after = Pt(6)
+            _parse_inline(p, stripped_ln, allow_sup=False, pt_size=9.5)
             continue
 
         ul_match = re.match(r"^[-*]\s+(.+)$", line)

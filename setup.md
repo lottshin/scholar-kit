@@ -1,6 +1,7 @@
 # Scholar Kit — Auto Install
 
 You are an AI agent. Follow these steps to install or update Scholar Kit cleanly.
+*(Users may also install via the Agent Skills CLI: `npx skills add lottshin/scholar-kit`, then run step 4–5 below.)*
 
 ## Steps
 
