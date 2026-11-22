@@ -615,8 +615,29 @@ def _wait_for_debug_port_http(port: int, timeout: int) -> bool:
     return False
 
 
+_LOCAL_NO_PROXY_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _ensure_local_proxy_bypass() -> None:
+    """让本地 WebDriver / CDP 调试连接绕过 HTTP 代理。
+
+    Selenium 通过 HTTP 与本地 WebDriver 端口通信；若进程环境中设置了
+    HTTP_PROXY/HTTPS_PROXY（托管沙盒或企业代理常见），回环请求会被误发给代理导致失败。
+    将回环地址补入 NO_PROXY，浏览器自身的外部请求不受影响。
+    """
+    current = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    hosts = [item.strip() for item in current.split(",") if item.strip()]
+    missing = [host for host in _LOCAL_NO_PROXY_HOSTS if host not in hosts]
+    if not missing:
+        return
+    merged = ",".join(hosts + missing)
+    os.environ["NO_PROXY"] = merged
+    os.environ["no_proxy"] = merged
+
+
 def _connect_remote_browser(browser: str, port: int = _DEFAULT_DEBUG_PORT) -> "webdriver.Remote":
     """通过远程调试端口连接到已运行的浏览器（优先由 Selenium Manager 精确匹配驱动版本，离线时回退最高版本本地驱动）。"""
+    _ensure_local_proxy_bypass()
     OptionsClass = webdriver.EdgeOptions if browser == "edge" else webdriver.ChromeOptions
     DriverClass = webdriver.Edge if browser == "edge" else webdriver.Chrome
 
@@ -1231,6 +1252,7 @@ def _create_driver(browser: str = None, headless: bool = False) -> "webdriver.Re
         )
 
     _ensure_selenium_cache()
+    _ensure_local_proxy_bypass()
 
     if browser is None:
         browser = _detect_browser()

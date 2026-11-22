@@ -28,6 +28,19 @@ from .driver import (
     _save_cookies,
     check_cnki_access,
 )
+from .query import (
+    CnkiCondition,
+    CnkiQueryError,
+    build_legacy_conditions,
+    canonical_match,
+    compile_conditions_to_expression,
+    has_same_field_operators,
+    normalize_value,
+    parse_condition,
+    validate_conditions,
+    validate_professional_expression,
+    validate_value_syntax,
+)
 from .selectors import CNKI_SELECTORS, save_adv_dom_diagnosis
 
 if HAS_SELENIUM:
@@ -66,12 +79,15 @@ _ADV_FIELD_MAP: Dict[str, str] = {
     "期刊名称": "LY",
     "基金": "FU",
     "基金资助": "FU",
+    "小标题": "CO",
+    "参考文献": "RF",
+    "分类号": "CLC",
     "DOI": "DOI",
 }
 
 _VALID_FIELD_CODES = {
     "SU", "TKA", "TI", "KY", "AB", "FT",
-    "AU", "FI", "RP", "AF", "LY", "FU", "DOI", "CLC",
+    "AU", "FI", "RP", "AF", "LY", "JN", "FU", "CO", "RF", "CLC", "DOI",
 }
 
 # 新版 KNS8S #gradetxt 下拉菜单文本候选（用于多行表单兜底）
@@ -87,7 +103,11 @@ _CODE_TO_LABELS: Dict[str, Tuple[str, ...]] = {
     "RP": ("通讯作者",),
     "AF": ("作者单位", "机构", "单位"),
     "LY": ("文献来源", "期刊名称", "来源"),
+    "JN": ("文献来源", "期刊名称", "来源"),
     "FU": ("基金", "基金资助"),
+    "CO": ("小标题",),
+    "RF": ("参考文献",),
+    "CLC": ("分类号",),
     "DOI": ("DOI",),
 }
 
@@ -182,22 +202,29 @@ def build_cnki_expression(
 
     if keyword and keyword.strip():
         code = resolve_cnki_field_code(field)
-        val, _ = _clean_cnki_value(keyword)
-        if val:
-            # 中文多关键词以空格分隔时（如 "新质生产力 高质量发展"），在主题/篇关摘/关键词/摘要/全文中拆分为 AND 组合，避免专业检索按字面带空格短语 0 命中
-            has_cjk_kw = any("\u4e00" <= ch <= "\u9fff" for ch in val)
-            terms = (
-                [t for t in re.split(r"[\s\u3000]+", val) if t]
-                if (has_cjk_kw and code in ("SU", "TKA", "KY", "AB", "FT") and re.search(r"[\s\u3000]", val))
-                else [val]
-            )
-            for term in terms:
-                if code in ("AU", "FI", "RP", "DOI"):
-                    clauses.append(f"{code}='{term}'")
-                elif code in ("AF", "FU") or fuzzy:
-                    clauses.append(f"{code} % '{term}'")
-                else:
-                    clauses.append(f"{code}='{term}'")
+        raw_kw = normalize_value(keyword)
+        if has_same_field_operators(raw_kw):
+            validate_value_syntax(raw_kw)
+            op = "%=" if code == "SU" else ("%" if (code in ("AF", "FU") or fuzzy) else "=")
+            expr_body = raw_kw if (raw_kw.startswith("(") and raw_kw.endswith(")")) else f"({raw_kw})"
+            clauses.append(f"{code} {op} {expr_body}")
+        else:
+            val, _ = _clean_cnki_value(keyword)
+            if val:
+                # 中文多关键词以空格分隔时（如 "新质生产力 高质量发展"），在主题/篇关摘/关键词/摘要/全文中拆分为 AND 组合，避免专业检索按字面带空格短语 0 命中
+                has_cjk_kw = any("\u4e00" <= ch <= "\u9fff" for ch in val)
+                terms = (
+                    [t for t in re.split(r"[\s\u3000]+", val) if t]
+                    if (has_cjk_kw and code in ("SU", "TKA", "KY", "AB", "FT") and re.search(r"[\s\u3000]", val))
+                    else [val]
+                )
+                for term in terms:
+                    if code in ("AU", "FI", "RP", "DOI"):
+                        clauses.append(f"{code}='{term}'")
+                    elif code in ("AF", "FU") or fuzzy:
+                        clauses.append(f"{code} % '{term}'")
+                    else:
+                        clauses.append(f"{code}='{term}'")
 
     if author and author.strip():
         val, _ = _clean_cnki_value(author)
@@ -251,17 +278,22 @@ def _build_structured_conditions(
     conds: List[Tuple[str, str, bool]] = []
     if keyword and keyword.strip():
         code = resolve_cnki_field_code(field)
-        val, _ = _clean_cnki_value(keyword)
-        if val:
+        raw_kw = normalize_value(keyword)
+        if has_same_field_operators(raw_kw):
             is_f = True if code in ("AF", "FU") else (False if code in ("AU", "FI", "RP", "DOI") else bool(fuzzy))
-            has_cjk_kw = any("\u4e00" <= ch <= "\u9fff" for ch in val)
-            terms = (
-                [t for t in re.split(r"[\s\u3000]+", val) if t]
-                if (has_cjk_kw and code in ("SU", "TKA", "KY", "AB", "FT") and re.search(r"[\s\u3000]", val))
-                else [val]
-            )
-            for term in terms:
-                conds.append((code, term, is_f))
+            conds.append((code, raw_kw, is_f))
+        else:
+            val, _ = _clean_cnki_value(keyword)
+            if val:
+                is_f = True if code in ("AF", "FU") else (False if code in ("AU", "FI", "RP", "DOI") else bool(fuzzy))
+                has_cjk_kw = any("\u4e00" <= ch <= "\u9fff" for ch in val)
+                terms = (
+                    [t for t in re.split(r"[\s\u3000]+", val) if t]
+                    if (has_cjk_kw and code in ("SU", "TKA", "KY", "AB", "FT") and re.search(r"[\s\u3000]", val))
+                    else [val]
+                )
+                for term in terms:
+                    conds.append((code, term, is_f))
     if author and author.strip():
         val, _ = _clean_cnki_value(author)
         if val:
@@ -700,6 +732,91 @@ def _detect_cnki_expr_error(driver) -> Optional[str]:
         return None
 
 
+def _set_cross_language(driver, enabled: bool) -> Optional[bool]:
+    """设置检索控制区的「中英文扩展」复选框；返回实际生效布尔值，页面无该控件时返回 None。"""
+    script = r"""
+    var want = Boolean(arguments[0]);
+    var box = document.querySelector('input[type="checkbox"][data-id="EN"]')
+           || document.querySelector('input[type="checkbox"][name="onlyChecked"][value="1"]');
+    if (!box) {
+        var labels = document.querySelectorAll('label');
+        for (var i = 0; i < labels.length; i++) {
+            var el = labels[i];
+            if ((el.textContent || '').trim() !== '中英文扩展') continue;
+            box = el.querySelector('input[type="checkbox"]');
+            if (box) break;
+        }
+    }
+    if (!box) return JSON.stringify({found: false});
+    var before = box.checked;
+    if (before !== want) box.click();
+    return JSON.stringify({found: true, before: before, after: box.checked});
+    """
+    try:
+        raw = driver.execute_script(script, bool(enabled))
+        info = json.loads(raw) if raw else {}
+        if not info.get("found"):
+            _log("[cnki] 当前页面未找到中英文扩展控件（仅高级/专业检索页提供），保持知网默认")
+            return None
+        _log(f"[cnki] 中英文扩展: {info.get('before')} -> {info.get('after')}")
+        return bool(info.get("after"))
+    except Exception as e:
+        _log(f"[cnki] 设置中英文扩展异常: {e}")
+        return None
+
+
+def _normalize_expr_for_compare(expr: str) -> str:
+    return re.sub(r"\s+", " ", (expr or "").strip())
+
+
+def _verify_professional_expression(driver, expected: str) -> Dict[str, Any]:
+    """在结果页回读专业检索框中的实际表达式并与请求比对；页面不含可回读框时返回 verified=None。"""
+    read_js = r"""
+    var ta = document.querySelector('textarea.textarea-major, textarea.majorSearch, .major-search textarea, #gradetxt textarea');
+    if (!ta) return '';
+    return (ta.value || '').trim();
+    """
+    try:
+        raw = driver.execute_script(read_js)
+        actual = str(raw).strip() if isinstance(raw, str) else ""
+        if not actual:
+            return {"verified": None, "actual": None}
+        matched = _normalize_expr_for_compare(actual) == _normalize_expr_for_compare(expected)
+        return {"verified": matched, "actual": actual}
+    except Exception:
+        return {"verified": None, "actual": None}
+
+
+def _read_total_hits(driver) -> Optional[int]:
+    """从结果页分页统计栏读取总命中篇数；无法解析时返回 None。"""
+    hits_js = r"""
+    var el = document.querySelector('.pagerTitleCell, .countPageMark, span.pagerTitleCell, em');
+    if (el && (el.textContent || '').match(/\d/)) {
+        var parentTxt = (el.parentElement ? el.parentElement.textContent : el.textContent) || '';
+        if (parentTxt.indexOf('条结果') >= 0 || parentTxt.indexOf('找到') >= 0) {
+            return parentTxt;
+        }
+    }
+    var cells = document.querySelectorAll('.pagerTitleCell, .search-result-info, .result-con-l');
+    for (var i = 0; i < cells.length; i++) {
+        var t = (cells[i].textContent || '').trim();
+        if (t.indexOf('条结果') >= 0 || t.indexOf('找到') >= 0) return t;
+    }
+    return '';
+    """
+    try:
+        raw = driver.execute_script(hits_js)
+        text = str(raw).strip() if isinstance(raw, str) else ""
+        if not text:
+            return None
+        m = re.search(r"([\d,]+)\s*条结果", text) or re.search(r"找到\s*([\d,]+)", text)
+        if not m:
+            return None
+        return int(m.group(1).replace(",", ""))
+    except Exception:
+        return None
+
+
 def _submit_major_search(
     driver,
     expression: str,
@@ -707,6 +824,7 @@ def _submit_major_search(
     core: Optional[str] = None,
     year_from: Optional[int] = None,
     year_to: Optional[int] = None,
+    cross_language: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """引擎 1：切换至 KNS8S「专业检索 (majorSearch)」，再勾选来源类别/出版年度并提交检索式。"""
     if not expression:
@@ -755,9 +873,10 @@ def _submit_major_search(
         """)
         time.sleep(0.4)
 
-        # 2. 在专业检索面板内设置来源类别复选框与出版年度/发表时间
+        # 2. 在专业检索面板内设置来源类别复选框、出版年度与中英文扩展开关
         core_ok = _preselect_adv_cores(driver, core) if core else False
         year_ok = _preset_adv_date_range(driver, year_from, year_to) if (year_from is not None or year_to is not None) else False
+        cross_lang_actual = _set_cross_language(driver, cross_language) if cross_language is not None else None
 
         # 3. 填入专业检索表达式
         raw = driver.execute_script(fill_only_js, expression)
@@ -782,6 +901,7 @@ def _submit_major_search(
             "expression": expression,
             "core_preselected": core_ok,
             "year_preset": year_ok,
+            "cross_language_applied": cross_lang_actual,
         }
     except Exception as e:
         _log(f"[cnki-major] 专业检索执行异常: {e}")
@@ -795,6 +915,7 @@ def _submit_grade_search(
     core: Optional[str] = None,
     year_from: Optional[int] = None,
     year_to: Optional[int] = None,
+    cross_language: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """引擎 2（兜底）：新版 KNS8S `#gradetxt dd` 多条件表单提交。"""
     if not conditions:
@@ -818,9 +939,10 @@ def _submit_grade_search(
         """)
         time.sleep(0.4)
 
-        # 2. 切回 gradeSearch 后重新设置来源类别与出版年度
+        # 2. 切回 gradeSearch 后重新设置来源类别、出版年度与中英文扩展开关
         core_ok = _preselect_adv_cores(driver, core) if core else False
         year_ok = _preset_adv_date_range(driver, year_from, year_to) if (year_from is not None or year_to is not None) else False
+        cross_lang_actual = _set_cross_language(driver, cross_language) if cross_language is not None else None
 
         # 3. 逐次点击 "+" 添加足够的条件行
         for idx in range(len(conditions)):
@@ -966,6 +1088,7 @@ def _submit_grade_search(
                 "engine": "gradeSearch",
                 "core_preselected": core_ok,
                 "year_preset": year_ok,
+                "cross_language_applied": cross_lang_actual,
             }
 
         inputs = driver.find_elements(By.CSS_SELECTOR, "#gradetxt input[type='text'], input[type='text']")
@@ -976,6 +1099,7 @@ def _submit_grade_search(
                 "engine": "gradeSearch",
                 "core_preselected": core_ok,
                 "year_preset": year_ok,
+                "cross_language_applied": cross_lang_actual,
             }
 
         return {"ok": False, "reason": "no_submit_button"}
@@ -993,6 +1117,7 @@ def _advanced_search(
     core: Optional[str] = None,
     year_from: Optional[int] = None,
     year_to: Optional[int] = None,
+    cross_language: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """统一执行知网高级检索：优先专业检索式 `majorSearch`，失败时自动回退 `#gradetxt` 多条件表单。"""
     if expression:
@@ -1002,6 +1127,7 @@ def _advanced_search(
             core=core,
             year_from=year_from,
             year_to=year_to,
+            cross_language=cross_language,
         )
         if major_res.get("ok"):
             return major_res
@@ -1013,7 +1139,7 @@ def _advanced_search(
         return {
             "ok": False,
             "syntax_error": False,
-            "reason": "自定义 --expr 提交失败且无结构化字段可回退表单",
+            "reason": "自定义检索式提交失败且无结构化字段可回退表单",
         }
 
     norm_conds: List[Tuple[str, str, bool]] = []
@@ -1029,6 +1155,7 @@ def _advanced_search(
         core=core,
         year_from=year_from,
         year_to=year_to,
+        cross_language=cross_language,
     )
 
 
@@ -1234,45 +1361,130 @@ def search_cnki(
     fund: str = None,
     expr: str = None,
     fuzzy: bool = False,
+    conditions: Optional[List[str]] = None,
+    professional: Optional[str] = None,
+    match: Optional[str] = None,
+    cross_language: Optional[bool] = None,
+    meta: Optional[Dict[str, Any]] = None,
     per_page: Optional[int] = None,
     bulk_abstract: bool = True,
     _keep_driver: bool = False,
 ):
-    """知网文献搜索（支持专业检索式、多字段精确/模糊限定、前置核心与年份过滤、50条/页扩容与批量题录摘要导出）。"""
+    """知网文献搜索（支持专业检索式、结构化多条件模型、中英文扩展控制、结果页回读校验与批量题录摘要导出）。"""
     _log(
-        f"[cnki] 开始搜索: keyword={keyword}, expr={expr}, field={field}, author={author}, "
-        f"first_author={first_author}, affiliation={affiliation}, journal={journal}, "
+        f"[cnki] 开始搜索: keyword={keyword}, expr={expr}, professional={professional}, "
+        f"conditions={conditions}, field={field}, match={match}, cross_language={cross_language}, "
+        f"author={author}, first_author={first_author}, affiliation={affiliation}, journal={journal}, "
         f"fund={fund}, core={core}, year={year_from}-{year_to}, doc_type={doc_type}, "
         f"fuzzy={fuzzy}, per_page={per_page}, bulk_abstract={bulk_abstract}"
     )
 
+    retrieval: Dict[str, Any] = {
+        "mode": "simple",
+        "requested": {},
+        "applied": {},
+        "verified": None,
+        "expression": None,
+        "total_hits": None,
+    }
+    parsed_conditions: List[CnkiCondition] = []
+    structured_conds: List[Tuple[str, str, bool]] = []
+    expression = ""
+    effective_fuzzy = bool(fuzzy)
+
     try:
-        expression = build_cnki_expression(
-            keyword=keyword,
-            field=field,
-            author=author,
-            first_author=first_author,
-            affiliation=affiliation,
-            journal=journal,
-            fund=fund,
-            expr=expr,
-            fuzzy=fuzzy,
-        )
-        structured_conds = _build_structured_conditions(
-            keyword=keyword,
-            field=field,
-            author=author,
-            first_author=first_author,
-            affiliation=affiliation,
-            journal=journal,
-            fund=fund,
-            fuzzy=fuzzy,
-        )
+        if conditions and (professional or (expr and expr.strip())):
+            raise CnkiQueryError(
+                "CNKI_INVALID_EXPRESSION",
+                "--condition 与 --professional / --expr 互斥，请只使用其中一种检索模式",
+            )
+        if professional and expr and expr.strip():
+            raise CnkiQueryError(
+                "CNKI_INVALID_EXPRESSION",
+                "--professional 与 --expr 不能同时指定",
+            )
+        if conditions and any([keyword and keyword.strip(), author, first_author, affiliation, journal, fund, match]):
+            raise CnkiQueryError(
+                "CNKI_INVALID_EXPRESSION",
+                "使用 --condition 时请将所有条件统一写入 --condition，勿混用位置关键词或 --author/--journal/--match",
+            )
+        if match is not None:
+            norm_match = canonical_match(match)
+            if norm_match:
+                validate_conditions([CnkiCondition(field=field or "主题", value=keyword or "占位", match=norm_match)])
+                effective_fuzzy = norm_match == "模糊"
+
+        if professional is not None:
+            retrieval["mode"] = "professional"
+            expression = validate_professional_expression(professional)
+            retrieval["requested"] = {"professional": expression}
+        elif conditions:
+            retrieval["mode"] = "advanced"
+            parsed_conditions = validate_conditions([parse_condition(c) for c in conditions])
+            expression = compile_conditions_to_expression(parsed_conditions)
+            retrieval["requested"] = {"conditions": [c.to_dict() for c in parsed_conditions]}
+            if all(c.logic == "并且" for c in parsed_conditions[1:]):
+                structured_conds = [
+                    (resolve_cnki_field_code(c.field), c.value, c.match != "精确")
+                    for c in parsed_conditions
+                ]
+        else:
+            expression = build_cnki_expression(
+                keyword=keyword,
+                field=field,
+                author=author,
+                first_author=first_author,
+                affiliation=affiliation,
+                journal=journal,
+                fund=fund,
+                expr=expr,
+                fuzzy=effective_fuzzy,
+            )
+            structured_conds = _build_structured_conditions(
+                keyword=keyword,
+                field=field,
+                author=author,
+                first_author=first_author,
+                affiliation=affiliation,
+                journal=journal,
+                fund=fund,
+                fuzzy=effective_fuzzy,
+            )
+            if expr and expr.strip():
+                retrieval["mode"] = "professional"
+                retrieval["requested"] = {"expr": expression}
+            elif any([author, first_author, affiliation, journal, fund, match, effective_fuzzy]) or (
+                field and resolve_cnki_field_code(field) != "SU"
+            ):
+                retrieval["mode"] = "advanced"
+                retrieval["requested"] = {
+                    "keyword": keyword,
+                    "field": field or "主题",
+                    "match": canonical_match(match) if match else ("模糊" if effective_fuzzy else None),
+                }
+            else:
+                retrieval["requested"] = {"keyword": keyword, "field": field or "主题"}
+
+        if cross_language is not None:
+            retrieval["requested"]["cross_language"] = bool(cross_language)
+        if expression:
+            retrieval["expression"] = expression
+    except CnkiQueryError as qe:
+        err_obj: Dict[str, Any] = {"status": "error", "code": qe.code, "message": qe.message}
+        if qe.condition:
+            err_obj["condition"] = qe.condition
+        if meta is not None:
+            meta["retrieval"] = retrieval
+        return [err_obj]
     except ValueError as ve:
+        if meta is not None:
+            meta["retrieval"] = retrieval
         return [{"status": "error", "code": "CNKI_EXPR_SYNTAX_ERROR", "message": str(ve)}]
 
     if not expression:
-        return [{"status": "error", "code": "NO_KEYWORDS", "message": "未提供搜索关键词、高级筛选字段或 --expr 检索式"}]
+        if meta is not None:
+            meta["retrieval"] = retrieval
+        return [{"status": "error", "code": "NO_KEYWORDS", "message": "未提供搜索关键词、--condition 高级条件或 --expr/--professional 检索式"}]
 
     accessible, msg = check_cnki_access()
     _log(f"[cnki] 网络检测: accessible={accessible}, msg={msg}")
@@ -1280,21 +1492,28 @@ def search_cnki(
         if msg.startswith("SANDBOX_BLOCKED"):
             _log("[cnki] 沙盒限制导致预检失败，浏览器可能仍可访问，继续尝试...")
         else:
+            if meta is not None:
+                meta["retrieval"] = retrieval
             return [{"status": "error", "code": "CNKI_UNREACHABLE", "message": msg}]
 
     # 严格的语义限定条件（若失败绝不允许静默退回普通关键词搜索）
     has_strict_adv = bool(
         (expr and expr.strip())
+        or professional
+        or conditions
+        or match
         or author
         or first_author
         or affiliation
         or journal
         or fund
-        or fuzzy
+        or effective_fuzzy
         or (field and resolve_cnki_field_code(field) != "SU")
     )
-    # 若带核心期刊或起止年份，也优先走 AdvSearch 一次性前置筛选，减少结果页连续刷侧边栏
-    prefer_adv_page = has_strict_adv or bool(core or year_from is not None or year_to is not None)
+    # 若带核心期刊、起止年份或中英文扩展控制，也优先走 AdvSearch（普通检索页不提供中英文扩展复选框）
+    prefer_adv_page = has_strict_adv or bool(
+        core or year_from is not None or year_to is not None or cross_language is not None
+    )
 
     driver = None
     should_quit = True
@@ -1320,15 +1539,33 @@ def search_cnki(
                 driver,
                 structured_conds,
                 expression=expression,
-                require_expr_only=bool(expr and expr.strip() and not structured_conds),
+                require_expr_only=bool(
+                    ((expr and expr.strip()) or professional or conditions) and not structured_conds
+                ),
                 core=core,
                 year_from=year_from,
                 year_to=year_to,
+                cross_language=cross_language,
             )
             if adv_res.get("ok"):
                 used_adv = True
                 core_filter_ok = bool(adv_res.get("core_preselected"))
                 year_preset_ok = bool(adv_res.get("year_preset"))
+                retrieval["applied"]["engine"] = adv_res.get("engine")
+                retrieval["applied"]["expression"] = expression
+                if parsed_conditions:
+                    retrieval["applied"]["conditions"] = [c.to_dict() for c in parsed_conditions]
+                if cross_language is not None:
+                    actual_cl = adv_res.get("cross_language_applied")
+                    retrieval["applied"]["cross_language"] = actual_cl
+                    if actual_cl is None:
+                        retrieval.setdefault("notes", []).append(
+                            "当前页面未暴露中英文扩展复选框，已保持知网默认状态"
+                        )
+                    elif actual_cl != bool(cross_language):
+                        retrieval.setdefault("notes", []).append(
+                            f"中英文扩展未能切换到 {bool(cross_language)}，当前实际为 {actual_cl}"
+                        )
                 _log(f"[cnki] 高级检索提交成功 (engine={adv_res.get('engine')}, expr={expression})")
             elif has_strict_adv:
                 err_code = "CNKI_EXPR_SYNTAX_ERROR" if adv_res.get("syntax_error") else "CNKI_ADV_SEARCH_FAILED"
@@ -1350,6 +1587,13 @@ def search_cnki(
         if not used_adv:
             _navigate_within_cnki(driver, CNKI_SEARCH_URL)
             driver = _handle_captcha(driver)
+            if cross_language is not None:
+                actual_cl = _set_cross_language(driver, cross_language)
+                retrieval["applied"]["cross_language"] = actual_cl
+                if actual_cl is None:
+                    retrieval.setdefault("notes", []).append(
+                        "普通检索页不提供中英文扩展控件，本次请求未生效；如需控制请搭配高级检索条件"
+                    )
             _input_search_keyword(driver, keyword)
             doctype_done = False
             core_filter_ok = False
@@ -1358,6 +1602,22 @@ def search_cnki(
         time.sleep(max(1, REQUEST_INTERVAL - 1))
         driver = _handle_captcha(driver)
         _wait_for_results_refresh(driver, prev_snapshot=None, timeout=15.0)
+
+        if used_adv and retrieval["applied"].get("engine") == "majorSearch" and expression:
+            ver = _verify_professional_expression(driver, expression)
+            retrieval["verified"] = ver["verified"]
+            if ver.get("actual"):
+                retrieval["applied"]["expression_readback"] = ver["actual"]
+            if ver["verified"] is False:
+                return [{
+                    "status": "error",
+                    "code": "CNKI_RETRIEVAL_MISMATCH",
+                    "message": f"结果页回读检索式与请求不一致: 请求 {expression!r}，实际 {ver.get('actual')!r}",
+                    "expression": expression,
+                    "actual_expression": ver.get("actual"),
+                }]
+
+        retrieval["total_hits"] = _read_total_hits(driver)
 
         # 若知网已明确返回 0 条记录，立即短路返回，避免在无结果空页面上反复等待侧边栏与结果表超时（节省 60s+）
         is_empty_page = False
@@ -1374,6 +1634,8 @@ def search_cnki(
             is_empty_page = False
 
         if is_empty_page:
+            if retrieval["total_hits"] is None:
+                retrieval["total_hits"] = 0
             _log("[cnki] 知网返回 0 条记录，快速结束检索")
             if _keep_driver:
                 should_quit = False
@@ -1454,6 +1716,8 @@ def search_cnki(
     except Exception as e:
         return [{"status": "error", "code": "CNKI_SEARCH_FAILED", "message": str(e)}]
     finally:
+        if meta is not None:
+            meta["retrieval"] = retrieval
         if driver is not None:
             if should_quit:
                 _release_driver(driver)
@@ -1494,15 +1758,25 @@ def batch_search_cnki(
     first_author: str = None,
     fund: str = None,
     fuzzy: bool = False,
+    match: Optional[str] = None,
+    cross_language: Optional[bool] = None,
     bulk_abstract: bool = True,
 ) -> Dict[str, Any]:
     """批量知网搜索：一次启动浏览器，循环执行每组关键词（完整保留每轮文献类型、高级字段与核心筛选）。"""
     if not keywords:
         return {"status": "error", "code": "NO_KEYWORDS", "message": "未提供关键词"}
 
+    effective_fuzzy = bool(fuzzy)
     try:
         if field:
             resolve_cnki_field_code(field)
+        if match is not None:
+            norm_match = canonical_match(match)
+            if norm_match:
+                validate_conditions([CnkiCondition(field=field or "主题", value=keywords[0] or "占位", match=norm_match)])
+                effective_fuzzy = norm_match == "模糊"
+    except CnkiQueryError as qe:
+        return {"status": "error", "code": qe.code, "message": qe.message}
     except ValueError as ve:
         return {"status": "error", "code": "CNKI_EXPR_SYNTAX_ERROR", "message": str(ve)}
 
@@ -1515,10 +1789,12 @@ def batch_search_cnki(
             return {"status": "error", "code": "CNKI_UNREACHABLE", "message": msg}
 
     has_strict_adv = bool(
-        author or first_author or affiliation or journal or fund or fuzzy
+        author or first_author or affiliation or journal or fund or match or effective_fuzzy
         or (field and resolve_cnki_field_code(field) != "SU")
     )
-    use_adv_page = has_strict_adv or bool(core or year_from is not None or year_to is not None)
+    use_adv_page = has_strict_adv or bool(
+        core or year_from is not None or year_to is not None or cross_language is not None
+    )
     entry_url = CNKI_ADV_SEARCH_URL if use_adv_page else CNKI_SEARCH_URL
 
     driver = None
@@ -1555,7 +1831,7 @@ def batch_search_cnki(
                         affiliation=affiliation,
                         journal=journal,
                         fund=fund,
-                        fuzzy=fuzzy,
+                        fuzzy=effective_fuzzy,
                     )
                     conds = _build_structured_conditions(
                         keyword=keyword,
@@ -1565,7 +1841,7 @@ def batch_search_cnki(
                         affiliation=affiliation,
                         journal=journal,
                         fund=fund,
-                        fuzzy=fuzzy,
+                        fuzzy=effective_fuzzy,
                     )
                     adv_res = _advanced_search(
                         driver,
@@ -1574,6 +1850,7 @@ def batch_search_cnki(
                         core=core,
                         year_from=year_from,
                         year_to=year_to,
+                        cross_language=cross_language,
                     )
                     if adv_res.get("ok"):
                         submitted = True

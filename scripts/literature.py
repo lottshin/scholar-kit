@@ -92,6 +92,7 @@ from research_tools import (  # noqa: E402
     cmd_rebuttal as _cmd_rebuttal,
 )
 from sections import extract_frontmatter_toc, parse_fulltext_sections, public_toc, slice_fulltext_sections  # noqa: E402
+from thesis_format import cmd_format_audit as _cmd_format_audit, cmd_format_docx as _cmd_format_docx  # noqa: E402
 from search import (  # noqa: E402
     analyze_trends,
     calculate_quality_score,
@@ -196,9 +197,14 @@ def _enhance_error(error_dict: Dict[str, Any], context: Optional[Dict[str, Any]]
 # ── CNKI 搜索缓存（优先全局缓存目录，兼容旧版工作区缓存） ──────────────────
 
 def _cnki_cache_key(args) -> str:
+    cond_list = getattr(args, "condition", None) or []
     parts = [
         args.query or "",
         getattr(args, "expr", "") or "",
+        getattr(args, "professional", "") or "",
+        ";".join(str(c) for c in cond_list),
+        getattr(args, "match", "") or "",
+        str(getattr(args, "cross_language", "") or ""),
         getattr(args, "core", "") or "",
         str(getattr(args, "year_from", "") or ""),
         str(getattr(args, "year_to", "") or ""),
@@ -267,15 +273,32 @@ def cmd_search(args) -> None:
         _output({"status": "error", "code": "DOWNLOAD_SOURCE_MISMATCH", "message": "--download 仅支持 --source cnki"})
         return
 
+    cond_args = getattr(args, "condition", None)
+    pro_arg = getattr(args, "professional", None)
+    match_arg = getattr(args, "match", None)
+    cross_lang_raw = getattr(args, "cross_language", None)
+    cross_lang_bool: Optional[bool] = (
+        True if cross_lang_raw == "on" else (False if cross_lang_raw == "off" else None)
+    )
+    if source not in ("cnki", "all") and any([cond_args, pro_arg, match_arg, cross_lang_raw]):
+        _output({
+            "status": "error",
+            "code": "CNKI_OPTION_SOURCE_MISMATCH",
+            "message": "--condition / --professional / --match / --cross-language 仅支持知网数据源 (--source cnki)",
+        })
+        return
+
     results: List[Dict[str, Any]] = []
     reuse_driver = None
     cnki_error = None
+    cnki_meta: Dict[str, Any] = {}
 
     if source in ("cnki", "all"):
         cached_cnki = _cnki_cache_get(args) if not want_download else None
         if cached_cnki is not None:
             print("[cnki] 使用缓存结果", file=sys.stderr)
             results.extend(cached_cnki)
+            cnki_meta["retrieval"] = {"mode": "cached"}
         else:
             keep = want_download and source == "cnki"
             bulk_abs = getattr(args, "bulk_abstract", False)
@@ -290,6 +313,15 @@ def cmd_search(args) -> None:
                 cnki_kw["bulk_abstract"] = False
             elif bulk_abs:
                 cnki_kw["bulk_abstract"] = True
+            if cond_args:
+                cnki_kw["conditions"] = list(cond_args)
+            if pro_arg is not None:
+                cnki_kw["professional"] = pro_arg
+            if match_arg is not None:
+                cnki_kw["match"] = match_arg
+            if cross_lang_bool is not None:
+                cnki_kw["cross_language"] = cross_lang_bool
+            cnki_kw["meta"] = cnki_meta
             cnki_core_only = None
             if args.core:
                 cn_parts = [
@@ -327,7 +359,10 @@ def cmd_search(args) -> None:
                 _cnki_cache_set(args, cnki_results)
             elif cnki_results and cnki_results[0].get("status") == "error":
                 if source == "cnki":
-                    _output(_enhance_error(cnki_results[0], {"query": args.query}))
+                    err_out = _enhance_error(cnki_results[0], {"query": args.query})
+                    if cnki_meta.get("retrieval"):
+                        err_out["retrieval"] = cnki_meta["retrieval"]
+                    _output(err_out)
                     if reuse_driver:
                         _release_driver(reuse_driver)
                     return
@@ -514,13 +549,15 @@ def cmd_search(args) -> None:
         _save_session(deduped, append=getattr(args, "append", False), project=_session_project(args))
 
         if len(deduped) == 0:
-            no_results_error = {
+            no_results_error: Dict[str, Any] = {
                 "status": "warning",
                 "code": "NO_RESULTS",
-                "message": f"未找到匹配 '{args.query}' 的结果",
+                "message": f"未找到匹配 '{args.query or getattr(args, 'professional', '') or getattr(args, 'expr', '')}' 的结果",
                 "count": 0,
                 "results": [],
             }
+            if cnki_meta.get("retrieval"):
+                no_results_error["retrieval"] = cnki_meta["retrieval"]
             _output(_enhance_error(no_results_error, {"query": args.query}))
             return
 
@@ -528,6 +565,8 @@ def cmd_search(args) -> None:
             p["citation_preview"] = citation_preview(p)
 
         search_output: Dict[str, Any] = {"status": "success", "count": len(deduped), "results": deduped}
+        if cnki_meta.get("retrieval"):
+            search_output["retrieval"] = cnki_meta["retrieval"]
         if cnki_error and source == "all":
             search_output["cnki_error"] = {"code": cnki_error.get("code"), "message": cnki_error.get("message")}
             search_output["status"] = "partial"
@@ -632,6 +671,16 @@ def cmd_batch_search(args) -> None:
         _output({"status": "error", "code": "NO_KEYWORDS", "message": "未提供关键词"})
         return
 
+    batch_cross_raw = getattr(args, "cross_language", None)
+    batch_cross_bool: Optional[bool] = (
+        True if batch_cross_raw == "on" else (False if batch_cross_raw == "off" else None)
+    )
+    batch_kw: Dict[str, Any] = {}
+    if getattr(args, "match", None) is not None:
+        batch_kw["match"] = getattr(args, "match")
+    if batch_cross_bool is not None:
+        batch_kw["cross_language"] = batch_cross_bool
+
     result = batch_search_cnki(
         keywords=keywords,
         core=args.core,
@@ -648,6 +697,7 @@ def cmd_batch_search(args) -> None:
         sort=args.sort or "relevance",
         pages=args.pages or 1,
         bulk_abstract=not getattr(args, "no_bulk_abstract", False),
+        **batch_kw,
     )
 
     if result.get("status") in ("success", "partial") and result.get("results"):
@@ -2191,6 +2241,14 @@ def cmd_patch_docx(args) -> None:
     _cmd_patch_docx(args, output_fn=_output)
 
 
+def cmd_format_audit(args) -> None:
+    _cmd_format_audit(args, output_fn=_output)
+
+
+def cmd_format_docx(args) -> None:
+    _cmd_format_docx(args, output_fn=_output)
+
+
 def cmd_review(args) -> None:
     _cmd_review(args, output_fn=_output)
 
@@ -2244,6 +2302,14 @@ def main() -> None:
     p_search.add_argument("--journal", help="期刊/文献来源（知网高级/专业检索 LY%%=，带《》时精确匹配）")
     p_search.add_argument("--fund", help="基金资助（知网高级/专业检索 FU%%=）")
     p_search.add_argument("--expr", help="知网专业检索布尔表达式，如 \"TKA=('大模型' + '生成式AI') AND LY%%='管理世界'\"")
+    p_search.add_argument("--professional", metavar="表达式",
+                          help="知网官方专业检索表达式（如 \"SU %%= 知识管理 AND AU = 邱均平\"；与 --condition / --expr 互斥）")
+    p_search.add_argument("--condition", action="append", metavar="字段|逻辑|匹配|值",
+                          help="知网结构化高级检索条件，可重复（最多 10 条），支持 并且/或者/不含 与 精确/模糊（自动加括号编译）")
+    p_search.add_argument("--match", default=None,
+                          help="知网单字段匹配方式: 精确/模糊（主题仅支持相关度匹配）")
+    p_search.add_argument("--cross-language", choices=["on", "off"], default=None,
+                          help="知网中英文扩展开关: on 启用（知网默认），off 关闭以仅检索纯中文文献")
     p_search.add_argument("--fuzzy", action="store_true", help="知网检索启用模糊/语义扩展匹配（%%=）")
     p_search.add_argument("--author-filter", help="作者过滤（API 源）")
     p_search.add_argument("--journal-filter", help="期刊过滤（API 源）")
@@ -2391,6 +2457,9 @@ def main() -> None:
     p_batch.add_argument("--affiliation", help="作者单位/机构")
     p_batch.add_argument("--journal", help="期刊名")
     p_batch.add_argument("--fund", help="基金资助")
+    p_batch.add_argument("--match", default=None, help="知网匹配方式: 精确/模糊（主题不支持）")
+    p_batch.add_argument("--cross-language", choices=["on", "off"], default=None,
+                         help="知网中英文扩展开关: on 启用，off 关闭")
     p_batch.add_argument("--fuzzy", action="store_true", help="启用模糊/语义扩展匹配（%%=）")
     p_batch.add_argument("--year-from", type=int, help="起始年份")
     p_batch.add_argument("--year-to", type=int, help="截止年份")
@@ -2443,6 +2512,27 @@ def main() -> None:
     p_pdocx.add_argument("--output", help="输出路径")
     p_pdocx.add_argument("--dry-run", action="store_true", help="仅预检所有替换和脚注定位是否唯一命中，不写入文件")
     p_pdocx.set_defaults(func=cmd_patch_docx)
+
+    p_faudit = sub.add_parser("format-audit", help="审计现有 .docx 学位论文格式（支持学校模板、JSON 或自然语言规范）")
+    p_faudit.add_argument("filepath", help="待审计的 .docx 论文文件")
+    p_faudit.add_argument("--template", help="用于自动提取格式规范的 .docx 范例模板")
+    p_faudit.add_argument("--spec", help="格式规范 JSON 或文本文件路径")
+    p_faudit.add_argument("--spec-text", help="自然语言描述的格式规范文本（如 '正文小四宋体1.5倍行距'）")
+    p_faudit.add_argument("--format", choices=["json", "markdown"], default="json", help="报告文件输出格式")
+    p_faudit.add_argument("-o", "--output", help="报告输出路径")
+    p_faudit.add_argument("--raw", action="store_true", help="直接输出 Markdown 审计报告")
+    p_faudit.set_defaults(func=cmd_format_audit)
+
+    p_fdocx = sub.add_parser("format-docx", help="按规范套用学位论文格式并生成安全副本（绝不覆盖原稿）")
+    p_fdocx.add_argument("filepath", help="待格式化的 .docx 论文文件")
+    p_fdocx.add_argument("--template", help="用于自动提取格式规范的 .docx 范例模板")
+    p_fdocx.add_argument("--spec", help="格式规范 JSON 或文本文件路径")
+    p_fdocx.add_argument("--spec-text", help="自然语言描述的格式规范文本")
+    p_fdocx.add_argument("-o", "--output", help="输出 .docx 路径（默认生成 *_formatted.docx）")
+    p_fdocx.add_argument("--report-output", help="格式化对比清单输出路径")
+    p_fdocx.add_argument("--report-format", choices=["json", "markdown"], default="json", help="格式化清单输出格式")
+    p_fdocx.add_argument("--raw", action="store_true", help="直接输出 Markdown 格式化报告")
+    p_fdocx.set_defaults(func=cmd_format_docx)
 
     # clean-cache
     p_clean = sub.add_parser("clean-cache", help="安全清理过期缓存文件")

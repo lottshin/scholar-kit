@@ -169,7 +169,7 @@ Table 3: Baseline OLS, IV-2SLS, and PSM-DID Estimates
 4. **Empirical Tables, Citation Formatting & Submission Workflow (`data-table`, `cite`, `match-journal`, `rebuttal`, `write-docx`, `patch-docx`)**
    - `data-table`: Descriptive stats (`summary`), Pearson correlation matrices with `*/**/***` (`corr`), two-row econometric regression tables (`regression`), and ML benchmark tables auto-detecting lower-is-better metrics (`comparison`).
    - `cite` / `export`: Deterministic APA, MLA, Chicago, **GB/T 7714** (numeric & author-year), pure-ASCII `pdflatex`-safe BibTeX, RIS, Excel, plus atomic in-place `.md`/`.tex` renumbering.
-   - `match-journal` & `rebuttal`: Tiered target venue recommendations with CAS warning quarantine, plus automated Reviewer comment parsing (`R1-C1`), manuscript `[Pn]` anchor linking, Response Letter generation, and dry-run verified `patch-docx` templates.
+   - `match-journal`, `rebuttal`, `format-audit` & `format-docx`: Tiered target venue recommendations with CAS warning quarantine; automated Reviewer comment parsing (`R1-C1`), manuscript `[Pn]` anchor linking, Response Letter generation, and dry-run verified `patch-docx` templates; plus non-destructive `.docx` thesis format auditing and styling from sample `.docx` templates, JSON, or natural-language specs.
 
 ---
 
