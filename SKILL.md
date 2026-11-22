@@ -63,7 +63,7 @@ metadata:
 
 | 用户意图 | 首选命令组合（完整参数见 [cli-reference.md](references/cli-reference.md)） |
 |----------|---------------------------------------------------------------------------|
-| 中文/多源文献检索 | `search "词"`（复杂同义词优先 `search --expr "TKA=('A'+'B') AND ..."` 降风控；无知网改 `--source openalex` 或 `--source all --async-search`；独立多词用 `batch-search`） |
+| 中文/多源文献检索 | `search "词"`（多概念交集用 `--condition "字段\|逻辑\|匹配\|值"` 或 `--expr`/`--professional`，纯中文加 `--cross-language off`；无知网改 `--source openalex` 或 `--source all --async-search`；独立多词用 `batch-search`） |
 | 核心期刊与预警把关 | 叠加 `--core`（中文 `北大核心,CSSCI,CSCD,AMI,EI`；英文 `SCI,SSCI,AHCI,ESCI,CCF-A/B`）与 `--exclude-warning`（规则见 [core-journals.md](references/core-journals.md)） |
 | 本机 Zotero / 本地 PDF | `zotero [词] --save --project <课题>` 或 `import <PDF目录> --project <课题>` → 直接复用 `read-detail`、`review`、`cite` |
 | 论文下载与引文滚雪球 | 先确认 `pdf`/`caj` 与引文格式后 `search --download` 或 `batch-download`（无知网用 `download --doi`）；追踪引文用 `citations <URL/题名/DOI> --save both --append` |
@@ -71,6 +71,7 @@ metadata:
 | 参考文献核验与格式导出 | 核对错名/改名/漏页码用 `verify-refs [--from-file <文稿>] --fix-session`；导出/重排统一用 `cite`（支持顺序编码、著者-出版年、经管顶刊、LaTeX `\cite` + 纯 ASCII `.bib`）或 `export` |
 | 实证统计 / 回归 / 实验制表 | `data-table <csv/tsv/json> --type summary/corr/regression/comparison --format markdown/latex/docx`（纯本地精确计算，零手算） |
 | 学术表达优化 / Word 修补 | 先读 [style-audit.md](references/style-audit.md)：`read-paper --numbered` → 审计 → 改写 → `patch-docx --dry-run` → 正式写回并附变更日志 |
+| 学位论文格式规范审计 / 套用 | `format-audit <论文.docx> [--template 模板.docx \| --spec 规范.json \| --spec-text "描述"]`；套用副本用 `format-docx`（绝不覆盖原稿） |
 | 投稿选刊与审稿返修 | 选刊：`match-journal [--project] [--from-file] [--topic --live]`（隔离在榜预警刊）；返修：`rebuttal <意见文件> --manuscript <原稿.docx> --init-patch patch.json -o reply.docx` → `patch-docx --dry-run` |
 
 > 搜索返回 `0` 结果时：主动切换同义词、中英文、`%` 模糊检索或 `--source all --async-search` / `--enable-fallback`，不要首次空结果就放弃。
@@ -96,6 +97,7 @@ metadata:
 - [工作流详解](references/workflows.md) — 综述、万字长文、实证制表、投稿选刊、审稿返修、Word 补丁与对比矩阵步骤
 - [表达审计规则](references/style-audit.md) — 学术表达优化、去 AI 腔清单、保留清单与变更日志模板
 - [API 源检索最佳实践](references/api-search-best-practices.md) — 高级过滤、`quality_score` 评分细则、分页与多源组合
+- [知网高级检索构造](references/search/cnki-advanced-retrieval.md) & [专业检索语法](references/search/cnki-professional-syntax.md) — 概念组拆解、`--condition` 编译映射与 `retrieval` 回读核验
 - [核心期刊知识](references/core-journals.md) — 学科与 `--core`（北大核心/CSSCI/CSCD/AMI/WJCI/EI）映射规则
 - [环境与沙盒排查](references/environment.md) — 各平台沙盒授权表、Windows 编码、浏览器热复用与网络代理排查
 - [错误码对照表](references/error-codes.md) — 脚本 `status: error/warning` 标准处置指引

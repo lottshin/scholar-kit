@@ -6,8 +6,8 @@
 
 | 命令 | 用途 | 完整常用参数 |
 |------|------|--------------|
-| `search [词]` | 单次 / 专业布尔检索 | `--source` (`cnki`/`openalex`/`semantic`/`arxiv`/`pubmed`/`nssd`/`dblp`/`base`/`all`) `--expr`（知网专业检索布尔式） `--field` (`主题`/`篇关摘`/`篇名`/`关键词`/`摘要`/`全文`) `--author` `--first-author` `--affiliation` `--journal` `--fund` `--fuzzy` `--core`（知网 `北大核心,CSSCI,CSCD,AMI,WJCI,EI`；英文源 `SCI,SSCI,AHCI,ESCI,CCF,CCF-A,CCF-B,CCF-C`） `--exclude-warning` `--doc-type` (`journal`/`master`/`doctor`/`thesis`/`conference`/`newspaper`) `--year-from` `--year-to` `--sort` (`relevance`/`date`/`citations`/`downloads`/`quality`) `--pages` `--per-page 50` `--limit` `--bulk-abstract` `--cite-enrich N` `--enrich N` `--author-filter` `--journal-filter` `--field-of-study` `--page` `--enable-fallback` `--async-search` `--download` `--download-fallback-format caj` `--append` `--project` |
-| `batch-search` | 多词知网检索 | `词1 词2` 或 `--query-file`（中文独立多主题） `--core` `--doc-type` `--field` `--year-from` `--year-to` `--sort` `--pages` `--append` `--project` |
+| `search [词]` | 单次 / 多条件 / 专业检索 | `--source` (`cnki`/`openalex`/`semantic`/`arxiv`/`pubmed`/`nssd`/`dblp`/`base`/`all`) `--condition "字段\|逻辑\|匹配\|值"`（可重复最多 10 条） `--professional` / `--expr`（知网专业检索式） `--match` (`精确`/`模糊`) `--cross-language` (`on`/`off`) `--field` (`主题`/`篇关摘`/`篇名`/`关键词`/`摘要`/`全文`/`小标题`/`参考文献`/`分类号`) `--author` `--first-author` `--affiliation` `--journal` `--fund` `--fuzzy` `--core`（知网 `北大核心,CSSCI,CSCD,AMI,WJCI,EI`；英文源 `SCI,SSCI,AHCI,ESCI,CCF,CCF-A,CCF-B,CCF-C`） `--exclude-warning` `--doc-type` (`journal`/`master`/`doctor`/`thesis`/`conference`/`newspaper`) `--year-from` `--year-to` `--sort` (`relevance`/`date`/`citations`/`downloads`/`quality`) `--pages` `--per-page 50` `--limit` `--bulk-abstract` `--cite-enrich N` `--enrich N` `--author-filter` `--journal-filter` `--field-of-study` `--page` `--enable-fallback` `--async-search` `--download` `--download-fallback-format caj` `--append` `--project` |
+| `batch-search` | 多词知网检索 | `词1 词2` 或 `--query-file`（中文独立多主题） `--core` `--doc-type` `--field` `--match` `--cross-language` `--year-from` `--year-to` `--sort` `--pages` `--append` `--project` |
 | `citations <id>` | 双向与共引图谱（滚雪球） | `<知网URL/中文题名/DOI/arXiv>` `--direction` (`citing`/`cited`/`both`/`coref`/`cocited`) `--limit 20` `--save` (`citing`/`cited`/`both`) `--append` `--project` |
 | `zotero [词]` | 本机 Zotero 文献库直连 | `[query]` `--collection <集合名>` `--list-collections` `--save` `--append` `--project` |
 | `import <path>` | 导入题录或本地 PDF 库 | 支持 NoteExpress / Refworks / BibTeX 及本地 PDF 文件/目录；`--append` `--project` |
@@ -42,6 +42,7 @@
 | `verify-refs` | 题名改名纠偏与页码真伪核验 | `--from-file <docx/md/txt>` `--indices 1,3` `--fix-session` `--project` |
 | `read-paper` / `pdf-meta` | 读用户文稿 / PDF 元数据 | `read-paper <docx/txt/md/tex/pdf> [--numbered] [--toc] [--section "第3章,4.2"] [--max-chars] [--output] [--raw]`；`pdf-meta <file.pdf>` |
 | `write-docx` / `patch-docx` | 交稿级 Word 排版 / 锚点修补 | `write-docx <md> [--output] [--no-superscript]`（原生三线表、正文角标上标、摘要楷体、居中表题与页码）；`patch-docx <docx> --patch patch.json [--dry-run] [--output]`（支持段落/表格锚点、原生脚注、`replace_references` 与 `superscript_citations`） |
+| `format-audit` / `format-docx` | 学位论文格式规范审计与副本套用 | `format-audit <论文.docx> [--template 模板.docx] [--spec 规范.json] [--spec-text "描述"] [--format json/markdown] [-o report] [--raw]`；`format-docx <论文.docx> [--template/--spec/--spec-text] [-o *_formatted.docx] [--report-output]` |
 | `match-journal` | 投稿目标期刊分层匹配与预警避雷 | `--project` `--from-file <docx/md>` `--topic <方向>` `--live` `--lang all/zh/en` `--limit 12` `--raw` |
 | `rebuttal <file>` | 审稿意见拆解与点对点回复函 | `<comments.txt/md/docx>` `--manuscript <原稿.docx/md>` `--title` `--lang auto/zh/en` `--format markdown/docx` `--init-patch <patch.json>` `-o/--output` `--raw` |
 

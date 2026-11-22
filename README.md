@@ -179,7 +179,7 @@ python3 <安装路径>/scripts/literature.py check --fix
 ## 核心能力（按科研工作流）
 
 ### 1. 多源文献检索与深层引文网络
-- **知网深度检索**：支持 KNS8S 专业布尔检索式与多条件高级检索（篇关摘、第一作者、机构、基金、精确/模糊刊名、北大核心/CSSCI/CSCD/EI 等核心筛选、单页 50 条高吞吐与按下载量排序）；内置本地浏览器常驻热复用，免去多步操作反复冷启动。
+- **知网深度检索**：支持 KNS8S 专业布尔检索式（`--expr` / `--professional`）与可重复结构化高级条件（`--condition` 最多 10 项，自动加括号保护 `AND/OR/NOT` 同级运算）、中英文扩展显式开关（`--cross-language on/off`）及结果页检索式回读核验（`retrieval.verified`）；支持篇关摘、第一作者、机构、基金、精确/模糊刊名、北大核心/CSSCI/CSCD/EI 等核心筛选、单页 50 条高吞吐与按下载量排序；内置本地浏览器常驻热复用与代理回环绕行。
 - **国际与专业开放源并发 + 离线分区/预警识别**：支持单源检索、无结果自动降级（Fallback）及全源异步并发检索；内置 30,300+ 条 ISSN 离线索引，自动识别 **SCI / SSCI / A&HCI / ESCI、CCF-A/B/C（2026 第七版）及中科院《国际期刊预警名单》**（支持 `--core SCI,SSCI,CCF-A` 与 `--exclude-warning` 一键防踩雷）。
 - **双向与共引图谱（滚雪球）**：中文论文可直接按知网链接或题名抓取**引证文献、参考文献、共引文献与同被引文献**；英文/DOI/arXiv 论文接入 Semantic Scholar 引文网络，检索结果可一键追加至课题库。
 
@@ -202,7 +202,7 @@ python3 <安装路径>/scripts/literature.py check --fix
 ### 5. 学术表达优化、投稿选刊与审稿返修闭环
 - **目标投稿期刊智能匹配（`match-journal`）**：聚合课题库或文稿参考文献的母刊分布（支持 `--live` 在线扩展同主题高被引母刊），结合 SCI/SSCI/A&HCI/CCF/CSSCI/北大核心收录标签划分为**冲刺顶刊/顶会、主投高契合核心、稳健拓展核心**三档，**自动隔离中科院在榜预警期刊**并标注曾上榜已调出期刊。
 - **审稿意见拆解与点对点返修（`rebuttal`）**：自动解析中英文审稿意见（`Editor` / `Reviewer #1` / `审稿专家一`），按方法识别、文献对话、概念论证、数据图表、语言规范分类编号（`R1-C1`），结合 `--manuscript` 自动定位原稿对应段落锚点 `[Pn]`，一键生成正式中/英文 **Response Letter（Markdown / Word）** 与可直接送入 `patch-docx --dry-run` 预检的修订补丁模板。
-- **三步法学术润色与 Word 交稿级排版**：读取 `.docx` / `.tex` / `.md` / `.txt` 真实顺序锚点，严格按「审计 → 改写 → 变更报告」消除中文 AI 腔（见 [references/style-audit.md](references/style-audit.md)），不篡改任何数据、公式与引文；`write-docx` 原生生成**学术三线表**（跨页重复表头）、**正文 `[1]` 上标**、`摘要/关键词` 规范样式与动态页码；`patch-docx` 支持锚点回填、原生脚注与 `--dry-run` 零写入预检。
+- **三步法学术润色、学位论文格式审计与 Word 交稿级排版**：读取 `.docx` / `.tex` / `.md` / `.txt` 真实顺序锚点，严格按「审计 → 改写 → 变更报告」消除中文 AI 腔（见 [references/style-audit.md](references/style-audit.md)），不篡改任何数据、公式与引文；`format-audit` / `format-docx` 支持从学校范例 `.docx` 模板、JSON 或自然语言规范审计并套用学位论文页面边距、各级标题、正文/摘要/参考文献/图注/脚注样式与章节编号（生成安全副本，绝不覆盖原稿）；`write-docx` 原生生成**学术三线表**（跨页重复表头）、**正文 `[1]` 上标**与动态页码；`patch-docx` 支持锚点回填、原生脚注与 `--dry-run` 零写入预检。
 
 ---
 
@@ -260,6 +260,7 @@ scholar-kit/
 │   ├── evidence.py           ← 课题库治理、对比矩阵、外部空白检索实证与极性/统计核验
 │   ├── research_tools.py     ← 实证数据三线表/LaTeX 制表、目标选刊匹配与审稿返修回复函
 │   ├── docx_tools.py         ← Word/LaTeX/PDF 文稿读取、交稿级排版与 OOXML 安全补丁
+│   ├── thesis_format/        ← 学位论文格式规范解析、模板提取、格式审计与安全副本套用
 │   ├── doctor.py             ← 环境自检、PEP 668 引导与缓存清理
 │   ├── workflows.py          ← 标准化流水线模板
 │   ├── smoke_upstream.py     ← 外部学术 API 每周线上契约巡检探针

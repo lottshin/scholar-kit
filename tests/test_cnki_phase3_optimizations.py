@@ -337,14 +337,16 @@ def test_release_driver_keeps_reused_browser_alive_and_quits_owned_driver(monkey
 
 def test_find_local_driver_prefers_highest_cached_version(monkeypatch, tmp_path):
     se_cache = tmp_path / "selenium"
-    old_drv = se_cache / "chromedriver" / "mac-arm64" / "155.0.8059.84" / "chromedriver"
-    new_drv = se_cache / "chromedriver" / "mac-arm64" / "157.0.8103.79" / "chromedriver"
+    bin_name = "chromedriver.exe" if sys.platform == "win32" else "chromedriver"
+    old_drv = se_cache / "chromedriver" / "mac-arm64" / "155.0.8059.84" / bin_name
+    new_drv = se_cache / "chromedriver" / "mac-arm64" / "157.0.8103.79" / bin_name
     old_drv.parent.mkdir(parents=True)
     new_drv.parent.mkdir(parents=True)
     old_drv.write_text("old", encoding="utf-8")
     new_drv.write_text("new", encoding="utf-8")
 
     monkeypatch.setenv("SE_CACHE_PATH", str(se_cache))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "empty_localappdata"))
     monkeypatch.delenv("SCHOLAR_DRIVER_PATH", raising=False)
     monkeypatch.setattr(cnki_driver.shutil, "which", lambda _name: None)
     monkeypatch.setattr(cnki_driver.Path, "home", lambda: tmp_path / "empty_home")
